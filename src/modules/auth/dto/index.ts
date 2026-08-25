@@ -1,0 +1,58 @@
+import { IsString, Matches, MinLength, IsIn, IsOptional, MaxLength } from 'class-validator';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+
+export class LoginDto {
+  @ApiProperty({ example: '13800138000' })
+  @Matches(/^1\d{10}$/, { message: '手机号格式不正确' })
+  phone: string;
+
+  @ApiProperty({ example: 'Admin@123456' })
+  @IsString()
+  @MinLength(1, { message: '密码不能为空' })
+  password: string;
+
+  @ApiProperty({ example: 'iPhone 15' })
+  @IsString()
+  device_name: string;
+
+  @ApiProperty({ example: 'mobile', enum: ['mobile', 'desktop', 'tablet', 'web'] })
+  @IsIn(['mobile', 'desktop', 'tablet', 'web'])
+  device_type: string;
+}
+
+export class ChangePasswordDto {
+  @ApiProperty()
+  @IsString()
+  old_password: string;
+
+  @ApiProperty({ minLength: 8 })
+  @IsString()
+  @MinLength(8, { message: '新密码长度不能少于8位' })
+  new_password: string;
+}
+
+export class RefreshTokenDto {
+  @ApiProperty()
+  @IsString()
+  refresh_token: string;
+}
+
+export class UpdateProfileDto {
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  @MaxLength(100)
+  display_name?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  @MaxLength(200)
+  signature?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
+  avatar_url?: string;
+}
