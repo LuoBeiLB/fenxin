@@ -35,7 +35,7 @@ export class ContactService {
     }
 
     qb.orderBy('u.display_name', 'ASC').skip((page - 1) * pageSize).take(pageSize);
-
+    // console.log(`qb结果是：${qb}`)
     const [data, total] = await qb.getManyAndCount();
     return { data, total };
   }

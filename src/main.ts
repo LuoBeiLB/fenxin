@@ -29,17 +29,26 @@ async function bootstrap() {
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
-  app.enableCors({ origin: origins.length > 0 ? origins : false, credentials: true });
+  const corsOrigin = origins.includes('*') ? true : origins.length > 0 ? origins : false;
+  app.enableCors({ origin: corsOrigin, credentials: true });
 
   // Swagger 仅显式开启时暴露（生产环境应关闭）
   if ((process.env.SWAGGER_ENABLED || 'false') === 'true') {
-    const config = new DocumentBuilder()
-      .setTitle('焚信 (BurnMsg) API')
-      .setDescription('企业级端到端加密通讯应用后端接口文档（NestJS 版）')
-      .setVersion('2.0.0')
-      .addBearerAuth()
-      .build();
-    const doc = SwaggerModule.createDocument(app, config);
+    let doc: any;
+    const openapiPath = path.resolve(process.cwd(), 'openapi.yaml');
+    if (fs.existsSync(openapiPath)) {
+      const yaml = require('js-yaml');
+      doc = yaml.load(fs.readFileSync(openapiPath, 'utf-8'));
+      console.log('[Swagger] 已加载 openapi.yaml（完整版文档）');
+    } else {
+      const config = new DocumentBuilder()
+        .setTitle('焚信 (BurnMsg) API')
+        .setDescription('企业级端到端加密通讯应用后端接口文档（NestJS 版）')
+        .setVersion('2.0.0')
+        .addBearerAuth()
+        .build();
+      doc = SwaggerModule.createDocument(app, config);
+    }
     SwaggerModule.setup('api-docs', app, doc, {
       customCss: '.swagger-ui .topbar { display: none }',
       customSiteTitle: '焚信 API 文档',

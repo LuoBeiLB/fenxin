@@ -6,7 +6,7 @@ import { AppUser, sanitizeUser } from '../../entities/app-user.entity';
 
 @Injectable()
 export class ConversationService {
-  constructor(private readonly dataSource: DataSource) {}
+  constructor(private readonly dataSource: DataSource) { }
 
   /** 获取（或创建）两人的私聊会话；共同会话只认 type='private'，避免命中共同群 */
   async getOrCreatePrivateConversation(userId1: string, userId2: string): Promise<Conversation> {
@@ -53,7 +53,8 @@ export class ConversationService {
     const conversations = await convRepo
       .createQueryBuilder('c')
       .whereInIds(convIds)
-      .orderBy('c.last_message_at', 'DESC', 'NULLS LAST')
+      .orderBy('c.last_message_at IS NULL', 'ASC')
+      .addOrderBy('c.last_message_at', 'DESC')
       .getMany();
 
     return Promise.all(
