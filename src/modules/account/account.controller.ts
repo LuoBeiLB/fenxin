@@ -2,6 +2,7 @@ import {
   BadRequestException,
   Body,
   Controller,
+  Delete,
   Get,
   Param,
   Post,
@@ -91,7 +92,18 @@ export class AccountController {
 
   @Get()
   list(@Query() query: ListAccountsQuery) {
-    return this.accountService.listAccounts(query);
+    return this.accountService.listAccounts({ ...query, showDeleted: query.show_deleted });
+  }
+
+  /**
+   * 软删除账号：标记 deleted_at，数据保留但不可登录、不在通讯录显示。
+   * 关联会话、消息、群组关系保留供审计；前端需二次确认（输入手机号确认）。
+   */
+  @Delete(':id')
+  @ResponseMessage('账号已删除')
+  async remove(@Param('id') id: string, @CurrentUser() user: AuthPayload, @Req() req: Request) {
+    await this.accountService.softDeleteAccount(id, user.userId, req.ip);
+    return null;
   }
 
   /** 注意：必须声明在 @Get(':id') 之前，否则 /departments 会被 /:id 抢占（旧版 bug） */

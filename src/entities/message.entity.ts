@@ -49,6 +49,26 @@ export class Message {
   @Column({ type: 'datetime', nullable: true })
   destroy_at: Date | null;
 
+  // ===== E2E 端到端加密字段（方案 B 简化版，见 docs/E2E_ENCRYPTION.md）=====
+  // 三者要么全填（全密文），要么全 null（明文，content 是真明文）。
+  // 加密消息的 content 只是占位提示（如 "[加密消息]"），明文在客户端解密 cipher_text 得到。
+
+  /** 是否加密。true → 客户端用 cipher_text + cipher_nonce + sender_ephemeral_pubkey 解密 */
+  @Column({ default: false })
+  is_encrypted: boolean;
+
+  /** AES-256-GCM nonce，base64 编码（12 字节 → 16 字符）。加密消息必填 */
+  @Column({ length: 32, nullable: true })
+  cipher_nonce: string | null;
+
+  /** AES-256-GCM 密文 + auth tag，base64 编码。加密消息必填 */
+  @Column({ type: 'text', nullable: true })
+  cipher_text: string | null;
+
+  /** 发送方临时 X25519 公钥，base64 编码（32 字节 → 44 字符）。加密消息必填 */
+  @Column({ length: 100, nullable: true })
+  sender_ephemeral_pubkey: string | null;
+
   @Index('idx_messages_created_at')
   @CreateDateColumn({ type: 'datetime' })
   created_at: Date;

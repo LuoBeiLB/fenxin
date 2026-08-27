@@ -22,6 +22,7 @@ export class ContactService {
       .createQueryBuilder('u')
       .select(SAFE_USER_FIELDS.map((f) => `u.${String(f)}`))
       .where('u.status = :status', { status: 'active' })
+      .andWhere('u.deleted_at IS NULL')
       .andWhere('u.id != :userId', { userId: params.userId });
 
     if (params.keyword) {
@@ -46,6 +47,7 @@ export class ContactService {
       .createQueryBuilder('u')
       .select(SAFE_USER_FIELDS.map((f) => `u.${String(f)}`))
       .where('u.status = :status', { status: 'active' })
+      .andWhere('u.deleted_at IS NULL')
       .andWhere('u.id != :userId', { userId })
       .andWhere('(u.phone = :keyword OR u.display_name LIKE :keywordLike)', {
         keyword,

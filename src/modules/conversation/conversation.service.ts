@@ -64,6 +64,8 @@ export class ConversationService {
     const conversations = await convRepo
       .createQueryBuilder('c')
       .whereInIds(convIds)
+      // 已解散的群不出现在会话列表（数据保留供审计）
+      .andWhere('c.dissolved_at IS NULL')
       // MySQL 不支持 NULLS LAST，用 IS NULL 表达式实现同样效果（无消息的会话排最后）
       .orderBy('c.last_message_at IS NULL', 'ASC')
       .addOrderBy('c.last_message_at', 'DESC')

@@ -25,6 +25,9 @@ export class MessageController {
       fileSize: dto.file_size,
       replyToId: dto.reply_to_id,
       destroyAt: dto.destroy_at,
+      senderEphemeralPubkey: dto.sender_ephemeral_pubkey,
+      cipherNonce: dto.cipher_nonce,
+      cipherText: dto.cipher_text,
     });
   }
 

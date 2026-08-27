@@ -25,6 +25,8 @@ info:
     - 请求中的时间字段使用 ISO8601 字符串；响应中的时间为服务端 datetime。
     - 所有业务 ID 均为 UUID v4 字符串。
     - 角色：user / admin。标注「仅管理员」的接口仅 admin 可调用，普通用户返回 403。
+    - 强制改密拦截：force_change_pwd=true 的账号（新开通 / 被重置密码后），除 POST /auth/change-password 与 GET /auth/profile 外，调用其他任何受保护接口一律返回 403（FORCE_CHANGE_PASSWORD），前端应引导其先完成改密再进入主界面。
+    - 软删除账号：被 DELETE /accounts/{id} 软删的账号立即吊销全部 token 并强制下线，其历史消息保留、前端统一展示「已注销用户」；账号列表默认不含已软删账号，加 show_deleted=1 可查看。
 servers:
   - url: http://localhost:9091/api/v1
     description: 开发环境（部署时请替换为实际域名/IP；端口默认 9091，全局前缀 /api/v1）
@@ -49,6 +51,12 @@ tags:
     description: 消息附件上传（multipart），返回的 url 在发消息时填入 file_url。
   - name: 审计日志
     description: 审计日志查询（仅 admin）：登录、开户、改密、重置密码、启用停用、设备下线等敏感操作留痕，供管理后台审计页展示。
+  - name: 统计
+    description: Dashboard 统计概览（仅 admin）：账号、消息、群组、在线设备与存储占用的汇总指标，供管理后台首页展示。
+  - name: 公告
+    description: 系统公告：管理员发布/管理公告，App 端拉取公告列表、未读数与已读上报；urgent 级公告走 WebSocket 实时推送（announcement:new 事件）。
+  - name: 密钥
+    description: E2E 端到端加密密钥通道：上传/查询 X25519 identity 公钥，服务端零接触私钥，协议细节见 docs/E2E_ENCRYPTION.md。
 
 paths:
   /health:
@@ -567,6 +575,10 @@ paths:
           in: query
           schema: { type: string, enum: [active, disabled] }
           description: 按状态过滤：active 正常 / disabled 已停用
+        - name: show_deleted
+          in: query
+          schema: { type: string, enum: ['1'] }
+          description: 传 1 时在结果中包含已软删除账号（deleted_at 非空，前端应置灰展示「已注销」）；默认不含
       responses:
         '200':
           description: 成功
@@ -816,6 +828,59 @@ paths:
                   message: { type: string, example: ok }
                   data:
                     $ref: '#/components/schemas/SafeUser'
+        '401':
+          description: 未携带或无效/过期 token；账号已停用或设备已下线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: 非 admin 角色（Admin access required）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: 账号不存在
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+    delete:
+      tags: [账号]
+      summary: 软删除账号（仅 admin）
+      description: |-
+        【用途】管理员软删除（注销）一个账号：账号打 deleted_at 标记，物理数据与历史消息全部保留。
+
+        【调用时机】管理后台「成员管理」对离职/异常账号执行注销时。
+
+        【业务规则与注意事项】
+        - 仅 admin 角色可调用；不能删除自己，也不能删除其他 admin 账号（均返回 400）。
+        - 删除立即生效：该账号全部已签发 token 即刻失效（JWT 守卫实时查库校验），全端强制下线。
+        - 历史消息保留，前端对 deleted_at 非空的发送者统一展示「已注销用户」。
+        - 删除后同手机号可重新开通账号（新账号为全新身份，不继承旧数据）。
+        - 账号列表（GET /accounts）默认不含已软删账号，传 show_deleted=1 可查看；审计日志留痕（action=delete_account）。
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+          description: 账号 ID（UUID）
+          example: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+      responses:
+        '200':
+          description: 删除成功（message 为「账号已删除」），data 为 null
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: 账号已删除 }
+                  data: { nullable: true, example: null }
+        '400':
+          description: 不能删除自己 / 不能删除管理员账号 / 账号已被删除
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '401':
           description: 未携带或无效/过期 token；账号已停用或设备已下线
           content:
@@ -1327,6 +1392,7 @@ paths:
         - 阅后即焚：传 destroy_at（ISO8601 绝对时间，如 5 分钟后的时间点），到期由服务端定时任务（每分钟扫描一批，每批最多 500 条）自动销毁——删除该消息全部回执、清空 content 与 file_url、置 is_destroyed=true；消息列表接口另有「到期即不返回」的过滤兜底（双保险）。源码未限定销毁时长的离散枚举，由客户端自行计算目标时间传入。
         - 发送成功后：会话 last_message_at 更新为当前时间（影响会话列表排序）；为除发送者外的每位成员各创建一条消息回执（is_delivered=false, is_read=false）。
         - reply_to_id 传入被回复消息的 Message.id 实现引用回复。
+        - E2E 加密：cipher_text / cipher_nonce / sender_ephemeral_pubkey 三个字段「全有或全无」——全传则按加密消息入库（is_encrypted=true，content 可置空或留占位），只传部分返回 400；都不传则为普通明文消息。协商流程见 docs/E2E_ENCRYPTION.md。
       requestBody:
         required: true
         content:
@@ -1373,6 +1439,17 @@ paths:
                   format: date-time
                   description: 阅后即焚销毁时间（ISO8601 绝对时间）；到期后服务端定时任务自动销毁该消息；不传则永久保留
                   example: '2026-08-26T12:05:00.000Z'
+                cipher_text:
+                  type: string
+                  description: E2E 加密密文（AES-256-GCM，base64）；明文消息不传
+                cipher_nonce:
+                  type: string
+                  pattern: '^[A-Za-z0-9+/=_-]{12,24}$'
+                  description: GCM nonce（base64）；与 cipher_text 配套
+                sender_ephemeral_pubkey:
+                  type: string
+                  pattern: '^[A-Za-z0-9+/_-]{43,44}$'
+                  description: 发送方临时 X25519 公钥（base64，43-44 字符），接收方用它做 ECDH 还原密钥
       responses:
         '200':
           description: 发送成功（message 为「发送成功」），data 为已入库的 Message
@@ -1805,6 +1882,175 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+    delete:
+      tags: [群组]
+      summary: 群主解散群（解散即焚）
+      description: |-
+        【用途】群主解散自己创建的群。与管理员强制解散（DELETE /groups/admin/{id}）语义不同：本接口为「解散即焚」。
+
+        【调用时机】群主在群设置页确认解散时。
+
+        【业务规则与注意事项】
+        - 仅该群 owner 可调用，其他成员/群管理员返回 403；已解散的群返回 400。
+        - 解散即焚：解散瞬间全群消息被置为立即到期（destroy_at=解散时刻），消息列表对成员立即不可见，约 1 分钟内由服务端焚毁调度器物理清除（含回执与附件文件）。
+        - 群记录（Conversation）保留并打 dissolved_at + dissolved_by 标记，成员不可再发消息；群内成员 WS 实时收到 conversation:updated（reason=dissolved）。
+        - 与「阅后即焚」共用同一条物理清除链路，清除动作不可恢复，前端交互上应二次确认。
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+          description: 群会话 ID（UUID）
+          example: 1b2c3d4e-5f6a-47b8-89c0-d1e2f3a4b5c6
+      responses:
+        '200':
+          description: 解散成功（message 为「群组已解散」），data 为 null
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: 群组已解散 }
+                  data: { nullable: true, example: null }
+        '400':
+          description: 群已解散 / 目标不是群会话
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: 未携带或无效/过期 token；账号已停用或设备已下线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: 仅群 owner 可解散该群
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: 群不存在
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /groups/admin/all:
+    get:
+      tags: [群组]
+      summary: 全量群组管理列表（仅 admin）
+      description: |-
+        【用途】管理员分页查看全平台所有群组，含群主信息、成员数与解散状态。
+
+        【调用时机】管理后台「群组管理」列表页加载与筛选时。
+
+        【业务规则与注意事项】
+        - 仅 admin 角色可调用。
+        - 默认不含已解散群，传 include_dissolved=true 可一并查看（dissolved_at 非空即为已解散）。
+        - 响应分页结构为 { data, total }，data 元素在 Conversation 基础上补充 owner_name（群主显示名）与 member_count。
+      parameters:
+        - name: page
+          in: query
+          schema: { type: integer, minimum: 1, default: 1 }
+          description: 页码，默认 1
+        - name: pageSize
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 20 }
+          description: 每页条数，默认 20
+        - name: keyword
+          in: query
+          schema: { type: string }
+          description: 群名称模糊搜索
+          example: 产品
+        - name: include_dissolved
+          in: query
+          schema: { type: string, enum: ['true'] }
+          description: 传 true 时结果包含已解散群；默认不含
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: ok }
+                  data:
+                    type: object
+                    properties:
+                      data:
+                        type: array
+                        description: 群组列表（Conversation + owner_name + member_count + dissolved_at/dissolved_by）
+                        items:
+                          $ref: '#/components/schemas/Conversation'
+                      total:
+                        type: integer
+                        description: 满足条件的群组总数
+                        example: 42
+        '401':
+          description: 未携带或无效/过期 token；账号已停用或设备已下线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: 非 admin 角色（Admin access required）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /groups/admin/{id}:
+    delete:
+      tags: [群组]
+      summary: 管理员强制解散群（留痕，仅 admin）
+      description: |-
+        【用途】管理员强制解散任意群组，用于违规群处置。与群主解散（DELETE /groups/{id}）语义不同：本接口「留痕」——消息记录保留供审计，不做物理焚毁。
+
+        【调用时机】管理后台「群组管理」对违规群执行强制解散时。
+
+        【业务规则与注意事项】
+        - 仅 admin 角色可调用；已解散的群重复操作返回 400。
+        - 解散后群打 dissolved_at + dissolved_by（操作管理员）标记，成员不可再发消息，消息与回执完整保留，可通过审计/管理后台追溯。
+        - 群内成员 WS 实时收到 conversation:updated（reason=dissolved），前端应将群置灰并禁止输入。
+        - 审计日志留痕（action=dissolve_group，含操作者与 IP）。
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+          description: 群会话 ID（UUID）
+          example: 1b2c3d4e-5f6a-47b8-89c0-d1e2f3a4b5c6
+      responses:
+        '200':
+          description: 解散成功（message 为「群组已解散」），data 为 null
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: 群组已解散 }
+                  data: { nullable: true, example: null }
+        '400':
+          description: 群已解散 / 目标不是群会话
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: 未携带或无效/过期 token；账号已停用或设备已下线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: 非 admin 角色（Admin access required）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: 群不存在
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   /groups/{id}/members:
     get:
       tags: [群组]
@@ -2094,6 +2340,447 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /stats/overview:
+    get:
+      tags: [统计]
+      summary: Dashboard 统计概览（仅 admin）
+      description: |-
+        【用途】管理后台首页的汇总指标：账号、消息、群组、在线设备与存储占用，一次调用全部返回。
+
+        【调用时机】管理后台 Dashboard 首页加载/刷新时。
+
+        【业务规则与注意事项】
+        - 仅 admin 角色可调用。
+        - today_active_users 为「今日登录过 ∪ 今日发过言」的去重人数（原生 SQL 一次统计）。
+        - storage 中 db_bytes 来自 information_schema 当前库 data_length+index_length；upload_bytes 为上传目录递归求和。
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: ok }
+                  data:
+                    type: object
+                    properties:
+                      total_users: { type: integer, description: 有效账号总数（不含已软删）, example: 137 }
+                      disabled_users: { type: integer, description: 已停用账号数, example: 3 }
+                      deleted_users: { type: integer, description: 已软删除账号数, example: 1 }
+                      today_active_users: { type: integer, description: 今日活跃人数（登录∪发言去重）, example: 56 }
+                      today_messages: { type: integer, description: 今日消息量, example: 1024 }
+                      total_messages: { type: integer, description: 累计消息量, example: 98765 }
+                      total_conversations: { type: integer, description: 有效会话总数（不含已解散）, example: 88 }
+                      total_groups: { type: integer, description: 有效群组数（不含已解散）, example: 21 }
+                      online_devices: { type: integer, description: 当前在线设备数, example: 40 }
+                      storage:
+                        type: object
+                        description: 存储占用（字节）
+                        properties:
+                          upload_bytes: { type: integer, example: 524288000 }
+                          upload_files: { type: integer, example: 320 }
+                          db_bytes: { type: integer, example: 104857600 }
+                          total_bytes: { type: integer, example: 629145600 }
+                      generated_at: { type: string, format: date-time, description: 统计生成时间 }
+        '401':
+          description: 未携带或无效/过期 token；账号已停用或设备已下线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: 非 admin 角色（Admin access required）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /announcements:
+    post:
+      tags: [公告]
+      summary: 发布系统公告（仅 admin）
+      description: |-
+        【用途】管理员发布一条系统公告，分 normal / urgent 两级。
+
+        【调用时机】管理后台「系统公告」发布操作时。
+
+        【业务规则与注意事项】
+        - 仅 admin 角色可调用。
+        - normal：进入 App 公告中心，用户打开公告页时拉取；urgent：除进公告中心外，还通过 WebSocket 实时推送 announcement:new 事件给在线用户（前端弹窗）。
+        - target_type=department 时 target_departments 必填，部门名需与账号 department 字段完全一致，否则目标用户不可见。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title, content]
+              properties:
+                title:
+                  type: string
+                  maxLength: 200
+                  description: 公告标题
+                  example: 系统维护通知
+                content:
+                  type: string
+                  description: 公告正文
+                  example: 本周六 22:00-24:00 服务器升级维护，期间消息可能延迟。
+                priority:
+                  type: string
+                  enum: [normal, urgent]
+                  default: normal
+                  description: urgent 会走 WebSocket 实时弹窗推送到在线 App
+                target_type:
+                  type: string
+                  enum: [all, department]
+                  default: all
+                  description: all=全员；department=按部门定向
+                target_departments:
+                  type: array
+                  items: { type: string }
+                  description: target_type=department 时必填，部门名单（需与账号部门完全一致）
+                  example: ['技术部', '市场部']
+      responses:
+        '200':
+          description: 发布成功（message 为「公告发布成功」），data 为已入库的公告对象
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: 公告发布成功 }
+                  data:
+                    $ref: '#/components/schemas/Announcement'
+        '400':
+          description: 参数校验失败（如 target_type=department 但未传部门名单）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: 未携带或无效/过期 token；账号已停用或设备已下线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: 非 admin 角色（Admin access required）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    get:
+      tags: [公告]
+      summary: App 端公告列表（公告中心）
+      description: |-
+        【用途】当前用户拉取自己可见的公告列表（全员公告 + 定向到本部门的公告）。
+
+        【调用时机】App 公告中心页加载/下拉刷新时。
+
+        【业务规则与注意事项】
+        - 按发布时间倒序；每条附 is_read 标记（是否已读），未读的可配合未读数角标展示。
+        - 部门定向公告仅目标部门成员可见。
+      parameters:
+        - name: page
+          in: query
+          schema: { type: integer, minimum: 1, default: 1 }
+          description: 页码，默认 1
+        - name: pageSize
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 20 }
+          description: 每页条数，默认 20
+      responses:
+        '200':
+          description: '成功，data 为 { data: 公告数组（含 is_read）, total }'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: ok }
+                  data:
+                    type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Announcement'
+                      total: { type: integer, example: 12 }
+        '401':
+          description: 未携带或无效/过期 token；账号已停用或设备已下线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /announcements/manage:
+    get:
+      tags: [公告]
+      summary: 公告管理列表（仅 admin，含已读人数）
+      description: |-
+        【用途】管理员查看全部公告及每条的已读人数，用于追踪触达效果。
+
+        【调用时机】管理后台「系统公告」列表页。
+
+        【业务规则与注意事项】
+        - 仅 admin 角色可调用；含全量公告（不分部门可见性），每条附 read_count（已读人数）。
+      parameters:
+        - name: page
+          in: query
+          schema: { type: integer, minimum: 1, default: 1 }
+          description: 页码，默认 1
+        - name: pageSize
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 20 }
+          description: 每页条数，默认 20
+      responses:
+        '200':
+          description: '成功，data 为 { data: 公告数组（含 read_count）, total }'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: ok }
+                  data:
+                    type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Announcement'
+                      total: { type: integer, example: 12 }
+        '401':
+          description: 未携带或无效/过期 token；账号已停用或设备已下线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: 非 admin 角色（Admin access required）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /announcements/unread-count:
+    get:
+      tags: [公告]
+      summary: 当前用户未读公告数
+      description: |-
+        【用途】返回当前用户可见公告中未读的条数，用于 App 公告中心入口角标。
+
+        【调用时机】App 启动/回到前台/收到 announcement:new 推送后刷新角标时。
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: ok }
+                  data:
+                    type: object
+                    properties:
+                      unread: { type: integer, description: 未读公告条数, example: 3 }
+        '401':
+          description: 未携带或无效/过期 token；账号已停用或设备已下线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /announcements/{id}:
+    delete:
+      tags: [公告]
+      summary: 删除公告（仅 admin）
+      description: |-
+        【用途】删除一条公告，同时清除其全部已读记录；已推送的弹窗不撤回，公告中心列表不再展示。
+
+        【调用时机】管理后台「系统公告」对过期/误发公告执行删除时。
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+          description: 公告 ID（UUID）
+      responses:
+        '200':
+          description: 删除成功（message 为「公告已删除」），data 为 null
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: 公告已删除 }
+                  data: { nullable: true, example: null }
+        '401':
+          description: 未携带或无效/过期 token；账号已停用或设备已下线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: 非 admin 角色（Admin access required）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: 公告不存在
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /announcements/{id}/read:
+    post:
+      tags: [公告]
+      summary: 标记公告已读
+      description: |-
+        【用途】当前用户将一条公告标记为已读；一人一公告一条已读记录（唯一约束），重复调用幂等。
+
+        【调用时机】用户点开公告详情时。
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+          description: 公告 ID（UUID）
+      responses:
+        '200':
+          description: 成功（message 为「已标记为已读」），data 为 null
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: 已标记为已读 }
+                  data: { nullable: true, example: null }
+        '401':
+          description: 未携带或无效/过期 token；账号已停用或设备已下线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: 公告不存在
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /keys:
+    post:
+      tags: [密钥]
+      summary: 上传/更新自己的 E2E identity 公钥
+      description: |-
+        【用途】上传本设备生成的 X25519 identity 公钥，作为端到端加密的身份公钥；私钥永不出设备，服务端零接触。
+
+        【调用时机】App 首次启用加密聊天、或本地重新生成密钥对后。
+
+        【业务规则与注意事项】
+        - 一用户一公钥：重复上传相同公钥幂等返回 updated=false；上传不同公钥则覆盖更新（旧公钥协商的会话需重新协商）。
+        - 限流：每用户每分钟 5 次，超限返回 429。
+        - 公钥替换风险：当前版本服务端不做公钥防替换校验，威胁模型与协议细节见 docs/E2E_ENCRYPTION.md。
+        - 上传/更换公钥后，该用户全部设备会收到 WS 事件 device:added，客户端可按 device_id 忽略本机。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [identity_pubkey]
+              properties:
+                identity_pubkey:
+                  type: string
+                  pattern: '^[A-Za-z0-9+/_-]{43,44}$'
+                  description: X25519 identity 公钥的 base64 编码（32 字节 → 43-44 字符）
+                  example: 'MCowBQYDK2VuAyEAj1Zs8a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4='
+      responses:
+        '200':
+          description: 成功（message 为「公钥已上传」）
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: 公钥已上传 }
+                  data:
+                    type: object
+                    properties:
+                      updated: { type: boolean, description: 是否发生写入（相同公钥幂等时为 false）, example: true }
+        '400':
+          description: 公钥格式错误（需 32 字节 X25519 公钥的 base64 编码）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: 未携带或无效/过期 token；账号已停用或设备已下线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: 触发限流（每用户每分钟 5 次）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /keys/{userId}:
+    get:
+      tags: [密钥]
+      summary: 查询某用户的 E2E identity 公钥
+      description: |-
+        【用途】发起端到端加密前，获取对方的 identity 公钥用于 ECDH 协商。
+
+        【调用时机】与某用户建立/恢复加密会话时；也可传自己的 userId 比对「本地存储的 vs 服务端存的」公钥一致性（自查是否被替换）。
+
+        【业务规则与注意事项】
+        - 权限：仅当双方至少同在一个会话（conversation）时可查，否则 403；查自己不受此限。
+        - 纯元数据通道：只返回公钥，不含手机号、姓名等任何个人信息。
+        - 限流：每用户每分钟 60 次，超限返回 429。
+        - 对方未上传公钥时返回 404，前端应提示「对方暂未启用加密聊天」并回退明文。
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+          description: 目标用户 ID（UUID）
+          example: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: ok }
+                  data:
+                    type: object
+                    properties:
+                      user_id: { type: string, format: uuid }
+                      identity_pubkey: { type: string, description: X25519 公钥 base64 }
+                      created_at: { type: string, format: date-time }
+                      updated_at: { type: string, format: date-time, description: 公钥最后更新时间，可用于变更侦测 }
+        '401':
+          description: 未携带或无效/过期 token；账号已停用或设备已下线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: 与目标用户无共同会话，无权查询其公钥
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: 目标用户尚未上传公钥
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: 触发限流（每用户每分钟 60 次）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -2288,6 +2975,25 @@ components:
           nullable: true
           description: 阅后即焚销毁时间，到期服务端自动销毁；非焚毁消息为 null
           example: null
+        is_encrypted:
+          type: boolean
+          description: 是否 E2E 端到端加密消息；为 true 时正文在 cipher_text，content 为占位/空
+          example: false
+        cipher_text:
+          type: string
+          nullable: true
+          description: E2E 密文（AES-256-GCM，base64）；明文消息为 null
+          example: null
+        cipher_nonce:
+          type: string
+          nullable: true
+          description: GCM nonce（base64）；明文消息为 null
+          example: null
+        sender_ephemeral_pubkey:
+          type: string
+          nullable: true
+          description: 发送方临时 X25519 公钥（base64）；明文消息为 null
+          example: null
         created_at:
           type: string
           format: date-time
@@ -2298,6 +3004,59 @@ components:
           format: date-time
           description: 更新时间
           example: '2026-08-26T08:00:00.000Z'
+
+    Announcement:
+      type: object
+      description: 系统公告对象（App 端列表附 is_read；管理列表附 read_count）
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: 公告 ID（UUID v4）
+        title:
+          type: string
+          description: 公告标题
+          example: 系统维护通知
+        content:
+          type: string
+          description: 公告正文
+          example: 本周六 22:00-24:00 服务器升级维护，期间消息可能延迟。
+        priority:
+          type: string
+          enum: [normal, urgent]
+          description: normal 进公告中心；urgent 另走 WS 实时弹窗（announcement:new）
+          example: normal
+        target_type:
+          type: string
+          enum: [all, department]
+          description: all=全员；department=按部门定向
+          example: all
+        target_departments:
+          type: array
+          items: { type: string }
+          nullable: true
+          description: 定向部门名单（target_type=department 时有值）
+          example: null
+        created_by:
+          type: string
+          format: uuid
+          description: 发布人（管理员）用户 ID
+        is_read:
+          type: boolean
+          description: 当前用户是否已读（仅 App 端列表接口返回）
+          example: false
+        read_count:
+          type: integer
+          description: 已读人数（仅管理列表 GET /announcements/manage 返回）
+          example: 35
+        created_at:
+          type: string
+          format: date-time
+          example: '2026-08-27T08:00:00.000Z'
+        updated_at:
+          type: string
+          format: date-time
+          example: '2026-08-27T08:00:00.000Z'
 
     Conversation:
       type: object
@@ -2348,6 +3107,18 @@ components:
           nullable: true
           description: 最后一条消息时间（会话列表按此倒序，无消息为 null 排最后）
           example: '2026-08-26T08:00:00.000Z'
+        dissolved_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: 解散时间；非空即已解散（成员不可再发消息），未解散为 null
+          example: null
+        dissolved_by:
+          type: string
+          format: uuid
+          nullable: true
+          description: 解散操作人用户 ID（群主解散=群主，管理员强制解散=管理员），未解散为 null
+          example: null
         created_at:
           type: string
           format: date-time

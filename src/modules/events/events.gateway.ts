@@ -67,7 +67,7 @@ export class EventsGateway implements OnGatewayConnection, OnGatewayDisconnect {
           where: { id: payload.deviceId, user_id: payload.userId },
         }),
       ]);
-      if (!user || user.status !== 'active') {
+      if (!user || user.status !== 'active' || user.deleted_at) {
         throw new Error('账号已被停用或不存在');
       }
       if (!device) {

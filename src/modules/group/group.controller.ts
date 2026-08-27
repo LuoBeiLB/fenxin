@@ -1,6 +1,8 @@
-import { Body, Controller, Delete, Get, Param, Post, Put } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Post, Put, Query, Req } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
+import { Request } from 'express';
 import { GroupService } from './group.service';
+import { Roles } from '../../common/decorators/roles.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { ResponseMessage } from '../../common/decorators/response-message.decorator';
 import { AuthPayload } from '../../common/guards/jwt-auth.guard';
@@ -11,6 +13,40 @@ import { CreateGroupDto, UpdateGroupDto, AddMembersDto, SetRoleDto } from './dto
 @Controller('groups')
 export class GroupController {
   constructor(private readonly groupService: GroupService) {}
+
+  /** 管理员：全量群组列表（含群主信息、成员数、解散状态），管理后台群组管理页用 */
+  @Get('admin/all')
+  @Roles('admin')
+  adminList(
+    @Query('page') page?: number,
+    @Query('pageSize') pageSize?: number,
+    @Query('keyword') keyword?: string,
+    @Query('include_dissolved') includeDissolved?: string,
+  ) {
+    return this.groupService.adminListGroups({
+      page: page ? Number(page) : 1,
+      pageSize: pageSize ? Number(pageSize) : 20,
+      keyword,
+      includeDissolved: includeDissolved === 'true',
+    });
+  }
+
+  /** 管理员：强制解散群（软解散：成员不可再发消息，消息记录保留供审计） */
+  @Delete('admin/:id')
+  @Roles('admin')
+  @ResponseMessage('群组已解散')
+  async dissolve(@CurrentUser() user: AuthPayload, @Param('id') id: string, @Req() req: Request) {
+    await this.groupService.dissolveGroup(id, user.userId, req.ip);
+    return null;
+  }
+
+  /** 群主：解散自己的群（解散即焚：全群消息到期由调度器物理清除，群记录保留） */
+  @Delete(':id')
+  @ResponseMessage('群组已解散')
+  async dissolveByOwner(@CurrentUser() user: AuthPayload, @Param('id') id: string) {
+    await this.groupService.dissolveGroupByOwner(id, user.userId);
+    return null;
+  }
 
   @Post()
   @ResponseMessage('群组创建成功')

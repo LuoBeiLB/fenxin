@@ -3,7 +3,8 @@ import 'dotenv/config';
 import * as fs from 'fs';
 import * as path from 'path';
 import { NestFactory } from '@nestjs/core';
-import { ValidationPipe } from '@nestjs/common';
+import { Logger as PinoNestLogger } from 'nestjs-pino';
+import { ValidationPipe, Logger } from '@nestjs/common';
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import { NestExpressApplication } from '@nestjs/platform-express';
 import { AppModule } from './app.module';
@@ -13,7 +14,12 @@ async function bootstrap() {
   const uploadDir = path.resolve(process.cwd(), process.env.UPLOAD_DIR || './uploads');
   fs.mkdirSync(uploadDir, { recursive: true });
 
-  const app = await NestFactory.create<NestExpressApplication>(AppModule);
+  // bufferLogs + useLogger：让所有 NestJS Logger（含各 service 内 new Logger('X')）都走 pino，
+  // 输出结构化 JSON（生产）或带色 pretty 行（开发）
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, {
+    bufferLogs: true,
+  });
+  app.useLogger(app.get(PinoNestLogger));
 
   app.setGlobalPrefix('api/v1');
   app.useGlobalPipes(
@@ -62,7 +68,9 @@ async function bootstrap() {
 
   const port = parseInt(process.env.PORT || '9091', 10);
   await app.listen(port);
-  console.log(`[Server] BurnMsg API (NestJS) running on port ${port}`);
+  // 启动横幅走 NestJS Logger（pino 接管），带 [Bootstrap] context
+  const logger = new Logger('Bootstrap');
+  logger.log(`BurnMsg API (NestJS) running on port ${port}`);
 }
 
 bootstrap();

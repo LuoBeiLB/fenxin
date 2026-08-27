@@ -47,6 +47,9 @@ export class MessageService {
     fileSize?: number;
     replyToId?: string;
     destroyAt?: string;
+    senderEphemeralPubkey?: string;
+    cipherNonce?: string;
+    cipherText?: string;
   }): Promise<Message> {
     const msgRepo = this.dataSource.getRepository(Message);
     const convRepo = this.dataSource.getRepository(Conversation);
@@ -57,12 +60,22 @@ export class MessageService {
 
     const conv = await convRepo.findOne({ where: { id: params.conversationId } });
     if (!conv) throw new NotFoundException('会话不存在');
+    if (conv.dissolved_at) throw new ForbiddenException('群组已解散，不能再发送消息');
 
     if (params.type === 'text' && !params.content) {
       throw new BadRequestException('文本消息 content 不能为空');
     }
     if (params.type !== 'text' && !params.fileUrl) {
       throw new BadRequestException(`${params.type} 消息 file_url 不能为空`);
+    }
+
+    // E2E：三个加密字段必须同时提供（全密文）或同时缺省（明文），不允许半加密状态
+    const encFields = [params.senderEphemeralPubkey, params.cipherNonce, params.cipherText];
+    const isEncrypted = encFields.every((f) => f !== undefined && f !== null && f !== '');
+    if (!isEncrypted && encFields.some((f) => f !== undefined && f !== null && f !== '')) {
+      throw new BadRequestException(
+        '加密字段不完整：sender_ephemeral_pubkey / cipher_nonce / cipher_text 必须同时提供',
+      );
     }
 
     const savedMsg = await msgRepo.save(
@@ -76,6 +89,11 @@ export class MessageService {
         file_size: params.fileSize ?? null,
         reply_to_id: params.replyToId ?? null,
         destroy_at: params.destroyAt ? new Date(params.destroyAt) : null,
+        // E2E 加密字段（明文消息全为 null / false）
+        is_encrypted: isEncrypted,
+        cipher_nonce: isEncrypted ? params.cipherNonce! : null,
+        cipher_text: isEncrypted ? params.cipherText! : null,
+        sender_ephemeral_pubkey: isEncrypted ? params.senderEphemeralPubkey! : null,
       }),
     );
 

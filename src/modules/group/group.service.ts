@@ -1,9 +1,11 @@
-import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { Conversation } from '../../entities/conversation.entity';
 import { ConversationMember } from '../../entities/conversation-member.entity';
+import { Message } from '../../entities/message.entity';
 import { AppUser, sanitizeUser } from '../../entities/app-user.entity';
 import { EventsGateway } from '../events/events.gateway';
+import { AuditService } from '../audit/audit.service';
 import { WS_EVENTS } from '../events/events.types';
 
 @Injectable()
@@ -11,6 +13,7 @@ export class GroupService {
   constructor(
     private readonly dataSource: DataSource,
     private readonly events: EventsGateway,
+    private readonly audit: AuditService,
   ) {}
 
   private async getMembership(conversationId: string, userId: string) {
@@ -133,6 +136,10 @@ export class GroupService {
     role: 'admin' | 'member',
     operatorId: string,
   ): Promise<void> {
+    const conv = await this.dataSource.getRepository(Conversation).findOne({
+      where: { id: conversationId },
+    });
+    if (conv?.dissolved_at) throw new BadRequestException('群组已解散，不能执行管理操作');
     const operatorMembership = await this.getMembership(conversationId, operatorId);
     if (operatorMembership?.role !== 'owner') {
       throw new ForbiddenException('Only group owner can set admin role');
@@ -194,5 +201,129 @@ export class GroupService {
         };
       }),
     );
+  }
+
+  /**
+   * 管理员：全量群组列表（管理后台群组管理页）。
+   * 默认只返回未解散群；include_dissolved=true 时包含已解散（回收站/审计视图）。
+   */
+  async adminListGroups(params: {
+    page?: number;
+    pageSize?: number;
+    keyword?: string;
+    includeDissolved?: boolean;
+  }) {
+    const page = params.page || 1;
+    const pageSize = params.pageSize || 20;
+
+    const qb = this.dataSource
+      .getRepository(Conversation)
+      .createQueryBuilder('c')
+      .where("c.type = 'group'");
+
+    if (!params.includeDissolved) {
+      qb.andWhere('c.dissolved_at IS NULL');
+    }
+    if (params.keyword) {
+      qb.andWhere('c.name LIKE :kw', { kw: `%${params.keyword}%` });
+    }
+
+    qb.orderBy('c.created_at', 'DESC').skip((page - 1) * pageSize).take(pageSize);
+    const [groups, total] = await qb.getManyAndCount();
+
+    // 批量补群主姓名（一次 IN 查询，避免 N+1）
+    const ownerIds = [...new Set(groups.map((g) => g.owner_id).filter((id): id is string => !!id))];
+    const owners = ownerIds.length
+      ? await this.dataSource.getRepository(AppUser).find({
+          where: ownerIds.map((id) => ({ id })),
+          select: ['id', 'display_name', 'phone'],
+        })
+      : [];
+    const ownerMap = new Map(owners.map((u) => [u.id, u]));
+
+    const data = groups.map((g) => ({
+      ...g,
+      owner_display_name: g.owner_id ? (ownerMap.get(g.owner_id)?.display_name ?? null) : null,
+      owner_phone: g.owner_id ? (ownerMap.get(g.owner_id)?.phone ?? null) : null,
+      is_dissolved: !!g.dissolved_at,
+    }));
+
+    return { data, total };
+  }
+
+  /**
+   * 管理员：强制解散群（软解散）。标记 dissolved_at，成员不可再发消息、
+   * 会话从成员列表消失；消息与成员记录保留供审计。操作实时推送给全体成员。
+   */
+  async dissolveGroup(conversationId: string, operatorId: string, ip?: string) {
+    const convRepo = this.dataSource.getRepository(Conversation);
+    const conv = await convRepo.findOne({ where: { id: conversationId, type: 'group' } });
+    if (!conv) throw new NotFoundException('群组不存在');
+    if (conv.dissolved_at) throw new BadRequestException('该群组已被解散');
+
+    await convRepo.update(conversationId, { dissolved_at: new Date() });
+
+    // 实时推送：群被解散，全体成员会话列表立即移除该群
+    const memberIds = await this.getMemberUserIds(conversationId);
+    this.events.emitToUsers(WS_EVENTS.CONVERSATION_UPDATED, memberIds, {
+      conversation_id: conversationId,
+      reason: 'dissolved',
+    });
+
+    await this.audit.log({
+      userId: operatorId,
+      action: 'dissolve_group',
+      targetType: 'conversation',
+      targetId: conversationId,
+      detail: `Dissolved group "${conv.name ?? conversationId}" (${memberIds.length} members)`,
+      ipAddress: ip,
+    });
+  }
+
+  /**
+   * 群主解散自己的群（解散即焚语义）：
+   * ① 群标记 dissolved_at/dissolved_by，成员立即不可再发消息；
+   * ② 全群消息 destroy_at 置为解散时刻——列表查询立即不可见，
+   *    下一分钟由 BurnScheduler 统一物理清除（含磁盘附件），与单条焚毁同一条链路；
+   * ③ WS 推 conversation:updated(dissolved)，全体成员会话列表移除该群。
+   * 与管理员强制解散的区别：管理员版保留消息供审计留痕，本版消息焚毁。
+   */
+  async dissolveGroupByOwner(conversationId: string, operatorId: string) {
+    const convRepo = this.dataSource.getRepository(Conversation);
+    const conv = await convRepo.findOne({ where: { id: conversationId, type: 'group' } });
+    if (!conv) throw new NotFoundException('群组不存在');
+    if (conv.dissolved_at) throw new BadRequestException('该群组已被解散');
+    if (conv.owner_id !== operatorId) throw new ForbiddenException('仅群主可解散群');
+
+    const dissolvedAt = new Date();
+    await this.dataSource.transaction(async (em) => {
+      await em.getRepository(Conversation).update(conversationId, {
+        dissolved_at: dissolvedAt,
+        dissolved_by: operatorId,
+      });
+      // 到期时间设为解散时刻 → 消息立即对成员不可见，等待 BurnScheduler 物理清除
+      await em
+        .createQueryBuilder()
+        .update(Message)
+        .set({ destroy_at: dissolvedAt })
+        .where('conversation_id = :conversationId', { conversationId })
+        .andWhere('is_destroyed = :destroyed', { destroyed: false })
+        .execute();
+    });
+
+    // 实时推送：群被解散，全体成员会话列表立即移除该群
+    const memberIds = await this.getMemberUserIds(conversationId);
+    this.events.emitToUsers(WS_EVENTS.CONVERSATION_UPDATED, memberIds, {
+      conversation_id: conversationId,
+      reason: 'dissolved',
+    });
+
+    await this.audit.log({
+      userId: operatorId,
+      action: 'dissolve_group_by_owner',
+      targetType: 'conversation',
+      targetId: conversationId,
+      detail: `Owner dissolved group "${conv.name ?? conversationId}" (${memberIds.length} members, messages scheduled for burn)`,
+    });
   }
 }

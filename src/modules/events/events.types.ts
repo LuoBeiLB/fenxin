@@ -15,6 +15,12 @@ export const WS_EVENTS = {
   RECEIPT_READ: 'receipt:read',
   /** 会话列表刷新信号（新建会话 / last_message_at 变化 / 成员变动） */
   CONVERSATION_UPDATED: 'conversation:updated',
+  /** 紧急公告（priority=urgent 时实时弹窗推送；普通公告不发 WS，仅进公告中心） */
+  ANNOUNCEMENT_NEW: 'announcement:new',
+  /** 同账号新设备登录通知（推给该用户全部设备，payload 带新设备信息，客户端自行忽略本设备） */
+  DEVICE_ADDED: 'device:added',
+  /** 设备被下线通知 */
+  DEVICE_REMOVED: 'device:removed',
 } as const;
 
 export type WsServerEvent = (typeof WS_EVENTS)[keyof typeof WS_EVENTS];
@@ -49,8 +55,33 @@ export interface WsReceiptReadPayload {
 /** conversation:updated 的 payload */
 export interface WsConversationUpdatedPayload {
   conversation_id: string;
-  /** 触发原因：message=新消息/last_message_at 更新；created=新建会话；members=成员变动；info=群资料变更 */
-  reason: 'message' | 'created' | 'members' | 'info';
+  /** 触发原因：message=新消息/last_message_at 更新；created=新建会话；members=成员变动；info=群资料变更；dissolved=群被解散 */
+  reason: 'message' | 'created' | 'members' | 'info' | 'dissolved';
+}
+
+/** announcement:new 的 payload（仅紧急公告） */
+export interface WsAnnouncementNewPayload {
+  id: string;
+  title: string;
+  content: string;
+  priority: 'normal' | 'urgent';
+  /** 发布时间（ISO8601） */
+  created_at: string;
+}
+
+/** device:added 的 payload */
+export interface WsDeviceAddedPayload {
+  device_id: string;
+  device_name: string;
+  device_type: string;
+  /** 登录时间（ISO8601） */
+  logged_in_at: string;
+  ip?: string;
+}
+
+/** device:removed 的 payload */
+export interface WsDeviceRemovedPayload {
+  device_id: string;
 }
 
 /** 事件名 → payload 类型映射，供 emitToUsers 做类型约束 */
@@ -60,6 +91,9 @@ export interface WsEventPayloadMap {
   'message:recalled': WsMessageRecalledPayload;
   'receipt:read': WsReceiptReadPayload;
   'conversation:updated': WsConversationUpdatedPayload;
+  'announcement:new': WsAnnouncementNewPayload;
+  'device:added': WsDeviceAddedPayload;
+  'device:removed': WsDeviceRemovedPayload;
 }
 
 /** 每个用户专属的房间名：同一用户的所有在线设备（socket）都会加入该房间 */

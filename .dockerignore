@@ -1,0 +1,57 @@
+# ---- Node / pnpm ----
+node_modules
+.pnpm-store
+
+# ---- 构建产物 ----
+dist
+build
+*.tsbuildinfo
+
+# ---- 上传文件（容器内挂卷，不应进镜像） ----
+uploads
+
+# ---- 环境与密钥 ----
+.env
+.env.local
+.env.*.local
+
+# ---- 日志 ----
+*.log
+npm-debug.log*
+pnpm-debug.log*
+logs
+
+# ---- 测试与覆盖率 ----
+coverage
+.nyc_output
+junit.xml
+
+# ---- IDE / 编辑器 ----
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# ---- OS 杂项 ----
+.DS_Store
+Thumbs.db
+
+# ---- Git ----
+.git
+.gitignore
+.gitattributes
+
+# ---- Docker 自身（避免递归） ----
+Dockerfile
+docker-compose.yml
+docker-compose.*.yml
+.dockerignore
+
+# ---- 文档 / 临时 ----
+README.md
+*.md
+!src/**/*.md
+tmp
+temp
+.cache

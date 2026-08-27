@@ -12,6 +12,9 @@ import { Device } from '../../entities/device.entity';
 import { AuditService } from '../audit/audit.service';
 import { TokenService } from './token.service';
 import { AuthPayload } from '../../common/guards/jwt-auth.guard';
+import { AuthCacheService } from '../../common/cache/auth-cache.service';
+import { EventsGateway } from '../events/events.gateway';
+import { WS_EVENTS } from '../events/events.types';
 
 const MAX_LOGIN_FAILS = 5;
 const LOCK_DURATION_MINUTES = 15;
@@ -22,6 +25,8 @@ export class AuthService {
     private readonly dataSource: DataSource,
     private readonly audit: AuditService,
     private readonly tokenService: TokenService,
+    private readonly authCache: AuthCacheService,
+    private readonly events: EventsGateway,
   ) {}
 
   /**
@@ -44,7 +49,7 @@ export class AuthService {
       throw new UnauthorizedException(`Account locked. Try again in ${remainSec} seconds`);
     }
 
-    if (user.status !== 'active') throw new UnauthorizedException('账号已被停用');
+    if (user.status !== 'active' || user.deleted_at) throw new UnauthorizedException('账号已被停用');
 
     const isValid = await argon2.verify(user.password_hash, password).catch(() => false);
     if (!isValid) {
@@ -70,6 +75,19 @@ export class AuthService {
         last_active_at: new Date(),
       }),
     );
+
+    // 新设备登录通知：推给同账号全部在线设备（含本设备，客户端按 device_id 自行忽略）
+    // 仅当已是第 2 台以上设备时才打扰用户；首台登录不推
+    const onlineDeviceCount = await deviceRepo.count({ where: { user_id: user.id } });
+    if (onlineDeviceCount > 1) {
+      this.events.emitToUsers(WS_EVENTS.DEVICE_ADDED, [user.id], {
+        device_id: device.id,
+        device_name: device.device_name,
+        device_type: device.device_type,
+        logged_in_at: new Date().toISOString(),
+        ip: meta.ip,
+      });
+    }
 
     const payload: AuthPayload = {
       userId: user.id,
@@ -108,6 +126,10 @@ export class AuthService {
       force_change_pwd: false,
     });
 
+    // 主动失效鉴权缓存：各设备缓存里 force_change_pwd 还是 true，
+    // 失效后守卫下次重查 DB，避免 30s TTL 内继续拦截已改密用户
+    this.authCache.invalidate(userId);
+
     await this.audit.log({ userId, action: 'change_password' });
   }
 
@@ -129,7 +151,7 @@ export class AuthService {
     if (!device) throw new UnauthorizedException('设备已下线，请重新登录');
 
     const user = await userRepo.findOne({ where: { id: payload.userId } });
-    if (!user || user.status !== 'active') throw new UnauthorizedException('账号已被停用或不存在');
+    if (!user || user.status !== 'active' || user.deleted_at) throw new UnauthorizedException('账号已被停用或不存在');
 
     const newPayload: AuthPayload = {
       userId: user.id,
@@ -171,6 +193,10 @@ export class AuthService {
   /** 下线设备 = 删除设备记录；因 JWT 守卫每请求校验设备存在性，该设备 token 立即失效 */
   async removeDevice(userId: string, deviceId: string) {
     await this.dataSource.getRepository(Device).delete({ id: deviceId, user_id: userId });
+    // 失效鉴权缓存：避免 30s TTL 内被下线设备仍凭缓存通过校验
+    this.authCache.invalidate(userId);
+    // WS 通知该用户全部设备（被下线设备若还连着可立即跳转登录页）
+    this.events.emitToUsers(WS_EVENTS.DEVICE_REMOVED, [userId], { device_id: deviceId });
     await this.audit.log({ userId, action: 'remove_device', targetId: deviceId });
   }
 }

@@ -1,5 +1,10 @@
-import { IsString, IsUUID, IsIn, IsOptional, IsNumber, IsDateString, MaxLength } from 'class-validator';
+import { IsString, IsUUID, IsIn, IsOptional, IsNumber, IsDateString, MaxLength, Length, Matches } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+
+/** X25519 公钥 base64：32 字节 → 44 字符（含结尾 =） */
+const PUBKEY_BASE64_RE = /^[A-Za-z0-9+/]{43}=$/;
+/** AES-256-GCM nonce base64：12 字节 → 16 字符 */
+const NONCE_BASE64_RE = /^[A-Za-z0-9+/]{16}$/;
 
 export class SendMessageDto {
   @ApiProperty()
@@ -41,6 +46,25 @@ export class SendMessageDto {
   @IsOptional()
   @IsDateString()
   destroy_at?: string;
+
+  @ApiPropertyOptional({ description: 'E2E 加密：发送方临时 X25519 公钥（base64，44 字符）。三个加密字段必须同时提供' })
+  @IsOptional()
+  @IsString()
+  @Length(44, 44)
+  @Matches(PUBKEY_BASE64_RE, { message: 'sender_ephemeral_pubkey 格式错误' })
+  sender_ephemeral_pubkey?: string;
+
+  @ApiPropertyOptional({ description: 'E2E 加密：AES-256-GCM nonce（base64，16 字符）' })
+  @IsOptional()
+  @IsString()
+  @Length(16, 16)
+  @Matches(NONCE_BASE64_RE, { message: 'cipher_nonce 格式错误（需 12 字节 nonce 的 base64 编码）' })
+  cipher_nonce?: string;
+
+  @ApiPropertyOptional({ description: 'E2E 加密：AES-256-GCM 密文 + auth tag（base64）' })
+  @IsOptional()
+  @IsString()
+  cipher_text?: string;
 }
 
 export class EditMessageDto {

@@ -42,6 +42,11 @@ export class AppUser {
   @Column({ type: 'datetime', nullable: true })
   locked_until: Date | null;
 
+  /** 软删除标记：非空表示账号已删除（不可登录、不出现在通讯录，历史数据保留供审计） */
+  @Index('idx_users_deleted_at')
+  @Column({ type: 'datetime', nullable: true })
+  deleted_at: Date | null;
+
   @CreateDateColumn({ type: 'datetime' })
   created_at: Date;
 
@@ -60,6 +65,7 @@ export const SAFE_USER_FIELDS: (keyof AppUser)[] = [
   'role',
   'status',
   'force_change_pwd',
+  'deleted_at',
   'created_at',
   'updated_at',
 ];

@@ -10,6 +10,7 @@ import {
   IsInt,
   Min,
   Max,
+  IsBoolean,
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
@@ -97,4 +98,10 @@ export class ListAccountsQuery {
   @IsOptional()
   @IsIn(['active', 'disabled'])
   status?: string;
+
+  /** 是否包含已软删除账号（默认不包含；true 时全部返回，供回收站视图使用） */
+  @IsOptional()
+  @Type(() => Boolean)
+  @IsBoolean()
+  show_deleted?: boolean;
 }
