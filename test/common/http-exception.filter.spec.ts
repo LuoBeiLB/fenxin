@@ -23,7 +23,7 @@ describe('HttpExceptionFilter', () => {
     expect(res.json).toHaveBeenCalledWith({ code: 418, message: 'boom' });
   });
 
-  it('业务 code 字符串（ForbiddenException({code:...})）→ 改名为 errorCode', () => {
+  it('业务 code 字符串（ForbiddenException({code:...})）→ 提取 message（master 无 errorCode 体系）', () => {
     const { host, res } = makeHost();
     filter.catch(
       new ForbiddenException({
@@ -36,7 +36,6 @@ describe('HttpExceptionFilter', () => {
     expect(res.json).toHaveBeenCalledWith({
       code: 403,
       message: '请先改密',
-      errorCode: 'FORCE_CHANGE_PASSWORD',
     });
   });
 
@@ -53,7 +52,6 @@ describe('HttpExceptionFilter', () => {
     expect(res.json).toHaveBeenCalledWith({
       code: 400,
       message: 'phone must be string; password too short',
-      error: 'Bad Request',
     });
   });
 

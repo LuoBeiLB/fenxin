@@ -2,7 +2,7 @@ import { AuthCacheService, CachedAuthContext } from '../../src/common/cache/auth
 
 describe('AuthCacheService', () => {
   const makeCtx = (): Omit<CachedAuthContext, 'cachedAt'> => ({
-    user: { id: 'u1', phone: '138', role: 'user', status: 'active', force_change_pwd: false },
+    user: { id: 'u1', phone: '138', role: 'user', status: 'active', force_change_pwd: false, deleted_at: null },
     device: { id: 'd1', user_id: 'u1' },
   });
 

@@ -5,6 +5,7 @@ import * as XLSX from 'xlsx';
 import { AppUser, sanitizeUser, SAFE_USER_FIELDS } from '../../entities/app-user.entity';
 import { Device } from '../../entities/device.entity';
 import { AuditService } from '../audit/audit.service';
+import { AuthCacheService } from '../../common/cache/auth-cache.service';
 import { generateRandomPassword } from '../../common/utils/password.util';
 
 export interface BatchResult {
@@ -20,6 +21,7 @@ export class AccountService {
   constructor(
     private readonly dataSource: DataSource,
     private readonly audit: AuditService,
+    private readonly authCache: AuthCacheService,
   ) {}
 
   async createAccount(params: {
@@ -140,6 +142,9 @@ export class AccountService {
       force_change_pwd: true,
     });
 
+    // 主动失效鉴权缓存：force_change_pwd 已翻回 true，避免 30s TTL 内守卫仍按旧缓存放行
+    this.authCache.invalidate(targetUserId);
+
     await this.audit.log({
       userId: operatorId,
       action: 'reset_password',
@@ -169,6 +174,9 @@ export class AccountService {
       await this.dataSource.getRepository(Device).delete({ user_id: targetUserId });
     }
 
+    // 主动失效鉴权缓存：停用/启用立即生效，不等 30s TTL（停用慢 30s = 被禁用户还能继续操作 30s）
+    this.authCache.invalidate(targetUserId);
+
     await this.audit.log({
       userId: operatorId,
       action: status === 'active' ? 'enable_account' : 'disable_account',
@@ -192,6 +200,9 @@ export class AccountService {
     });
     // 删除设备记录 = 立即吊销该账号所有已签发 token（JWT 守卫每请求校验设备存在性）
     await this.dataSource.getRepository(Device).delete({ user_id: targetUserId });
+
+    // 主动失效鉴权缓存：deleted_at 已写入，避免 30s TTL 内已删除账号凭旧缓存继续通行
+    this.authCache.invalidate(targetUserId);
 
     await this.audit.log({
       userId: operatorId,

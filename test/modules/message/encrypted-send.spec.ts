@@ -4,7 +4,6 @@ import { Message } from 'src/entities/message.entity';
 import { Conversation } from 'src/entities/conversation.entity';
 import { ConversationMember } from 'src/entities/conversation-member.entity';
 import { MessageReceipt } from 'src/entities/message-receipt.entity';
-import { BurnDuration } from 'src/modules/message/dto';
 
 /**
  * 验证"sendMessage 加密路径"链路（V4.0 §E2E 方案 B）。
@@ -14,7 +13,7 @@ import { BurnDuration } from 'src/modules/message/dto';
  *   2. 全填加密字段 → 加密路：is_encrypted=true、content='[加密消息]'、3 字段透传
  *   3. 半填（只填 1 字段） → BadRequestException
  *   4. 半填（只填 2 字段） → BadRequestException
- *   5. 加密 + expiresIn='5s' 阅后即焚 → 组合：destroy_at 落库 + 加密字段都在
+ *   5. 加密 + destroyAt（5s 后）阅后即焚 → 组合：destroy_at 落库 + 加密字段都在
  *   6. 加密路径 content 不传 → 不抛错（占位由 service 强制填 '[加密消息]'）
  *
  * 不接 DB：jest.fn 替身 repository + dataSource.transaction 走回调；
@@ -107,11 +106,11 @@ describe('MessageService.sendMessage（V4.0 §E2E 加密路径）', () => {
     expect(savedMessages[0].cipher_text).toBeNull();
     expect(savedMessages[0].cipher_nonce).toBeNull();
     expect(savedMessages[0].sender_ephemeral_pubkey).toBeNull();
+    // master events 网关签名：emitToUsers(event, userIds, payload)，事件名 message:new
     expect(realtime.emitToUsers).toHaveBeenCalledWith(
+      'message:new',
       expect.any(Array),
-      'message_created',
       expect.objectContaining({ message: expect.objectContaining({ is_encrypted: false }) }),
-      'u1',
     );
   });
 
@@ -136,17 +135,16 @@ describe('MessageService.sendMessage（V4.0 §E2E 加密路径）', () => {
     expect(saved.cipher_text).toBe(VALID_CIPHER);
     expect(saved.cipher_nonce).toBe(VALID_NONCE);
     expect(saved.sender_ephemeral_pubkey).toBe(VALID_EPK);
-    // WS 推送完整 payload
+    // WS 推送完整 payload（master events 网关签名：emitToUsers(event, userIds, payload)）
     expect(realtime.emitToUsers).toHaveBeenCalledWith(
+      'message:new',
       expect.any(Array),
-      'message_created',
       expect.objectContaining({
         message: expect.objectContaining({
           is_encrypted: true,
           cipher_text: VALID_CIPHER,
         }),
       }),
-      'u1',
     );
   });
 
@@ -183,8 +181,8 @@ describe('MessageService.sendMessage（V4.0 §E2E 加密路径）', () => {
     expect(savedMessages).toHaveLength(0);
   });
 
-  // ===== Case 5: 加密 + 阅后即焚组合 =====
-  it('加密 + expiresIn="5s" 阅后即焚 → destroy_at 落库 + 加密字段都在', async () => {
+  // ===== Case 5: 加密 + 阅后即焚组合（master 方案：destroyAt 绝对时间，fbs 九档 expiresIn 未采纳）=====
+  it('加密 + destroyAt=5s 后 阅后即焚 → destroy_at 落库 + 加密字段都在', async () => {
     buildSvc();
     const before = Date.now();
     const res = await svc.sendMessage({
@@ -194,7 +192,7 @@ describe('MessageService.sendMessage（V4.0 §E2E 加密路径）', () => {
       senderEphemeralPubkey: VALID_EPK,
       cipherNonce: VALID_NONCE,
       cipherText: VALID_CIPHER,
-      expiresIn: BurnDuration.S5,
+      destroyAt: new Date(before + 5000).toISOString(),
     });
 
     expect(savedMessages).toHaveLength(1);

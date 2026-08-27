@@ -193,8 +193,8 @@ export class AuthService {
   /** 下线设备 = 删除设备记录；因 JWT 守卫每请求校验设备存在性，该设备 token 立即失效 */
   async removeDevice(userId: string, deviceId: string) {
     await this.dataSource.getRepository(Device).delete({ id: deviceId, user_id: userId });
-    // 失效鉴权缓存：避免 30s TTL 内被下线设备仍凭缓存通过校验
-    this.authCache.invalidate(userId);
+    // 失效鉴权缓存（单条精准清除，不影响该用户其它在线设备）：避免 30s TTL 内被下线设备仍凭缓存通过校验
+    this.authCache.invalidate(userId, deviceId);
     // WS 通知该用户全部设备（被下线设备若还连着可立即跳转登录页）
     this.events.emitToUsers(WS_EVENTS.DEVICE_REMOVED, [userId], { device_id: deviceId });
     await this.audit.log({ userId, action: 'remove_device', targetId: deviceId });

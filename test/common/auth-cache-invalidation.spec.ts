@@ -71,13 +71,12 @@ describe('业务状态变化 → AuthCache.invalidate', () => {
         log: jest.fn().mockResolvedValue(undefined),
       } as unknown as AuditService;
       const tokenService = {} as any;
-      const realtime = {
-        isReady: () => false,
-        emitToUser: jest.fn(),
-        emitToUserExceptDevice: jest.fn(),
+      // master 版 AuthService 第 5 参是 EventsGateway（WS 推送），最小 mock 只需 emitToUsers
+      const events = {
+        emitToUsers: jest.fn(),
       } as any;
 
-      svc = new AuthService(dataSource, audit, tokenService, realtime, authCache);
+      svc = new AuthService(dataSource, audit, tokenService, authCache, events);
 
       // mock 后的 argon2 是 jest auto-mock，属性可重定义
       mockedArgon2.verify.mockResolvedValue(true);

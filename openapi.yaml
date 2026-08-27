@@ -1413,7 +1413,7 @@ paths:
                   example: text
                 content:
                   type: string
-                  description: 文本内容；type=text 时必填
+                  description: 文本内容；type=text 且非加密消息时必填。加密消息（带 3 个加密字段）无需传 content，即使传了服务端也会强制覆盖为占位符 [加密消息]——服务端不保存任何明文
                   example: 会议纪要已发，请查收
                 file_url:
                   type: string

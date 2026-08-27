@@ -1,80 +1,175 @@
-# 焚信 BurnMsg 后端 v2（NestJS 重构版）
+# 焚信 BurnMsg 后端
 
-企业内部端到端加密通讯应用后端。由 Express 版（v1, commit b429b3c）重构而来。
+企业内部加密通讯应用后端：阅后即焚 + WebSocket 实时推送 + 端到端加密（E2EE）+ 完整管理后台。
+
+NestJS 10 + TypeORM + MySQL 8，接口文档见 Swagger（`/api-docs`，42 个接口全中文文档）。
+
+## 功能特性
+
+**核心通讯**
+- 单聊 / 群聊，消息类型：文本、图片、语音、视频、文件
+- 阅后即焚：消息到期自动销毁（`BurnScheduler` 每分钟扫描 + 查询侧兜底过滤）
+- 消息编辑、撤回、已读回执
+- WebSocket 实时推送（socket.io v4）：新消息 / 编辑 / 撤回 / 已读回执 / 会话变更 / 设备上下线，详见 [docs/websocket-events.md](docs/websocket-events.md)
+
+**安全**
+- 端到端加密（E2EE，单聊）：X25519 密钥协商 + HKDF-SHA256 + AES-256-GCM，服务器只存公钥和密文，协议见 [docs/E2E_ENCRYPTION.md](docs/E2E_ENCRYPTION.md)
+- JWT 双密钥认证：access token（2h）+ refresh token（30d，独立密钥）
+- Argon2id 密码哈希；登录限流 5 次/分钟/IP；全局 300 次/分钟
+- JWT 守卫每请求校验账号状态与设备存在性：停用账号 / 下线设备立即吊销
+- 首次登录强制改密（`force_change_pwd` 白名单拦截）
+- 全量审计日志（操作人、动作、IP、User-Agent）
+
+**管理后台**
+- 数据总览：12 项指标（用户 / 会话 / 消息 / 存储用量）
+- 账号管理：开通（仅后台开通，无自助注册）、Excel 批量导入、停用、**软删除**
+- 群组管理：全量群组列表（含已解散）、**管理员强制解散（留痕）**
+- 系统公告：发布 / 撤回 / 已读统计 / 未读角标，支持 urgent 强提醒
+- 群主解散群 = 解散即焚（消息一并销毁），与管理员强制解散（留痕）语义区分
+
+**工程化**
+- pino 结构化日志；auth 30s 缓存
+- Jest 单元/集成测试；k6 压测脚本（`loadtest/`）
+- TypeORM migration 流程（`migration:*` 脚本）
+- Dockerfile + docker-compose 一键部署
 
 ## 技术栈
 
 | 项 | 选型 |
 |----|------|
 | 框架 | NestJS 10 |
-| ORM | TypeORM 0.3（synchronize 由 DB_SYNC 环境变量控制，默认关闭） |
+| ORM | TypeORM 0.3（`synchronize` 由 `DB_SYNC` 控制，**生产必须 false**） |
 | 数据库 | MySQL 8（utf8mb4） |
-| 密码哈希 | Argon2id（argon2） |
-| 认证 | JWT 双密钥：access（2h）+ refresh（30d，独立密钥） |
-| 限流 | @nestjs/throttler（全局 300/min，登录 5/min） |
-| 定时任务 | @nestjs/schedule（阅后即焚每分钟扫描） |
-| 文档 | @nestjs/swagger（SWAGGER_ENABLED 控制，生产关闭） |
-
-## 相对 v1 的修复（审查报告逐项落地）
-
-**P0 安全**
-- 发消息强制会话成员校验（原越权漏洞）
-- 所有用户返回字段走白名单 `sanitizeUser` / `SAFE_USER_FIELDS`，password_hash 等不再外泄
-- 删除 `POST /auth/register` 自助注册（账号仅由管理后台开通）
-- `GET /accounts/departments` 声明先于 `GET /accounts/:id`（原路由抢占 bug）
-- JWT 守卫每请求查库校验账号状态 + 设备存在性：停用账号、下线设备立即吊销 token
-- refresh token 使用独立密钥 `JWT_REFRESH_SECRET` 并带 type 标记；`/auth/refresh-token` 不再要求 access token 有效
-- 群成员列表、消息回执接口补会话成员校验
-
-**P0 功能**
-- 阅后即焚落地：`BurnScheduler` 每分钟销毁到期消息（清内容/删回执），`listMessages` 另有到期过滤兜底
-- 初始管理员 Seed：首次启动无 admin 时按 `INITIAL_ADMIN_PHONE/PASSWORD` 创建，密码为空则随机生成并打印日志
-- 文件上传 `POST /api/v1/upload`（50MB，本地存储 + /uploads 静态访问）
-- Excel 批量导入 `POST /api/v1/accounts/import`（xlsx，列：phone/手机号, display_name/姓名, department/部门）
-
-**P1 健壮性**
-- CORS 白名单（CORS_ORIGINS），空则禁止跨域
-- 登录接口 5 次/分钟/IP 限流
-- markAsRead 改单条 UPDATE + 子查询
-- 审计日志记录 IP 与 User-Agent
-- 私聊会话查找限定 type='private'，不再命中共同群
-- 停用账号时删除其设备记录（等于全端强制下线）
-- 手机号唯一冲突返回 409 友好提示
-- 创建私聊前校验对方账号存在且 active
+| 实时 | socket.io v4（path `/api/v1/socket.io`） |
+| 密码哈希 | Argon2id |
+| 认证 | JWT 双密钥 |
+| 日志 | nestjs-pino |
+| 测试 | Jest + supertest；k6 压测 |
+| 文档 | Swagger（优先加载 `openapi.yaml`，42 接口 / 12 分组） |
 
 ## 快速开始
 
+### 全新部署
+
 ```bash
-cp .env.example .env   # 按实际修改数据库与两个 JWT 密钥
+cp .env.example .env   # 修改数据库连接与两个 JWT 密钥（必须不同）
 npm ci
-# 首次部署：.env 中 DB_SYNC=true 建表；启动后立即改回 false
+# 首次部署：.env 设 DB_SYNC=true，启动一次自动建表，然后立即改回 false
 npm run build
-npm run start:prod      # 或 npm run start:dev 开发热更
+npm run start:prod     # 开发热更用 npm run start:dev
 ```
 
 启动后：
-- API 前缀 `http://<host>:9091/api/v1`
-- Swagger `http://<host>:9091/api-docs`（SWAGGER_ENABLED=true 时）
-- 初始管理员账号见启动日志（仅打印一次），首次登录强制改密
+- API 前缀：`http://<host>:9091/api/v1`
+- Swagger：`http://<host>:9091/api-docs`（`SWAGGER_ENABLED=true` 时）
+- 初始管理员按 `INITIAL_ADMIN_PHONE` 创建，密码见启动日志（仅打印一次），首次登录强制改密
 
-## API 一览（与 v1 路径保持一致）
+### 老库升级（v4 之前 → 当前版本）
 
-- `POST /auth/login`、`POST /auth/change-password`、`POST /auth/refresh-token`（body: refresh_token）、`GET|PUT /auth/profile`、`GET /auth/devices`、`POST /auth/devices/:id/offline`
-- `POST /accounts`、`POST /accounts/batch`、`POST /accounts/import`（Excel）、`POST /accounts/:id/reset-password`、`POST /accounts/:id/toggle-status`、`GET /accounts`、`GET /accounts/departments`、`GET /accounts/:id`（均 admin）
-- `GET /contacts`、`GET /contacts/search`
-- `POST /conversations/private`、`GET /conversations`、`GET /conversations/:id`
-- `POST /messages`、`GET /messages/:conversationId`、`PUT /messages/:id`、`POST /messages/:id/recall`、`POST /messages/:id/read`、`GET /messages/:id/receipt`
-- `POST /groups`、`PUT /groups/:id`、`GET /groups/:id/members`、`POST /groups/:id/members`、`DELETE /groups/:id/members/:userId`、`PUT /groups/:id/members/:userId/role`
-- `POST /upload`
+`DB_SYNC=false` 下 TypeORM 不会自动改表，需执行增量迁移：
 
-统一响应 `{ code: 0, message, data }`；错误 `{ code: <httpStatus>, message }`。
+```bash
+mysql -u root -p burnmsg < docs/migration-20260827.sql
+```
 
-## 数据库迁移注意
+内容为：软删除列、群解散列、消息 4 个加密列、公告 / 公告已读 / 用户公钥三张新表。**重复执行会报"列已存在"，忽略即可。**
 
-v1 的 bcrypt 密码哈希与 Argon2 不兼容：升级后所有账号需由管理员重置密码（或首次登录走重置流程）。表结构保持一致，可直接复用原库。
+也可以用标准 migration 流程：`npm run migration:run`（生成新迁移用 `npm run migration:generate <name>`）。
 
-## 下一批（未含在本版）
+### Docker
 
-- WebSocket 实时通道（socket.io：新消息/回执/销毁事件推送，取代轮询）
-- MinIO 对象存储与分片断点续传
-- 端到端加密密钥交换接口（X25519/X3DH 公钥托管与预钥包）
+```bash
+docker compose up -d --build
+```
+
+## 环境变量
+
+| 变量 | 说明 | 默认 |
+|------|------|------|
+| `PORT` | 服务端口 | `9091` |
+| `DB_HOST` / `DB_PORT` / `DB_USERNAME` / `DB_PASSWORD` / `DB_DATABASE` | MySQL 连接 | - |
+| `DB_SYNC` | 首次建表 `true`，**正式运行必须 `false`** | `true` |
+| `JWT_SECRET` / `JWT_REFRESH_SECRET` | 两个密钥**必须不同**，生产换随机长串 | - |
+| `ACCESS_TOKEN_TTL` / `REFRESH_TOKEN_TTL` | token 有效期（秒） | `7200` / `2592000` |
+| `CORS_ORIGINS` | 跨域白名单（逗号分隔；空 = 禁止一切浏览器跨域） | - |
+| `UPLOAD_DIR` | 文件上传目录 | `./uploads` |
+| `SWAGGER_ENABLED` | 是否开放 `/api-docs`，**生产建议 false** | `true` |
+| `INITIAL_ADMIN_PHONE` / `INITIAL_ADMIN_PASSWORD` | 初始管理员（仅无任何 admin 时首次生效；密码留空则随机生成打印日志） | - |
+
+## 接口概览
+
+完整文档见 Swagger `/api-docs` 或仓库根目录 `openapi.yaml`（42 接口 / 12 分组）。
+
+| 分组 | 代表接口 |
+|------|---------|
+| 认证 | 登录 / 刷新 token / 改密 / 设备列表 / 设备下线 |
+| 账号 | 列表（含 `show_deleted`）/ 开通 / 导入 / 停用 / 软删除 |
+| 会话 | 单聊创建 / 我的会话 / 会话详情 |
+| 群组 | 建群 / 成员管理 / 群资料 / 群主解散（即焚）/ 管理员解散（留痕，`DELETE /groups/admin/:id`） |
+| 消息 | 发送（支持 E2EE 密文字段）/ 列表 / 编辑 / 撤回 / 已读 / 回执查询 |
+| 密钥 | 上传身份公钥（限 5/min）/ 查询对方公钥（限 60/min，需同会话） |
+| 公告 | 发布 / 列表 / 管理列表 / 未读数 / 已读标记 / 撤回 |
+| 统计 | 数据总览（12 指标） |
+| 审计 | 审计日志查询 |
+| 上传 | `POST /upload`（50MB） |
+
+## WebSocket
+
+连接方式（握手 `auth` 携带 access token）：
+
+```ts
+io(SERVER_ORIGIN, {
+  path: '/api/v1/socket.io',
+  transports: ['websocket', 'polling'],
+  auth: { token: accessToken },
+});
+```
+
+事件：`message:new`、`message:edited`、`message:recalled`、`receipt:read`、`conversation:updated`、`device:added`、`device:removed`。
+鉴权失败立即断开；停用账号 / 下线设备在重连时吊销。payload 结构与前端镜像见 [docs/websocket-events.md](docs/websocket-events.md)。
+
+## 测试与压测
+
+```bash
+npm test              # Jest 单元/集成测试
+npm run test:cov      # 覆盖率
+npm run lint          # tsc --noEmit 类型检查
+```
+
+压测（k6，脚本在 `loadtest/`）：登录、发消息、会话列表等场景，Windows 可用 `test-groups.ps1` 分组执行。
+
+## 运维工具
+
+| 脚本 | 用途 |
+|------|------|
+| `reset-admin-password.js` | 重置 admin 密码 |
+| `reset-b-password.js` | 重置测试账号 b 密码 |
+
+## 项目结构
+
+```
+src/
+├── modules/
+│   ├── auth/          # 登录、token、设备、强制改密
+│   ├── account/       # 账号管理（软删除）
+│   ├── contact/       # 通讯录
+│   ├── conversation/  # 会话
+│   ├── group/         # 群组（双语义解散）
+│   ├── message/       # 消息、焚毁、回执（E2EE 密文字段）
+│   ├── events/        # WebSocket 网关（全局模块）
+│   ├── keys/          # E2EE 公钥分发
+│   ├── announcement/  # 系统公告
+│   ├── stats/         # 数据总览
+│   ├── audit/         # 审计日志
+│   └── upload/        # 文件上传
+├── common/            # 守卫、装饰器、拦截器
+└── database/          # data-source（migration 用）
+docs/                  # WS 事件文档、E2EE 协议、迁移 SQL
+loadtest/              # k6 压测脚本
+test/                  # Jest 测试
+```
+
+## 相关仓库
+
+- 移动前端：fenxin-app（React Native 0.75.4，WS 客户端镜像 `src/services/ws.ts`）
+- 管理后台：独立前端项目（对接 `/api/v1` 管理接口）

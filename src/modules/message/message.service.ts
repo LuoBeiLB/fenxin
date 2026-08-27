@@ -62,13 +62,6 @@ export class MessageService {
     if (!conv) throw new NotFoundException('会话不存在');
     if (conv.dissolved_at) throw new ForbiddenException('群组已解散，不能再发送消息');
 
-    if (params.type === 'text' && !params.content) {
-      throw new BadRequestException('文本消息 content 不能为空');
-    }
-    if (params.type !== 'text' && !params.fileUrl) {
-      throw new BadRequestException(`${params.type} 消息 file_url 不能为空`);
-    }
-
     // E2E：三个加密字段必须同时提供（全密文）或同时缺省（明文），不允许半加密状态
     const encFields = [params.senderEphemeralPubkey, params.cipherNonce, params.cipherText];
     const isEncrypted = encFields.every((f) => f !== undefined && f !== null && f !== '');
@@ -78,12 +71,21 @@ export class MessageService {
       );
     }
 
+    // 加密消息豁免 content 必填：密文在 cipher_text，服务端不应接触明文
+    if (params.type === 'text' && !params.content && !isEncrypted) {
+      throw new BadRequestException('文本消息 content 不能为空');
+    }
+    if (params.type !== 'text' && !params.fileUrl) {
+      throw new BadRequestException(`${params.type} 消息 file_url 不能为空`);
+    }
+
     const savedMsg = await msgRepo.save(
       msgRepo.create({
         conversation_id: params.conversationId,
         sender_id: params.senderId,
         type: params.type as Message['type'],
-        content: params.content ?? null,
+        // E2E 语义：密文消息的 content 一律强制占位，即使调用方传了 content 也不落库（服务端不见明文）
+        content: isEncrypted ? '[加密消息]' : (params.content ?? null),
         file_url: params.fileUrl ?? null,
         file_name: params.fileName ?? null,
         file_size: params.fileSize ?? null,

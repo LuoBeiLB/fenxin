@@ -17,7 +17,7 @@ export class HttpExceptionFilter implements ExceptionFilter {
       const msg = typeof body === 'string' ? body : (body as any)?.message;
       message = Array.isArray(msg) ? msg.join('; ') : msg || exception.message;
     } else if (exception instanceof Error) {
-      message = exception.message;
+      // 不透出内部错误详情（如磁盘/SQL 错误）给客户端，统一 500 通用消息；细节只记日志
       this.logger.error(exception.stack);
     } else {
       this.logger.error(String(exception));
