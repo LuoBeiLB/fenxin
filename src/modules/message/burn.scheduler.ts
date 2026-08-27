@@ -1,13 +1,15 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { DataSource, In } from 'typeorm';
+import * as fs from 'fs';
+import * as path from 'path';
 import { Message } from '../../entities/message.entity';
 import { MessageReceipt } from '../../entities/message-receipt.entity';
 
 /**
- * 阅后即焚调度器：每分钟扫描到期消息并销毁。
- * 销毁 = 删除回执 + 清空 content/file_url + 置 is_destroyed。
- * （listMessages 另有到期过滤兜底，双保险）
+ * 阅后即焚调度器：每分钟扫描到期消息并彻底销毁。
+ * 销毁 = 删除回执 + 断开其他消息的引用 + 整行 DELETE + 删除磁盘附件。
+ * 数据库与文件系统均不留痕迹（listMessages 另有到期过滤兜底）。
  */
 @Injectable()
 export class BurnScheduler {
@@ -20,7 +22,7 @@ export class BurnScheduler {
     const expired = await this.dataSource
       .getRepository(Message)
       .createQueryBuilder('m')
-      .select(['m.id'])
+      .select(['m.id', 'm.file_url'])
       .where('m.is_destroyed = :isDestroyed', { isDestroyed: false })
       .andWhere('m.destroy_at IS NOT NULL')
       .andWhere('m.destroy_at <= :now', { now: new Date() })
@@ -31,12 +33,26 @@ export class BurnScheduler {
 
     const ids = expired.map((m) => m.id);
     await this.dataSource.transaction(async (em) => {
+      // 1. 删除这些消息的已读/送达回执
       await em.getRepository(MessageReceipt).delete({ message_id: In(ids) });
-      await em
-        .getRepository(Message)
-        .update({ id: In(ids) }, { is_destroyed: true, content: null, file_url: null });
+      // 2. 其他消息若引用了被销毁消息，断开引用（避免悬空 reply_to_id）
+      await em.getRepository(Message).update({ reply_to_id: In(ids) }, { reply_to_id: null });
+      // 3. 整行物理删除（content/file_name/file_size 等全部随行消失）
+      await em.getRepository(Message).delete({ id: In(ids) });
     });
 
-    this.logger.log(`Destroyed ${ids.length} expired message(s)`);
+    // 4. 删除磁盘上的附件文件（/uploads/<filename> -> UPLOAD_DIR/<filename>）
+    const uploadDir = path.resolve(process.cwd(), process.env.UPLOAD_DIR || './uploads');
+    for (const m of expired) {
+      if (!m.file_url) continue;
+      const filename = path.basename(m.file_url); // 防路径穿越，只取文件名
+      try {
+        fs.unlinkSync(path.join(uploadDir, filename));
+      } catch {
+        // 文件可能已不存在（如未上传成功），不影响销毁流程
+      }
+    }
+
+    this.logger.log(`Destroyed ${ids.length} expired message(s) (rows + attachments)`);
   }
 }

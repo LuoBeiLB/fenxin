@@ -12,6 +12,7 @@ import { RolesGuard } from './common/guards/roles.guard';
 import { TransformInterceptor } from './common/interceptors/transform.interceptor';
 import { HttpExceptionFilter } from './common/filters/http-exception.filter';
 import { TokenModule } from './modules/auth/token.module';
+import { EventsModule } from './modules/events/events.module';
 import { AuditModule } from './modules/audit/audit.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { AccountModule } from './modules/account/account.module';
@@ -44,6 +45,7 @@ import { UploadModule } from './modules/upload/upload.module';
       serveRoot: '/uploads',
     }),
     TokenModule,
+    EventsModule,
     AuditModule,
     AuthModule,
     AccountModule,

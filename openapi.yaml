@@ -47,6 +47,8 @@ tags:
     description: 群组/频道管理：建群、群资料、群成员增删与角色设置（群主 owner / 管理员 admin / 成员 member）。
   - name: 文件上传
     description: 消息附件上传（multipart），返回的 url 在发消息时填入 file_url。
+  - name: 审计日志
+    description: 审计日志查询（仅 admin）：登录、开户、改密、重置密码、启用停用、设备下线等敏感操作留痕，供管理后台审计页展示。
 
 paths:
   /health:
@@ -956,6 +958,113 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '404':
           description: 账号不存在
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /audit-logs:
+    get:
+      tags: [审计日志]
+      summary: 审计日志分页查询
+      description: |-
+        【用途】分页查询系统审计日志，供管理后台「审计日志」页展示：谁在什么时间从哪个 IP 做了什么敏感操作。
+
+        【调用时机】管理后台审计页加载/筛选时。
+
+        【业务规则与注意事项】
+        - 仅 admin 角色可调用，普通用户返回 403。
+        - 按 created_at 倒序排列（最新在前）。
+        - 响应分页结构为 { data: AuditLogItem[], total }（注意字段名为 data，不是 list）。
+        - 每条记录附带操作人姓名 user_display_name 与手机号 user_phone；操作人已删除或系统动作（user_id 为空）时为 null。
+        - 当前已记录的 action：login 登录、change_password 修改密码、create_account 开通账号、batch_import_accounts 批量导入账号、reset_password 重置密码、enable_account 启用账号、disable_account 停用账号、remove_device 下线设备；后续迭代可能新增，前端展示时建议直接显示原值或做兜底映射。
+        - 所有筛选条件可组合；start_time/end_time 支持 ISO 8601 或 YYYY-MM-DD（含边界）。
+      parameters:
+        - name: page
+          in: query
+          schema: { type: integer, minimum: 1, default: 1 }
+          description: 页码，默认 1
+          example: 1
+        - name: pageSize
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 20 }
+          description: 每页条数，默认 20，最大 200
+          example: 20
+        - name: user_id
+          in: query
+          schema: { type: string }
+          description: 按操作人用户 ID 精确过滤
+          example: 9f1c2a7e-3b4d-4e5f-8a9b-1c2d3e4f5a6b
+        - name: action
+          in: query
+          schema: { type: string, enum: [login, change_password, create_account, batch_import_accounts, reset_password, enable_account, disable_account, remove_device] }
+          description: 按动作精确过滤
+          example: login
+        - name: target_type
+          in: query
+          schema: { type: string }
+          description: 按目标类型精确过滤，如 user / device
+          example: user
+        - name: start_time
+          in: query
+          schema: { type: string }
+          description: 起始时间（含），ISO 8601 或 YYYY-MM-DD
+          example: '2026-08-01'
+        - name: end_time
+          in: query
+          schema: { type: string }
+          description: 结束时间（含），ISO 8601 或 YYYY-MM-DD
+          example: '2026-08-31T23:59:59+08:00'
+        - name: keyword
+          in: query
+          schema: { type: string }
+          description: 模糊搜索操作详情 detail（LIKE %keyword%）
+          example: 138
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: ok }
+                  data:
+                    type: object
+                    properties:
+                      data:
+                        type: array
+                        description: 当前页审计日志列表
+                        items:
+                          type: object
+                          properties:
+                            id: { type: string, description: 日志 ID }
+                            user_id: { type: string, nullable: true, description: 操作人用户 ID（系统动作为 null） }
+                            action: { type: string, description: 动作标识，如 login }
+                            target_type: { type: string, nullable: true, description: 目标类型，如 user / device }
+                            target_id: { type: string, nullable: true, description: 目标对象 ID }
+                            detail: { type: string, nullable: true, description: 操作详情（如目标手机号/设备名） }
+                            ip_address: { type: string, nullable: true, description: 操作来源 IP }
+                            user_agent: { type: string, nullable: true, description: 操作来源 UA }
+                            created_at: { type: string, format: date-time, description: 操作时间 }
+                            user_display_name: { type: string, nullable: true, description: 操作人姓名（关联用户表带出） }
+                            user_phone: { type: string, nullable: true, description: 操作人手机号（关联用户表带出） }
+                      total:
+                        type: integer
+                        description: 满足条件的日志总数
+                        example: 523
+        '400':
+          description: 参数校验失败（分页参数越界 / start_time / end_time 格式无效）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: 未携带或无效/过期 token；账号已停用或设备已下线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: 非 admin 角色（Admin access required）
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

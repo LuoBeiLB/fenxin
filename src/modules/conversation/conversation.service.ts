@@ -3,10 +3,15 @@ import { DataSource, In } from 'typeorm';
 import { Conversation } from '../../entities/conversation.entity';
 import { ConversationMember } from '../../entities/conversation-member.entity';
 import { AppUser, sanitizeUser } from '../../entities/app-user.entity';
+import { EventsGateway } from '../events/events.gateway';
+import { WS_EVENTS } from '../events/events.types';
 
 @Injectable()
 export class ConversationService {
-  constructor(private readonly dataSource: DataSource) { }
+  constructor(
+    private readonly dataSource: DataSource,
+    private readonly events: EventsGateway,
+  ) {}
 
   /** 获取（或创建）两人的私聊会话；共同会话只认 type='private'，避免命中共同群 */
   async getOrCreatePrivateConversation(userId1: string, userId2: string): Promise<Conversation> {
@@ -38,6 +43,12 @@ export class ConversationService {
     ]);
     await convRepo.update(savedConv.id, { member_count: 2 });
 
+    // 实时推送：新会话创建，双方会话列表立即刷新
+    this.events.emitToUsers(WS_EVENTS.CONVERSATION_UPDATED, [userId1, userId2], {
+      conversation_id: savedConv.id,
+      reason: 'created',
+    });
+
     return savedConv;
   }
 
@@ -53,6 +64,7 @@ export class ConversationService {
     const conversations = await convRepo
       .createQueryBuilder('c')
       .whereInIds(convIds)
+      // MySQL 不支持 NULLS LAST，用 IS NULL 表达式实现同样效果（无消息的会话排最后）
       .orderBy('c.last_message_at IS NULL', 'ASC')
       .addOrderBy('c.last_message_at', 'DESC')
       .getMany();

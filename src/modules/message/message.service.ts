@@ -10,10 +10,15 @@ import { MessageReceipt } from '../../entities/message-receipt.entity';
 import { Conversation } from '../../entities/conversation.entity';
 import { ConversationMember } from '../../entities/conversation-member.entity';
 import { AppUser } from '../../entities/app-user.entity';
+import { EventsGateway } from '../events/events.gateway';
+import { WS_EVENTS } from '../events/events.types';
 
 @Injectable()
 export class MessageService {
-  constructor(private readonly dataSource: DataSource) {}
+  constructor(
+    private readonly dataSource: DataSource,
+    private readonly events: EventsGateway,
+  ) {}
 
   private async assertMember(conversationId: string, userId: string) {
     const membership = await this.dataSource.getRepository(ConversationMember).findOne({
@@ -21,6 +26,14 @@ export class MessageService {
     });
     if (!membership) throw new ForbiddenException('Access denied to this conversation');
     return membership;
+  }
+
+  /** 会话全体成员的用户 ID 列表（用于 WebSocket 定向推送） */
+  private async getMemberUserIds(conversationId: string): Promise<string[]> {
+    const members = await this.dataSource.getRepository(ConversationMember).find({
+      where: { conversation_id: conversationId },
+    });
+    return members.map((m) => m.user_id);
   }
 
   /** 发消息：必须先是会话成员（修复旧版越权发消息漏洞） */
@@ -83,6 +96,17 @@ export class MessageService {
       );
     }
 
+    // 实时推送：新消息 + 会话列表刷新信号（推给全体成员，含发送者的其他在线设备）
+    const memberIds = members.map((m) => m.user_id);
+    this.events.emitToUsers(WS_EVENTS.MESSAGE_NEW, memberIds, {
+      conversation_id: params.conversationId,
+      message: savedMsg,
+    });
+    this.events.emitToUsers(WS_EVENTS.CONVERSATION_UPDATED, memberIds, {
+      conversation_id: params.conversationId,
+      reason: 'message',
+    });
+
     return savedMsg;
   }
 
@@ -124,7 +148,17 @@ export class MessageService {
     if (hoursSinceCreated > 48) throw new BadRequestException('Cannot edit messages older than 48 hours');
 
     await msgRepo.update(messageId, { content: newContent, is_edited: true });
-    return msgRepo.findOne({ where: { id: messageId } });
+    const updated = await msgRepo.findOne({ where: { id: messageId } });
+
+    // 实时推送：编辑后的完整消息体（前端就地更新对应气泡）
+    if (updated) {
+      const memberIds = await this.getMemberUserIds(message.conversation_id);
+      this.events.emitToUsers(WS_EVENTS.MESSAGE_EDITED, memberIds, {
+        conversation_id: message.conversation_id,
+        message: updated,
+      });
+    }
+    return updated;
   }
 
   async recallMessage(messageId: string, userId: string): Promise<void> {
@@ -137,13 +171,21 @@ export class MessageService {
     if (hoursSinceCreated > 48) throw new BadRequestException('Cannot recall messages older than 48 hours');
 
     await msgRepo.update(messageId, { is_recalled: true });
+
+    // 实时推送：撤回信号（前端把对应消息就地替换为「消息已撤回」灰条）
+    const memberIds = await this.getMemberUserIds(message.conversation_id);
+    this.events.emitToUsers(WS_EVENTS.MESSAGE_RECALLED, memberIds, {
+      conversation_id: message.conversation_id,
+      message_id: messageId,
+      recalled_at: new Date().toISOString(),
+    });
   }
 
   /** 标记已读：单条 UPDATE + 子查询，不再先查全量消息 ID */
   async markAsRead(conversationId: string, userId: string): Promise<void> {
     await this.assertMember(conversationId, userId);
 
-    await this.dataSource
+    const result = await this.dataSource
       .getRepository(MessageReceipt)
       .createQueryBuilder()
       .update()
@@ -165,6 +207,18 @@ export class MessageService {
         { conversation_id: conversationId, user_id: userId },
         { last_read_message_id: lastMsg.id },
       );
+    }
+
+    // 实时推送：已读回执（仅当确实把新消息从「未读」翻成「已读」时才广播，
+    // 避免用户每次打开聊天页都向会话其他成员发送无效事件）
+    if ((result.affected ?? 0) > 0) {
+      const memberIds = await this.getMemberUserIds(conversationId);
+      this.events.emitToUsers(WS_EVENTS.RECEIPT_READ, memberIds, {
+        conversation_id: conversationId,
+        user_id: userId,
+        last_read_message_id: lastMsg ? lastMsg.id : null,
+        read_at: new Date().toISOString(),
+      });
     }
   }
 
@@ -189,15 +243,24 @@ export class MessageService {
     );
   }
 
-  /** 销毁单条消息（供阅后即焚调度器调用）：清空内容、删除回执 */
+  /** 销毁单条消息：删回执 + 断开引用 + 整行删除 + 删磁盘附件（与 BurnScheduler 语义一致） */
   async destroyMessage(messageId: string): Promise<void> {
+    const msg = await this.dataSource.getRepository(Message).findOne({ where: { id: messageId } });
+    if (!msg) return;
     await this.dataSource.transaction(async (em) => {
       await em.getRepository(MessageReceipt).delete({ message_id: messageId });
-      await em.getRepository(Message).update(messageId, {
-        is_destroyed: true,
-        content: null,
-        file_url: null,
-      });
+      await em.getRepository(Message).update({ reply_to_id: messageId }, { reply_to_id: null });
+      await em.getRepository(Message).delete({ id: messageId });
     });
+    if (msg.file_url) {
+      const fs = require('fs');
+      const path = require('path');
+      const uploadDir = path.resolve(process.cwd(), process.env.UPLOAD_DIR || './uploads');
+      try {
+        fs.unlinkSync(path.join(uploadDir, path.basename(msg.file_url)));
+      } catch {
+        // 文件可能已不存在，不影响销毁
+      }
+    }
   }
 }
