@@ -57,6 +57,8 @@ tags:
     description: 系统公告：管理员发布/管理公告，App 端拉取公告列表、未读数与已读上报；urgent 级公告走 WebSocket 实时推送（announcement:new 事件）。
   - name: 密钥
     description: E2E 端到端加密密钥通道：上传/查询 X25519 identity 公钥，服务端零接触私钥，协议细节见 docs/E2E_ENCRYPTION.md。
+  - name: 意见反馈
+    description: 意见反馈：用户提交意见与查看回复，管理员在管理后台查看全量反馈并回复（回复即处理）。
 
 paths:
   /health:
@@ -2061,7 +2063,8 @@ paths:
         【调用时机】打开群聊的成员列表/群设置页时。
 
         【业务规则与注意事项】
-        - 仅本群成员可查看，非成员返回 403（修复了旧版任意用户可查漏洞）。
+        - 本群成员可查看，非成员返回 403；管理员（role=admin）可查看任意群的成员列表（配合管理后台群组管理）。
+        - 已停用 / 已注销（软删除）的成员不返回；成员关系记录保留，账号恢复启用后自动重新出现在列表中。
         - 结果按成员角色 role 字段升序排列；每条在 ConversationMember 基础上附带 user_display_name、user_avatar_url 便于直接展示。
       parameters:
         - name: id
@@ -2781,6 +2784,226 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /feedback:
+    post:
+      tags: [意见反馈]
+      summary: 提交意见反馈
+      description: |-
+        【用途】用户向管理员提交意见/建议，可自愿留下联系方式便于回访。
+
+        【调用时机】App「意见反馈」页提交时。
+
+        【业务规则与注意事项】
+        - 所有登录用户可提交；content 最长 2000 字，contact 可选（最长 100 字）。
+        - 提交后状态为 pending（待处理），管理员回复后变为 processed，回复内容通过「我的反馈」可见。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content:
+                  type: string
+                  maxLength: 2000
+                  description: 意见内容
+                  example: 希望群聊支持按部门批量拉人，每次手动加人太麻烦了。
+                contact:
+                  type: string
+                  maxLength: 100
+                  description: 自愿留下的联系方式（可选）
+                  example: '13800138000'
+      responses:
+        '200':
+          description: 提交成功，data 为 { id, created_at }
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: 反馈提交成功 }
+                  data:
+                    type: object
+                    properties:
+                      id: { type: string, format: uuid, example: 7f3a9b2c-4d5e-4f6a-8b9c-0d1e2f3a4b5c }
+                      created_at: { type: string, format: date-time, example: '2026-08-27T09:30:00.000Z' }
+        '400':
+          description: 参数校验失败（如 content 为空或超长）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: 未携带或无效/过期 token；账号已停用或设备已下线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /feedback/my:
+    get:
+      tags: [意见反馈]
+      summary: 我的反馈列表（含管理员回复）
+      description: |-
+        【用途】查看当前用户自己提交过的反馈及管理员回复。
+
+        【调用时机】App「我的反馈」页。
+
+        【业务规则与注意事项】
+        - 仅返回本人提交的反馈，按提交时间倒序分页。
+        - status=processed 的记录中 admin_reply / replied_at 为管理员回复内容与时间。
+      parameters:
+        - name: page
+          in: query
+          schema: { type: integer, minimum: 1, default: 1 }
+          description: 页码，默认 1
+        - name: pageSize
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 20 }
+          description: 每页条数，默认 20
+      responses:
+        '200':
+          description: '成功，data 为 { data: 反馈数组, total }'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: ok }
+                  data:
+                    type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Feedback'
+                      total: { type: integer, example: 5 }
+        '401':
+          description: 未携带或无效/过期 token；账号已停用或设备已下线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /feedback/admin/all:
+    get:
+      tags: [意见反馈]
+      summary: 反馈管理列表（仅 admin，附提交人姓名/部门）
+      description: |-
+        【用途】管理员查看全量用户反馈，可按处理状态筛选。
+
+        【调用时机】管理后台「意见反馈」列表页。
+
+        【业务规则与注意事项】
+        - 仅 admin 角色可调用；按提交时间倒序分页。
+        - 每条附 user_display_name、user_department（提交人姓名与部门，账号已删除时为 Unknown）。
+      parameters:
+        - name: page
+          in: query
+          schema: { type: integer, minimum: 1, default: 1 }
+          description: 页码，默认 1
+        - name: pageSize
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 20 }
+          description: 每页条数，默认 20
+        - name: status
+          in: query
+          schema: { type: string, enum: [pending, processed] }
+          description: 按处理状态筛选；不传返回全部
+      responses:
+        '200':
+          description: '成功，data 为 { data: 反馈数组（含提交人信息）, total }'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: ok }
+                  data:
+                    type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Feedback'
+                      total: { type: integer, example: 27 }
+        '401':
+          description: 未携带或无效/过期 token；账号已停用或设备已下线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: 非 admin 角色（Admin access required）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /feedback/admin/{id}/reply:
+    put:
+      tags: [意见反馈]
+      summary: 回复反馈（仅 admin，回复即处理）
+      description: |-
+        【用途】管理员回复一条用户反馈；回复后该反馈状态自动置为 processed，提交人可在「我的反馈」中看到回复内容。
+
+        【调用时机】管理后台「意见反馈」详情/回复操作时。
+
+        【业务规则与注意事项】
+        - 仅 admin 角色可调用；重复回复会覆盖上次的回复内容与时间。
+        - 操作写入审计日志（reply_feedback）。
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+          description: 反馈 ID（UUID）
+          example: 7f3a9b2c-4d5e-4f6a-8b9c-0d1e2f3a4b5c
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reply]
+              properties:
+                reply:
+                  type: string
+                  maxLength: 2000
+                  description: 回复内容
+                  example: 已收到，该功能已列入下个版本计划，感谢反馈！
+      responses:
+        '200':
+          description: 回复成功，data 为更新后的反馈记录
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: 回复成功 }
+                  data:
+                    $ref: '#/components/schemas/Feedback'
+        '400':
+          description: 参数校验失败（如 reply 为空或超长）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: 未携带或无效/过期 token；账号已停用或设备已下线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: 非 admin 角色（Admin access required）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: 反馈不存在
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -3259,3 +3482,63 @@ components:
           type: string
           description: 失败原因（仅失败项存在，如「该手机号已开通账号」）
           example: 该手机号已开通账号
+
+    Feedback:
+      type: object
+      description: 意见反馈记录
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: 7f3a9b2c-4d5e-4f6a-8b9c-0d1e2f3a4b5c
+        user_id:
+          type: string
+          description: 提交人用户 ID
+          example: 1b2c3d4e-5f6a-47b8-89c0-d1e2f3a4b5c6
+        content:
+          type: string
+          description: 意见内容
+          example: 希望群聊支持按部门批量拉人，每次手动加人太麻烦了。
+        contact:
+          type: string
+          nullable: true
+          description: 用户自愿留下的联系方式
+          example: '13800138000'
+        status:
+          type: string
+          enum: [pending, processed]
+          description: pending=待处理；processed=已处理（管理员已回复）
+          example: processed
+        admin_reply:
+          type: string
+          nullable: true
+          description: 管理员回复内容（status=processed 时存在）
+          example: 已收到，该功能已列入下个版本计划，感谢反馈！
+        replied_by:
+          type: string
+          nullable: true
+          description: 回复操作人（管理员）用户 ID
+          example: 9c8b7a6d-5e4f-43a2-b1c0-d9e8f7a6b5c4
+        replied_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: 回复时间
+          example: '2026-08-27T10:05:00.000Z'
+        created_at:
+          type: string
+          format: date-time
+          example: '2026-08-27T09:30:00.000Z'
+        updated_at:
+          type: string
+          format: date-time
+          example: '2026-08-27T10:05:00.000Z'
+        user_display_name:
+          type: string
+          description: 提交人显示名（仅管理端列表附带；账号已删除时为 Unknown）
+          example: 张三
+        user_department:
+          type: string
+          nullable: true
+          description: 提交人部门（仅管理端列表附带）
+          example: 技术部

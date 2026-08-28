@@ -1,5 +1,5 @@
 import { BadRequestException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
-import { DataSource } from 'typeorm';
+import { DataSource, In, IsNull } from 'typeorm';
 import { Conversation } from '../../entities/conversation.entity';
 import { ConversationMember } from '../../entities/conversation-member.entity';
 import { Message } from '../../entities/message.entity';
@@ -179,28 +179,40 @@ export class GroupService {
     return updated;
   }
 
-  /** 群成员列表：仅本群成员可见（修复旧版任意用户可查漏洞） */
-  async getGroupMembers(conversationId: string, requesterId: string) {
-    const membership = await this.getMembership(conversationId, requesterId);
-    if (!membership) throw new ForbiddenException('Access denied to this conversation');
+  /**
+   * 群成员列表。
+   * - 群成员可查；管理员（role=admin）可查看任意群（配合管理后台群组管理）。
+   * - 已停用 / 已注销（软删除）的成员不返回；成员关系记录保留，账号恢复启用后自动重新出现。
+   */
+  async getGroupMembers(conversationId: string, requesterId: string, requesterRole?: string) {
+    if (requesterRole !== 'admin') {
+      const membership = await this.getMembership(conversationId, requesterId);
+      if (!membership) throw new ForbiddenException('Access denied to this conversation');
+    }
 
     const members = await this.dataSource.getRepository(ConversationMember).find({
       where: { conversation_id: conversationId },
       order: { role: 'ASC' },
     });
+    if (members.length === 0) return [];
 
+    // 批量取账号信息，过滤已停用 / 已注销成员（避免逐条查询）
     const userRepo = this.dataSource.getRepository(AppUser);
-    return Promise.all(
-      members.map(async (member) => {
-        const user = await userRepo.findOne({ where: { id: member.user_id } });
-        const safe = sanitizeUser(user);
+    const activeUsers = await userRepo.find({
+      where: { id: In(members.map((m) => m.user_id)), status: 'active', deleted_at: IsNull() },
+    });
+    const userMap = new Map(activeUsers.map((u) => [u.id, sanitizeUser(u)]));
+
+    return members
+      .filter((member) => userMap.has(member.user_id))
+      .map((member) => {
+        const safe = userMap.get(member.user_id);
         return {
           ...member,
           user_display_name: safe?.display_name || 'Unknown',
           user_avatar_url: safe?.avatar_url ?? null,
         };
-      }),
-    );
+      });
   }
 
   /**

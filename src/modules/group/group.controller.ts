@@ -73,7 +73,7 @@ export class GroupController {
 
   @Get(':id/members')
   members(@CurrentUser() user: AuthPayload, @Param('id') id: string) {
-    return this.groupService.getGroupMembers(id, user.userId);
+    return this.groupService.getGroupMembers(id, user.userId, user.role);
   }
 
   @Post(':id/members')

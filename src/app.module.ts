@@ -26,6 +26,7 @@ import { GroupModule } from './modules/group/group.module';
 import { UploadModule } from './modules/upload/upload.module';
 import { StatsModule } from './modules/stats/stats.module';
 import { AnnouncementModule } from './modules/announcement/announcement.module';
+import { FeedbackModule } from './modules/feedback/feedback.module';
 
 @Module({
   imports: [
@@ -116,6 +117,7 @@ import { AnnouncementModule } from './modules/announcement/announcement.module';
     UploadModule,
     StatsModule,
     AnnouncementModule,
+    FeedbackModule,
   ],
   controllers: [AppController],
   providers: [

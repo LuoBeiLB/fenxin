@@ -2,7 +2,7 @@
 
 企业内部加密通讯应用后端：阅后即焚 + WebSocket 实时推送 + 端到端加密（E2EE）+ 完整管理后台。
 
-NestJS 10 + TypeORM + MySQL 8，接口文档见 Swagger（`/api-docs`，42 个接口全中文文档）。
+NestJS 10 + TypeORM + MySQL 8，接口文档见 Swagger（`/api-docs`，46 个接口全中文文档）。
 
 ## 功能特性
 
@@ -25,6 +25,7 @@ NestJS 10 + TypeORM + MySQL 8，接口文档见 Swagger（`/api-docs`，42 个�
 - 账号管理：开通（仅后台开通，无自助注册）、Excel 批量导入、停用、**软删除**
 - 群组管理：全量群组列表（含已解散）、**管理员强制解散（留痕）**
 - 系统公告：发布 / 撤回 / 已读统计 / 未读角标，支持 urgent 强提醒
+- 意见反馈：用户提交意见，管理后台查看 / 回复（回复即处理）
 - 群主解散群 = 解散即焚（消息一并销毁），与管理员强制解散（留痕）语义区分
 
 **工程化**
@@ -45,7 +46,7 @@ NestJS 10 + TypeORM + MySQL 8，接口文档见 Swagger（`/api-docs`，42 个�
 | 认证 | JWT 双密钥 |
 | 日志 | nestjs-pino |
 | 测试 | Jest + supertest；k6 压测 |
-| 文档 | Swagger（优先加载 `openapi.yaml`，42 接口 / 12 分组） |
+| 文档 | Swagger（优先加载 `openapi.yaml`，46 接口 / 13 分组） |
 
 ## 快速开始
 
@@ -70,9 +71,10 @@ npm run start:prod     # 开发热更用 npm run start:dev
 
 ```bash
 mysql -u root -p burnmsg < docs/migration-20260827.sql
+mysql -u root -p burnmsg < docs/migration-20260827-feedback.sql   # 意见反馈表（v5.3 新增）
 ```
 
-内容为：软删除列、群解散列、消息 4 个加密列、公告 / 公告已读 / 用户公钥三张新表。**重复执行会报"列已存在"，忽略即可。**
+内容为：软删除列、群解散列、消息 4 个加密列、公告 / 公告已读 / 用户公钥三张新表；feedback.sql 再补意见反馈表。**重复执行会报"列已存在"，忽略即可。**
 
 也可以用标准 migration 流程：`npm run migration:run`（生成新迁移用 `npm run migration:generate <name>`）。
 
@@ -98,7 +100,7 @@ docker compose up -d --build
 
 ## 接口概览
 
-完整文档见 Swagger `/api-docs` 或仓库根目录 `openapi.yaml`（42 接口 / 12 分组）。
+完整文档见 Swagger `/api-docs` 或仓库根目录 `openapi.yaml`（46 接口 / 13 分组）。
 
 | 分组 | 代表接口 |
 |------|---------|
@@ -109,6 +111,7 @@ docker compose up -d --build
 | 消息 | 发送（支持 E2EE 密文字段）/ 列表 / 编辑 / 撤回 / 已读 / 回执查询 |
 | 密钥 | 上传身份公钥（限 5/min）/ 查询对方公钥（限 60/min，需同会话） |
 | 公告 | 发布 / 列表 / 管理列表 / 未读数 / 已读标记 / 撤回 |
+| 意见反馈 | 提交 / 我的反馈 / 管理列表（按状态筛选）/ 管理员回复 |
 | 统计 | 数据总览（12 指标） |
 | 审计 | 审计日志查询 |
 | 上传 | `POST /upload`（50MB） |
@@ -159,6 +162,7 @@ src/
 │   ├── events/        # WebSocket 网关（全局模块）
 │   ├── keys/          # E2EE 公钥分发
 │   ├── announcement/  # 系统公告
+│   ├── feedback/      # 意见反馈
 │   ├── stats/         # 数据总览
 │   ├── audit/         # 审计日志
 │   └── upload/        # 文件上传
