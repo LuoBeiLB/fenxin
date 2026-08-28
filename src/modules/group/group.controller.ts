@@ -6,7 +6,7 @@ import { Roles } from '../../common/decorators/roles.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { ResponseMessage } from '../../common/decorators/response-message.decorator';
 import { AuthPayload } from '../../common/guards/jwt-auth.guard';
-import { CreateGroupDto, UpdateGroupDto, AddMembersDto, SetRoleDto } from './dto';
+import { CreateGroupDto, UpdateGroupDto, AddMembersDto, SetRoleDto, TransferOwnershipDto } from './dto';
 
 @ApiTags('群组管理')
 @ApiBearerAuth()
@@ -103,6 +103,18 @@ export class GroupController {
     @Body() dto: SetRoleDto,
   ) {
     await this.groupService.setMemberRole(id, userId, dto.role, user.userId);
+    return null;
+  }
+
+  /** 群主：把 owner 身份转给群内另一个成员 */
+  @Post(':id/transfer')
+  @ResponseMessage('群主已转让')
+  async transferOwnership(
+    @CurrentUser() user: AuthPayload,
+    @Param('id') id: string,
+    @Body() dto: TransferOwnershipDto,
+  ) {
+    await this.groupService.transferOwnership(id, user.userId, dto.new_owner_id);
     return null;
   }
 }

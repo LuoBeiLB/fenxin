@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Post, Put, Query } from '@nestjs/common';
+import { Body, Controller, DefaultValuePipe, Get, Param, ParseIntPipe, Post, Put, Query } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { MessageService } from './message.service';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
@@ -43,6 +43,23 @@ export class MessageController {
       userId: user.userId,
       before,
       limit: limit ? Number(limit) : undefined,
+    });
+  }
+
+  @Get(':conversationId/search')
+  search(
+    @CurrentUser() user: AuthPayload,
+    @Param('conversationId') conversationId: string,
+    @Query('keyword') keyword: string,
+    @Query('before') before?: string,
+    @Query('limit', new DefaultValuePipe(50), ParseIntPipe) limit?: number,
+  ) {
+    return this.messageService.searchMessages({
+      conversationId,
+      userId: user.userId,
+      keyword,
+      before,
+      limit,  // service 内 Math.min(limit, 200) 二次兜底
     });
   }
 

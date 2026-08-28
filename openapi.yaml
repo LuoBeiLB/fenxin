@@ -1534,6 +1534,83 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /messages/{conversationId}/search:
+    get:
+      tags: [消息]
+      summary: 消息关键字搜索
+      description: |-
+        【用途】在指定会话内按关键字搜索消息内容（仅明文消息）。
+
+        【调用时机】用户在聊天页搜索框输入关键字并触发搜索时。
+
+        【业务规则与注意事项】
+        - 调用人必须是会话成员（conversation_members 中存在），否则返回 403。
+        - 关键字必填且不能为空字符串（去 trim 后），否则返回 400。
+        - 仅搜索明文消息：is_encrypted=false 的消息可搜，加密（E2EE）消息后端无密钥无法检索，加密消息需走客户端本地搜索。
+        - 自动排除已焚毁的消息：is_destroyed=false 且 destroy_at IS NULL OR destroy_at > NOW()。
+        - 按 created_at 倒序分页，使用 before 游标（与 GET /messages/{conversationId} 一致）；默认 limit=50。
+        - 响应中 data.items 为正序（与 listMessages 一致），data.next_before 为下一页游标。
+      parameters:
+        - name: conversationId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+          description: 会话 ID（UUID）
+          example: 1b2c3d4e-5f6a-47b8-89c0-d1e2f3a4b5c6
+        - name: keyword
+          in: query
+          required: true
+          schema: { type: string, minLength: 1 }
+          description: 搜索关键字（必填，trim 后非空）
+          example: 项目进度
+        - name: before
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+          description: 分页游标
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+          description: 每页条数，默认 50
+      responses:
+        '200':
+          description: 搜索成功，data.items 为匹配消息数组，data.next_before 为下一页游标
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: ok }
+                  data:
+                    type: object
+                    properties:
+                      items:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Message'
+                      next_before:
+                        type: string
+                        format: uuid
+                        nullable: true
+        '400':
+          description: 关键字为空 / 参数校验失败
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: 未携带或无效/过期 token；账号已停用或设备已下线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: 非会话成员
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+
   /messages/{id}:
     put:
       tags: [消息]
@@ -1933,6 +2010,75 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+  /groups/{id}/transfer:
+    post:
+      tags: [群组]
+      summary: 群主转让群
+      description: |-
+        【用途】群主将自己的群主身份转让给本群其他成员。
+
+        【调用时机】群主在群设置页选择「转让群主」并指定新群主后。
+
+        【业务规则与注意事项】
+        - 仅该群 owner 可调用，其他成员/群管理员返回 403（Only group owner can transfer ownership）。
+        - 新群主必须是本群在册成员（conversation_members 中存在且未退出），否则返回 400（New owner must be a member of the group）。
+        - 不能转让给自己（new_owner_id === 当前 owner），返回 400。
+        - 转让为事务操作：同时更新 Conversation.owner_id、老 owner 降级为 admin、新 owner 升级为 owner。
+        - 全群成员通过 WS 收到 conversation:updated（reason=owner_changed, new_owner_id=<新群主ID>）。
+        - 写 audit_log（action=transfer_ownership），供管理后台审计查询。
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+          description: 群会话 ID（UUID）
+          example: 1b2c3d4e-5f6a-47b8-89c0-d1e2f3a4b5c6
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [new_owner_id]
+              properties:
+                new_owner_id:
+                  type: string
+                  format: uuid
+                  description: 新群主用户 ID（UUIDv4），必须是当前群内成员
+                  example: 873b9615-a1ba-11f1-aa22-00155d52a721
+      responses:
+        '200':
+          description: 转让成功（message 为「群主已转让」），data 为 null
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: 群主已转让 }
+                  data: { nullable: true, example: null }
+        '400':
+          description: 参数校验失败 / 不能转让给自己 / 新群主不是本群成员 / 群已解散
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: 未携带或无效/过期 token；账号已停用或设备已下线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: 仅群 owner 可转让该群
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: 群不存在
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+
 
   /groups/admin/all:
     get:
