@@ -24,7 +24,7 @@ export class AccountService {
     private readonly audit: AuditService,
     private readonly authCache: AuthCacheService,
     private readonly groupService: GroupService,
-  ) {}
+  ) { }
 
   async createAccount(params: {
     phone: string;
@@ -216,7 +216,7 @@ export class AccountService {
       action: 'delete_account',
       targetType: 'user',
       targetId: targetUserId,
-      detail: `Soft-deleted account ${target.phone} (${target.display_name})`,
+      detail: `Soft-deleted account ${target.phone} (${target.display_name}); cascade-dissolved ${cascade.dissolved}/${cascade.total} owned groups`,
       ipAddress: ip,
     });
 
