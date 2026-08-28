@@ -2,7 +2,7 @@
 
 企业内部加密通讯应用后端：阅后即焚 + WebSocket 实时推送 + 端到端加密（E2EE）+ 完整管理后台。
 
-NestJS 10 + TypeORM + MySQL 8，接口文档见 Swagger（`/api-docs`，46 个接口全中文文档）。
+NestJS 10 + TypeORM + MySQL 8，接口文档见 Swagger（`/api-docs`，45 个接口全中文文档）。
 
 ## 功能特性
 
@@ -22,7 +22,7 @@ NestJS 10 + TypeORM + MySQL 8，接口文档见 Swagger（`/api-docs`，46 个�
 
 **管理后台**
 - 数据总览：12 项指标（用户 / 会话 / 消息 / 存储用量）
-- 账号管理：开通（仅后台开通，无自助注册）、Excel 批量导入、停用、**软删除**
+- 账号管理：开通（仅后台开通，无自助注册）、Excel 批量导入、停用（群不受影响，恢复启用即还原）、**软删除**（注销时级联解散其为群主的全部群，解散即焚）
 - 群组管理：全量群组列表（含已解散）、**管理员强制解散（留痕）**
 - 系统公告：发布 / 撤回 / 已读统计 / 未读角标，支持 urgent 强提醒
 - 意见反馈：用户提交意见，管理后台查看 / 回复（回复即处理）
@@ -46,7 +46,7 @@ NestJS 10 + TypeORM + MySQL 8，接口文档见 Swagger（`/api-docs`，46 个�
 | 认证 | JWT 双密钥 |
 | 日志 | nestjs-pino |
 | 测试 | Jest + supertest；k6 压测 |
-| 文档 | Swagger（优先加载 `openapi.yaml`，46 接口 / 13 分组） |
+| 文档 | Swagger（优先加载 `openapi.yaml`，45 接口 / 13 分组） |
 
 ## 快速开始
 
@@ -72,6 +72,7 @@ npm run start:prod     # 开发热更用 npm run start:dev
 ```bash
 mysql -u root -p burnmsg < docs/migration-20260827.sql
 mysql -u root -p burnmsg < docs/migration-20260827-feedback.sql   # 意见反馈表（v5.3 新增）
+mysql -u root -p burnmsg < docs/migration-20260828-group-role-cleanup.sql   # 存量群管理员降级为成员（v5.5，无 admin 记录则无影响）
 ```
 
 内容为：软删除列、群解散列、消息 4 个加密列、公告 / 公告已读 / 用户公钥三张新表；feedback.sql 再补意见反馈表。**重复执行会报"列已存在"，忽略即可。**
@@ -100,14 +101,14 @@ docker compose up -d --build
 
 ## 接口概览
 
-完整文档见 Swagger `/api-docs` 或仓库根目录 `openapi.yaml`（46 接口 / 13 分组）。
+完整文档见 Swagger `/api-docs` 或仓库根目录 `openapi.yaml`（45 接口 / 13 分组）。
 
 | 分组 | 代表接口 |
 |------|---------|
 | 认证 | 登录 / 刷新 token / 改密 / 设备列表 / 设备下线 |
 | 账号 | 列表（含 `show_deleted`）/ 开通 / 导入 / 停用 / 软删除 |
 | 会话 | 单聊创建 / 我的会话 / 会话详情 |
-| 群组 | 建群 / 成员管理 / 群资料 / 群主解散（即焚）/ 管理员解散（留痕，`DELETE /groups/admin/:id`） |
+| 群组 | 建群 / 成员管理（仅群主；系统管理员可跨群查看与移除成员，群内无管理员角色）/ 群资料 / 群主解散（即焚）/ 管理员解散（留痕，`DELETE /groups/admin/:id`） |
 | 消息 | 发送（支持 E2EE 密文字段）/ 列表 / 编辑 / 撤回 / 已读 / 回执查询 |
 | 密钥 | 上传身份公钥（限 5/min）/ 查询对方公钥（限 60/min，需同会话） |
 | 公告 | 发布 / 列表 / 管理列表 / 未读数 / 已读标记 / 撤回 |

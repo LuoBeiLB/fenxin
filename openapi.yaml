@@ -46,7 +46,7 @@ tags:
   - name: 消息
     description: 消息管理：发送（含阅后即焚）、历史消息游标分页、编辑、撤回、已读标记与消息回执。
   - name: 群组
-    description: 群组/频道管理：建群、群资料、群成员增删与角色设置（群主 owner / 管理员 admin / 成员 member）。
+    description: 群组/频道管理：建群、群资料、群成员增删（群内仅 owner 群主 / member 成员两种角色；系统管理员 app_users.role=admin 可跨群查看成员与移除成员）。
   - name: 文件上传
     description: 消息附件上传（multipart），返回的 url 在发消息时填入 file_url。
   - name: 审计日志
@@ -859,6 +859,8 @@ paths:
         - 删除立即生效：该账号全部已签发 token 即刻失效（JWT 守卫实时查库校验），全端强制下线。
         - 历史消息保留，前端对 deleted_at 非空的发送者统一展示「已注销用户」。
         - 删除后同手机号可重新开通账号（新账号为全新身份，不继承旧数据）。
+        - 级联解散群（v5.4 起）：该用户作为**群主**的全部群随即解散，走「解散即焚」链路——群标记 dissolved_at、全群消息立即不可见并由 BurnScheduler 物理清除、全体成员 WS 实时收到 conversation:updated(dissolved)；每个群单独审计留痕（action=dissolve_group_on_account_delete），单群失败不阻断注销主流程。其仅以普通成员身份加入的群不受影响（成员列表按规则过滤其显示）。
+        - 注意对比：「停用」（POST /accounts/{id}/toggle-status）不做任何群操作，群正常使用，账号恢复启用后一切还原。
         - 账号列表（GET /accounts）默认不含已软删账号，传 show_deleted=1 可查看；审计日志留痕（action=delete_account）。
       parameters:
         - name: id
@@ -1900,10 +1902,10 @@ paths:
       description: |-
         【用途】更新群名称、简介、头像，三个字段均为可选，仅提交的字段会被更新。
 
-        【调用时机】群主/管理员在群设置页修改资料保存时。
+        【调用时机】群主在群设置页修改资料保存时。
 
         【业务规则与注意事项】
-        - 仅群主（owner）或群管理员（admin）可调用，普通成员返回 403（Only group owner or admin can update group info）。
+        - 仅群主（owner）可调用，普通成员返回 403（Only group owner can update group info）；群内无管理员角色。
         - 响应为更新后的完整 Conversation。
       parameters:
         - name: id
@@ -1956,7 +1958,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '403':
-          description: 权限不足，仅群主/群管理员可操作（Only group owner or admin can update group info）
+          description: 权限不足，仅群主可操作（Only group owner can update group info）
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -1970,7 +1972,7 @@ paths:
         【调用时机】群主在群设置页确认解散时。
 
         【业务规则与注意事项】
-        - 仅该群 owner 可调用，其他成员/群管理员返回 403；已解散的群返回 400。
+        - 仅该群 owner 可调用，其他成员返回 403；已解散的群返回 400。
         - 解散即焚：解散瞬间全群消息被置为立即到期（destroy_at=解散时刻），消息列表对成员立即不可见，约 1 分钟内由服务端焚毁调度器物理清除（含回执与附件文件）。
         - 群记录（Conversation）保留并打 dissolved_at + dissolved_by 标记，成员不可再发消息；群内成员 WS 实时收到 conversation:updated（reason=dissolved）。
         - 与「阅后即焚」共用同一条物理清除链路，清除动作不可恢复，前端交互上应二次确认。
@@ -2209,7 +2211,7 @@ paths:
         【调用时机】打开群聊的成员列表/群设置页时。
 
         【业务规则与注意事项】
-        - 本群成员可查看，非成员返回 403；管理员（role=admin）可查看任意群的成员列表（配合管理后台群组管理）。
+        - 本群成员可查看，非成员返回 403；系统管理员（app_users.role=admin，数据库默认管理员）可查看任意群的成员列表（配合管理后台群组管理）。
         - 已停用 / 已注销（软删除）的成员不返回；成员关系记录保留，账号恢复启用后自动重新出现在列表中。
         - 结果按成员角色 role 字段升序排列；每条在 ConversationMember 基础上附带 user_display_name、user_avatar_url 便于直接展示。
       parameters:
@@ -2249,10 +2251,10 @@ paths:
       description: |-
         【用途】向群内批量添加成员。
 
-        【调用时机】群主/管理员在群设置页「添加成员」选人后提交时。
+        【调用时机】群主在群设置页「添加成员」选人后提交时。
 
         【业务规则与注意事项】
-        - 仅群主（owner）或群管理员（admin）可调用，普通成员返回 403（Only group owner or admin can add members）。
+        - 仅群主（owner）可调用，普通成员返回 403（Only group owner can add members）；群内无管理员角色。
         - member_ids 必填，最多 500 个，每个必须是合法 UUID v4；新成员角色均为 member。
         - 已在群内的用户 ID 自动跳过（幂等），全部已存在时不做任何变更；添加成功后同步更新会话 member_count。
       parameters:
@@ -2298,7 +2300,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '403':
-          description: 权限不足，仅群主/群管理员可操作（Only group owner or admin can add members）
+          description: 权限不足，仅群主可操作（Only group owner can add members）
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -2310,10 +2312,11 @@ paths:
       description: |-
         【用途】把指定用户移出群聊。
 
-        【调用时机】群主/管理员在成员列表中执行「移出群聊」时。
+        【调用时机】群主在成员列表中执行「移出群聊」时；或系统管理员在管理后台移除任意群成员时。
 
         【业务规则与注意事项】
-        - 仅群主（owner）或群管理员（admin）可调用（Only group owner or admin can remove members）；源码未对「本人退群」做单独豁免，普通成员调用同样返回 403。
+        - 两种调用身份：本群群主（owner），或系统管理员（app_users.role=admin，数据库默认管理员）——系统管理员可移除**任意群**的成员；普通成员调用返回 403（Only group owner can remove members）。群内无管理员角色。
+        - 源码未对「本人退群」做单独豁免，普通成员调用同样返回 403。
         - 群主不可被移除，尝试移除群主返回 403（Cannot remove the group owner）。
         - 移除成功后同步更新会话 member_count。
       parameters:
@@ -2346,78 +2349,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '403':
-          description: 权限不足，仅群主/群管理员可操作；或尝试移除群主（Cannot remove the group owner）
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-
-  /groups/{id}/members/{userId}/role:
-    put:
-      tags: [群组]
-      summary: 设置群成员角色
-      description: |-
-        【用途】设置指定群成员的角色（设为管理员或降为普通成员）。
-
-        【调用时机】群主在成员列表中「设为管理员/取消管理员」时。
-
-        【业务规则与注意事项】
-        - 仅群主（owner）可调用，群管理员也无权设置角色（Only group owner can set admin role）。
-        - role 仅允许 admin / member 两种取值（群主身份不可通过本接口转让）。
-        - 目标用户必须在群内，否则返回 404（目标用户不在群内）。
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema: { type: string, format: uuid }
-          description: 群会话 ID（UUID）
-          example: 1b2c3d4e-5f6a-47b8-89c0-d1e2f3a4b5c6
-        - name: userId
-          in: path
-          required: true
-          schema: { type: string, format: uuid }
-          description: 目标用户 ID（UUID）
-          example: 7c9e6679-7425-40de-944b-e07fc1f90ae7
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [role]
-              properties:
-                role:
-                  type: string
-                  enum: [admin, member]
-                  description: 目标角色：admin 设为管理员 / member 降为普通成员
-                  example: admin
-      responses:
-        '200':
-          description: 设置成功（message 为「角色设置成功」，data 为 null）
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  code: { type: integer, example: 0 }
-                  message: { type: string, example: 角色设置成功 }
-                  data: { type: object, nullable: true, example: null }
-        '400':
-          description: role 缺失或取值非法（仅允许 admin/member）
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-        '401':
-          description: 未携带或无效/过期 token；账号已停用或设备已下线
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-        '403':
-          description: 非群主（Only group owner can set admin role）
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-        '404':
-          description: 目标用户不在群内
+          description: 权限不足（非本群群主且非系统管理员）；或尝试移除群主（Cannot remove the group owner）
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -3525,8 +3457,8 @@ components:
           example: 7c9e6679-7425-40de-944b-e07fc1f90ae7
         role:
           type: string
-          enum: [owner, admin, member]
-          description: 群内角色：owner 群主（创建者，可设置管理员）/ admin 群管理员（可改群资料、增删成员）/ member 普通成员
+          enum: [owner, member]
+          description: 群内角色：owner 群主（创建者，可改群资料、增删成员、解散群）/ member 普通成员；群内无管理员角色，「管理员」均指系统管理员（app_users.role=admin）
           example: member
         muted:
           type: boolean
