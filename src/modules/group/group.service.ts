@@ -338,4 +338,83 @@ export class GroupService {
       detail: `Owner dissolved group "${conv.name ?? conversationId}" (${memberIds.length} members, messages scheduled for burn)`,
     });
   }
+
+  /**
+   * 群主转让：把 owner 身份转给群内另一个成员
+   * ① 仅当前 owner 可调用；
+   * ② 新 owner 必须是本群成员（普通成员或管理员均可），不能转让给已退群/外部用户，不能转让给自己；
+   * ③ 已解散群不可转让；
+   * ④ 事务里同步改 Conversation.owner_id + ConversationMember.role（原 owner 降为 admin，新 owner 升为 owner），保证数据一致；
+   * ⑤ 实时推送 conversation:updated(reason=owner_changed, new_owner_id) 通知全体成员刷新群资料。
+   */
+  async transferOwnership(conversationId: string, currentOwnerId: string, newOwnerId: string) {
+    if (currentOwnerId === newOwnerId) {
+      throw new BadRequestException('不能把群主转让给自己');
+    }
+    const convRepo = this.dataSource.getRepository(Conversation);
+    const memberRepo = this.dataSource.getRepository(ConversationMember);
+
+    const conv = await convRepo.findOne({ where: { id: conversationId, type: 'group' } });
+    if (!conv) throw new NotFoundException('群组不存在');
+    if (conv.dissolved_at) throw new BadRequestException('该群组已被解散');
+    if (conv.owner_id !== currentOwnerId) {
+      throw new ForbiddenException('仅群主可转让群主');
+    }
+    const newOwnerMembership = await memberRepo.findOne({
+      where: { conversation_id: conversationId, user_id: newOwnerId },
+    });
+    if (!newOwnerMembership) {
+      throw new BadRequestException('目标用户不是本群成员');
+    }
+
+    await this.dataSource.transaction(async (em) => {
+      // 1. 会话主表 owner_id 改为新群主（带 owner_id 条件做乐观锁，防止两个 owner 并发转让导致 audit 不一致）
+      const ownerUpdate = await em.getRepository(Conversation).update(
+        { id: conversationId, owner_id: currentOwnerId },
+        { owner_id: newOwnerId },
+      );
+      if (ownerUpdate.affected === 0) {
+        throw new ConflictException('群主已被他人变更，请刷新后重试');
+      }
+      // 2. 老群主降为 admin（保留管理权限，不踢出群）
+      const oldOwnerUpdate = await em.getRepository(ConversationMember).update(
+        { conversation_id: conversationId, user_id: currentOwnerId },
+        { role: 'admin' },
+      );
+      if (oldOwnerUpdate.affected === 0) {
+        // 异常数据：老 owner 不在 members 中，但 owner_id 已改。抛错让事务回滚。
+        throw new Error('老群主不在会话成员表中，数据异常');
+      }
+      // 3. 新群主升为 owner
+      const newOwnerUpdate = await em.getRepository(ConversationMember).update(
+        { conversation_id: conversationId, user_id: newOwnerId },
+        { role: 'owner' },
+      );
+      if (newOwnerUpdate.affected === 0) {
+        // 前面已校验过新 owner 是成员，不应发生
+        throw new Error('新群主不在会话成员表中，数据异常');
+      }
+    });
+
+    // 实时推送：群主变更，全体成员刷新群资料
+    // WS 推送失败不能让接口 500（数据已改成功），用 try/catch 隔离
+    try {
+      const memberIds = await this.getMemberUserIds(conversationId);
+      this.events.emitToUsers(WS_EVENTS.CONVERSATION_UPDATED, memberIds, {
+        conversation_id: conversationId,
+        reason: 'owner_changed',
+        new_owner_id: newOwnerId,
+      });
+    } catch (err) {
+      Logger.warn(`群主转让 WS 推送失败: ${(err as Error).message}`, 'GroupService');
+    }
+
+    await this.audit.log({
+      userId: currentOwnerId,
+      action: 'transfer_ownership',
+      targetType: 'conversation',
+      targetId: conversationId,
+      detail: `Transferred ownership of "${conv.name ?? conversationId}" to ${newOwnerId}`,
+    });
+  }
 }

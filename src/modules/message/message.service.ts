@@ -283,4 +283,60 @@ export class MessageService {
       }
     }
   }
+
+  /**
+   * 按关键字搜索会话内历史消息。
+   * ① 仅会话成员可访问；
+   * ② E2EE 加密消息后端无法解密（密文存 cipher_text，content 只是占位符）—— 仅搜明文消息 is_encrypted=false；
+   * ③ 与 listMessages 一样过滤已销毁 + 到期未销毁 的消息。
+   * keyword 必填，前后 trim；用 content LIKE 模糊匹配，命中按 created_at 倒序再翻转为正序。
+   */
+  async searchMessages(params: {
+    conversationId: string;
+    userId: string;
+    keyword: string;
+    before?: string;
+    limit?: number;
+  }): Promise<Message[]> {
+    const keyword = (params.keyword ?? '').trim();
+    if (!keyword) {
+      throw new BadRequestException('keyword 不能为空');
+    }
+    if (keyword.length > 100) {
+      throw new BadRequestException('关键字过长（最长 100 字符）');
+    }
+    await this.assertMember(params.conversationId, params.userId);
+
+    // 限制单次返回数量上限为 200，防止恶意传大 limit 导致内存爆掉
+    const limit = Math.min(params.limit || 50, 200);
+    const qb = this.dataSource
+      .getRepository(Message)
+      .createQueryBuilder('m')
+      .where('m.conversation_id = :conversationId', { conversationId: params.conversationId })
+      .andWhere('m.is_destroyed = :isDestroyed', { isDestroyed: false })
+      .andWhere('(m.destroy_at IS NULL OR m.destroy_at > :now)', { now: new Date() })
+      // E2EE：加密消息后端无法解密，仅搜明文
+      .andWhere('m.is_encrypted = :isEncrypted', { isEncrypted: false })
+      .andWhere('m.content LIKE :kw', { kw: `%${keyword}%` })
+      .orderBy('m.created_at', 'DESC')
+      .take(limit);
+
+    if (params.before) {
+      // 校验 before 必须是合法日期字符串（UUID 不行，ISO 日期才行）
+      // 接受 ISO8601 字符串或时间戳（毫秒）
+      let beforeDate: Date;
+      if (/^\d{10,13}$/.test(params.before)) {
+        beforeDate = new Date(Number(params.before));
+      } else {
+        beforeDate = new Date(params.before);
+      }
+      if (isNaN(beforeDate.getTime())) {
+        throw new BadRequestException('before 参数格式错误，应为 ISO8601 日期或毫秒时间戳');
+      }
+      qb.andWhere('m.created_at < :before', { before: beforeDate });
+    }
+
+    const messages = await qb.getMany();
+    return messages.reverse();
+  }
 }

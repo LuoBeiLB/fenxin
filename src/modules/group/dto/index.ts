@@ -63,3 +63,9 @@ export class SetRoleDto {
   @IsIn(['admin', 'member'])
   role: 'admin' | 'member';
 }
+
+export class TransferOwnershipDto {
+  @ApiProperty({ description: '新群主用户 ID（UUIDv4），必须是当前群内成员' })
+  @IsUUID('4')
+  new_owner_id: string;
+}
