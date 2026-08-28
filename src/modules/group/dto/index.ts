@@ -1,4 +1,4 @@
-import { IsString, IsOptional, IsArray, ArrayMaxSize, IsUUID, IsBoolean, IsIn, MaxLength } from 'class-validator';
+import { IsString, IsOptional, IsArray, ArrayMaxSize, IsUUID, IsBoolean,  MaxLength } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
 export class CreateGroupDto {
@@ -58,11 +58,7 @@ export class AddMembersDto {
   member_ids: string[];
 }
 
-export class SetRoleDto {
-  @ApiProperty({ enum: ['admin', 'member'] })
-  @IsIn(['admin', 'member'])
-  role: 'admin' | 'member';
-}
+
 
 export class TransferOwnershipDto {
   @ApiProperty({ description: '新群主用户 ID（UUIDv4），必须是当前群内成员' })

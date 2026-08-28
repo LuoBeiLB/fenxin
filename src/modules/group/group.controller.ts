@@ -6,7 +6,7 @@ import { Roles } from '../../common/decorators/roles.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { ResponseMessage } from '../../common/decorators/response-message.decorator';
 import { AuthPayload } from '../../common/guards/jwt-auth.guard';
-import { CreateGroupDto, UpdateGroupDto, AddMembersDto, SetRoleDto, TransferOwnershipDto } from './dto';
+import { CreateGroupDto, UpdateGroupDto, AddMembersDto,  TransferOwnershipDto } from './dto';
 
 @ApiTags('群组管理')
 @ApiBearerAuth()
@@ -90,21 +90,11 @@ export class GroupController {
     @Param('id') id: string,
     @Param('userId') userId: string,
   ) {
-    await this.groupService.removeMember(id, userId, user.userId);
+    // 系统管理员（user.role=admin）可移除任意群成员；否则仅本群群主
+    await this.groupService.removeMember(id, userId, user.userId, user.role);
     return null;
   }
 
-  @Put(':id/members/:userId/role')
-  @ResponseMessage('角色设置成功')
-  async setRole(
-    @CurrentUser() user: AuthPayload,
-    @Param('id') id: string,
-    @Param('userId') userId: string,
-    @Body() dto: SetRoleDto,
-  ) {
-    await this.groupService.setMemberRole(id, userId, dto.role, user.userId);
-    return null;
-  }
 
   /** 群主：把 owner 身份转给群内另一个成员 */
   @Post(':id/transfer')

@@ -132,8 +132,11 @@ describe('业务状态变化 → AuthCache.invalidate', () => {
       const audit = {
         log: jest.fn().mockResolvedValue(undefined),
       } as unknown as AuditService;
-
-      svc = new AccountService(dataSource, audit, authCache);
+      // v5.4 起构造新增 GroupService（注销级联解散群主群）；本套件不触达注销流程，给最小 mock
+      const groupService = {
+        dissolveGroupsOnAccountDelete: jest.fn().mockResolvedValue({ total: 0, dissolved: 0 }),
+      };
+      svc = new AccountService(dataSource, audit, authCache, groupService as any);
 
       mockedArgon2.hash.mockResolvedValue('hashed-new' as any);
     });

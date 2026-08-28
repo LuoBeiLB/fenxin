@@ -6,6 +6,7 @@ import { AppUser, sanitizeUser, SAFE_USER_FIELDS } from '../../entities/app-user
 import { Device } from '../../entities/device.entity';
 import { AuditService } from '../audit/audit.service';
 import { AuthCacheService } from '../../common/cache/auth-cache.service';
+import { GroupService } from '../group/group.service';
 import { generateRandomPassword } from '../../common/utils/password.util';
 
 export interface BatchResult {
@@ -22,6 +23,7 @@ export class AccountService {
     private readonly dataSource: DataSource,
     private readonly audit: AuditService,
     private readonly authCache: AuthCacheService,
+    private readonly groupService: GroupService,
   ) {}
 
   async createAccount(params: {
@@ -203,6 +205,11 @@ export class AccountService {
 
     // 主动失效鉴权缓存：deleted_at 已写入，避免 30s TTL 内已删除账号凭旧缓存继续通行
     this.authCache.invalidate(targetUserId);
+
+
+    // 级联解散其为群主的全部群（解散即焚）：群主账号已注销，群失去存续主体；
+    // 普通成员身份所在群不受影响（仅成员列表按 v5.3 规则过滤其显示）
+    const cascade = await this.groupService.dissolveGroupsOnAccountDelete(targetUserId, operatorId, ip);
 
     await this.audit.log({
       userId: operatorId,

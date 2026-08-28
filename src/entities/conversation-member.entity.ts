@@ -1,6 +1,6 @@
 import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn, Index, Unique } from 'typeorm';
 
-export type MemberRole = 'owner' | 'admin' | 'member';
+export type MemberRole = 'owner'| 'member';
 
 @Entity('conversation_members')
 @Unique('idx_conv_members_unique', ['conversation_id', 'user_id'])

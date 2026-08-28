@@ -1,4 +1,4 @@
-import { BadRequestException,ConflictException, ForbiddenException, Injectable,Logger, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, ForbiddenException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { DataSource, In, IsNull } from 'typeorm';
 import { Conversation } from '../../entities/conversation.entity';
 import { ConversationMember } from '../../entities/conversation-member.entity';
@@ -14,7 +14,7 @@ export class GroupService {
     private readonly dataSource: DataSource,
     private readonly events: EventsGateway,
     private readonly audit: AuditService,
-  ) {}
+  ) { }
 
   private async getMembership(conversationId: string, userId: string) {
     return this.dataSource.getRepository(ConversationMember).findOne({
@@ -30,10 +30,12 @@ export class GroupService {
     return members.map((m) => m.user_id);
   }
 
-  private async assertOwnerOrAdmin(conversationId: string, userId: string, action: string) {
+  // 群内只有 owner / member 两种角色（无群管理员概念）。
+  // 系统管理员（app_users.role=admin）的跨群权限由各方法单独判断，不走本断言。
+  private async assertOwner(conversationId: string, userId: string, action: string) {
     const membership = await this.getMembership(conversationId, userId);
-    if (!membership || !['owner', 'admin'].includes(membership.role)) {
-      throw new ForbiddenException(`Only group owner or admin can ${action}`);
+    if (!membership || membership.role !== 'owner') {
+      throw new ForbiddenException(`Only group owner can ${action}`);
     }
     return membership;
   }
@@ -83,7 +85,7 @@ export class GroupService {
   }
 
   async addMembers(conversationId: string, memberIds: string[], operatorId: string): Promise<void> {
-    await this.assertOwnerOrAdmin(conversationId, operatorId, 'add members');
+    await this.assertOwner(conversationId, operatorId, 'add members');
 
     const memberRepo = this.dataSource.getRepository(ConversationMember);
     const convRepo = this.dataSource.getRepository(Conversation);
@@ -108,8 +110,11 @@ export class GroupService {
     );
   }
 
-  async removeMember(conversationId: string, targetUserId: string, operatorId: string): Promise<void> {
-    await this.assertOwnerOrAdmin(conversationId, operatorId, 'remove members');
+  // 系统管理员（operatorRole=admin，数据库默认管理员）可移除任意群的成员；否则仅本群群主可移除
+  async removeMember(conversationId: string, targetUserId: string, operatorId: string, operatorRole?: string): Promise<void> {
+    if (operatorRole !== 'admin') {
+      await this.assertOwner(conversationId, operatorId, 'remove members');
+    }
 
     const memberRepo = this.dataSource.getRepository(ConversationMember);
     const targetMembership = await this.getMembership(conversationId, targetUserId);
@@ -130,34 +135,13 @@ export class GroupService {
     );
   }
 
-  async setMemberRole(
-    conversationId: string,
-    targetUserId: string,
-    role: 'admin' | 'member',
-    operatorId: string,
-  ): Promise<void> {
-    const conv = await this.dataSource.getRepository(Conversation).findOne({
-      where: { id: conversationId },
-    });
-    if (conv?.dissolved_at) throw new BadRequestException('群组已解散，不能执行管理操作');
-    const operatorMembership = await this.getMembership(conversationId, operatorId);
-    if (operatorMembership?.role !== 'owner') {
-      throw new ForbiddenException('Only group owner can set admin role');
-    }
-    const target = await this.getMembership(conversationId, targetUserId);
-    if (!target) throw new NotFoundException('目标用户不在群内');
-
-    await this.dataSource
-      .getRepository(ConversationMember)
-      .update({ conversation_id: conversationId, user_id: targetUserId }, { role });
-  }
 
   async updateGroupInfo(
     conversationId: string,
     updates: { name?: string; description?: string; avatarUrl?: string },
     operatorId: string,
   ): Promise<Conversation> {
-    await this.assertOwnerOrAdmin(conversationId, operatorId, 'update group info');
+    await this.assertOwner(conversationId, operatorId, 'update group info');
 
     const convRepo = this.dataSource.getRepository(Conversation);
     const updateData: Partial<Conversation> = {};
@@ -247,9 +231,9 @@ export class GroupService {
     const ownerIds = [...new Set(groups.map((g) => g.owner_id).filter((id): id is string => !!id))];
     const owners = ownerIds.length
       ? await this.dataSource.getRepository(AppUser).find({
-          where: ownerIds.map((id) => ({ id })),
-          select: ['id', 'display_name', 'phone'],
-        })
+        where: ownerIds.map((id) => ({ id })),
+        select: ['id', 'display_name', 'phone'],
+      })
       : [];
     const ownerMap = new Map(owners.map((u) => [u.id, u]));
 
@@ -376,10 +360,10 @@ export class GroupService {
       if (ownerUpdate.affected === 0) {
         throw new ConflictException('群主已被他人变更，请刷新后重试');
       }
-      // 2. 老群主降为 admin（保留管理权限，不踢出群）
+      // 2. 老群主降为普通成员（不踢出群）
       const oldOwnerUpdate = await em.getRepository(ConversationMember).update(
         { conversation_id: conversationId, user_id: currentOwnerId },
-        { role: 'admin' },
+        { role: 'member' },
       );
       if (oldOwnerUpdate.affected === 0) {
         // 异常数据：老 owner 不在 members 中，但 owner_id 已改。抛错让事务回滚。
@@ -416,5 +400,61 @@ export class GroupService {
       targetId: conversationId,
       detail: `Transferred ownership of "${conv.name ?? conversationId}" to ${newOwnerId}`,
     });
+  }
+
+
+  /**
+   * 账号注销级联：解散该用户作为群主的全部群（解散即焚语义）。
+   * 供 AccountService.softDeleteAccount 调用；群主账号已注销，群失去存续主体，
+   * 走与群主自行解散同一条焚毁链路（消息 destroy_at 置为解散时刻，BurnScheduler 物理清除）。
+   * 每群独立事务 + 独立审计；单群失败不阻断其余群与账号注销主流程。
+   */
+  async dissolveGroupsOnAccountDelete(ownerId: string, operatorId: string, ip?: string) {
+    const convRepo = this.dataSource.getRepository(Conversation);
+    const owned = await convRepo.find({
+      where: { owner_id: ownerId, type: 'group', dissolved_at: IsNull() },
+    });
+
+    let dissolved = 0;
+    for (const conv of owned) {
+      try {
+        const dissolvedAt = new Date();
+        await this.dataSource.transaction(async (em) => {
+          await em.getRepository(Conversation).update(conv.id, {
+            dissolved_at: dissolvedAt,
+            dissolved_by: operatorId,
+          });
+          // 到期时间设为解散时刻 → 消息立即不可见，等待 BurnScheduler 物理清除
+          await em
+            .createQueryBuilder()
+            .update(Message)
+            .set({ destroy_at: dissolvedAt })
+            .where('conversation_id = :conversationId', { conversationId: conv.id })
+            .andWhere('is_destroyed = :destroyed', { destroyed: false })
+            .execute();
+        });
+
+        // 实时推送：全体成员会话列表立即移除该群
+        const memberIds = await this.getMemberUserIds(conv.id);
+        this.events.emitToUsers(WS_EVENTS.CONVERSATION_UPDATED, memberIds, {
+          conversation_id: conv.id,
+          reason: 'dissolved',
+        });
+
+        await this.audit.log({
+          userId: operatorId,
+          action: 'dissolve_group_on_account_delete',
+          targetType: 'conversation',
+          targetId: conv.id,
+          detail: `Cascade-dissolved group "${conv.name ?? conv.id}" on account deletion of owner ${ownerId} (${memberIds.length} members, messages scheduled for burn)`,
+          ipAddress: ip,
+        });
+        dissolved += 1;
+      } catch {
+        // 单群失败不阻断：其余群继续解散，账号注销主流程不受影响（失败群保持原状，可人工处理）
+      }
+    }
+
+    return { total: owned.length, dissolved };
   }
 }
