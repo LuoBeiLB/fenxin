@@ -13,7 +13,7 @@ import { MessageReceipt } from 'src/entities/message-receipt.entity';
  *   2. 全填加密字段 → 加密路：is_encrypted=true、content='[加密消息]'、3 字段透传
  *   3. 半填（只填 1 字段） → BadRequestException
  *   4. 半填（只填 2 字段） → BadRequestException
- *   5. 加密 + destroyAt（5s 后）阅后即焚 → 组合：destroy_at 落库 + 加密字段都在
+ *   5. 加密 + burnTtlSeconds=5 点开才焚 → 组合：burn_ttl_seconds 落库 + destroy_at 兜底 + 加密字段都在
  *   6. 加密路径 content 不传 → 不抛错（占位由 service 强制填 '[加密消息]'）
  *
  * 不接 DB：jest.fn 替身 repository + dataSource.transaction 走回调；
@@ -181,8 +181,8 @@ describe('MessageService.sendMessage（V4.0 §E2E 加密路径）', () => {
     expect(savedMessages).toHaveLength(0);
   });
 
-  // ===== Case 5: 加密 + 阅后即焚组合（master 方案：destroyAt 绝对时间，fbs 九档 expiresIn 未采纳）=====
-  it('加密 + destroyAt=5s 后 阅后即焚 → destroy_at 落库 + 加密字段都在', async () => {
+  // ===== Case 5: 加密 + 点开才焚组合（v2 方案：burn_ttl_seconds 相对秒数，点开才开始计时）=====
+  it('加密 + burn_ttl_seconds=5 点开才焚 → burn_ttl_seconds 落库 + destroy_at 兜底 + 加密字段都在', async () => {
     buildSvc();
     const before = Date.now();
     const res = await svc.sendMessage({
@@ -192,18 +192,20 @@ describe('MessageService.sendMessage（V4.0 §E2E 加密路径）', () => {
       senderEphemeralPubkey: VALID_EPK,
       cipherNonce: VALID_NONCE,
       cipherText: VALID_CIPHER,
-      destroyAt: new Date(before + 5000).toISOString(),
+      burnTtlSeconds: 5,
     });
 
     expect(savedMessages).toHaveLength(1);
     const saved = savedMessages[0];
     expect(saved.is_encrypted).toBe(true);
     expect(saved.cipher_text).toBe(VALID_CIPHER);
-    // destroy_at 应该是 5s 后（±1s 容差）
+    // burn_ttl_seconds 落库
+    expect(saved.burn_ttl_seconds).toBe(5);
+    // destroy_at 语义 = 兜底强制焚毁时间（默认 24h 后，±1min 容差）
     expect(saved.destroy_at).toBeInstanceOf(Date);
     const delta = saved.destroy_at.getTime() - before;
-    expect(delta).toBeGreaterThanOrEqual(4000);
-    expect(delta).toBeLessThanOrEqual(6000);
+    expect(delta).toBeGreaterThanOrEqual(24 * 3600 * 1000 - 60 * 1000);
+    expect(delta).toBeLessThanOrEqual(24 * 3600 * 1000 + 60 * 1000);
   });
 
   // ===== Case 6: 加密路径不传 content =====

@@ -2,13 +2,13 @@
 
 企业内部加密通讯应用后端：阅后即焚 + WebSocket 实时推送 + 端到端加密（E2EE）+ 完整管理后台。
 
-NestJS 10 + TypeORM + MySQL 8，接口文档见 Swagger（`/api-docs`，45 个接口全中文文档）。
+NestJS 10 + TypeORM + MySQL 8，接口文档见 Swagger（`/api-docs`，46 个接口全中文文档）。
 
 ## 功能特性
 
 **核心通讯**
 - 单聊 / 群聊，消息类型：文本、图片、语音、视频、文件
-- 阅后即焚：消息到期自动销毁（`BurnScheduler` 每分钟扫描 + 查询侧兜底过滤）
+- 点开才焚（阅后即焚 v2）：焚毁消息全员先收马赛克占位，调 `POST /messages/:id/reveal` 点开才下发内容，各自独立倒计时焚毁；兜底超时（`BURN_FALLBACK_TTL_HOURS`，默认 24h）强制销毁；`BurnScheduler` 每分钟扫描物理删除（全员看完提前删）
 - 消息编辑、撤回、已读回执
 - WebSocket 实时推送（socket.io v4）：新消息 / 编辑 / 撤回 / 已读回执 / 会话变更 / 设备上下线，详见 [docs/websocket-events.md](docs/websocket-events.md)
 
@@ -46,7 +46,7 @@ NestJS 10 + TypeORM + MySQL 8，接口文档见 Swagger（`/api-docs`，45 个�
 | 认证 | JWT 双密钥 |
 | 日志 | nestjs-pino |
 | 测试 | Jest + supertest；k6 压测 |
-| 文档 | Swagger（优先加载 `openapi.yaml`，45 接口 / 13 分组） |
+| 文档 | Swagger（优先加载 `openapi.yaml`，46 接口 / 13 分组） |
 
 ## 快速开始
 
@@ -73,6 +73,7 @@ npm run start:prod     # 开发热更用 npm run start:dev
 mysql -u root -p burnmsg < docs/migration-20260827.sql
 mysql -u root -p burnmsg < docs/migration-20260827-feedback.sql   # 意见反馈表（v5.3 新增）
 mysql -u root -p burnmsg < docs/migration-20260828-group-role-cleanup.sql   # 存量群管理员降级为成员（v5.5，无 admin 记录则无影响）
+mysql -u root -p burnmsg < docs/migration-20260831-burn-on-read.sql   # 点开才焚（v5.6：burn_ttl_seconds + 回执 revealed_at/burn_at）
 ```
 
 内容为：软删除列、群解散列、消息 4 个加密列、公告 / 公告已读 / 用户公钥三张新表；feedback.sql 再补意见反馈表。**重复执行会报"列已存在"，忽略即可。**
@@ -96,12 +97,13 @@ docker compose up -d --build
 | `ACCESS_TOKEN_TTL` / `REFRESH_TOKEN_TTL` | token 有效期（秒） | `7200` / `2592000` |
 | `CORS_ORIGINS` | 跨域白名单（逗号分隔；空 = 禁止一切浏览器跨域） | - |
 | `UPLOAD_DIR` | 文件上传目录 | `./uploads` |
+| `BURN_FALLBACK_TTL_HOURS` | 点开才焚兜底强制焚毁时间（小时）：超期未被全员点开看完的焚毁消息强制物理删除 | `24` |
 | `SWAGGER_ENABLED` | 是否开放 `/api-docs`，**生产建议 false** | `true` |
 | `INITIAL_ADMIN_PHONE` / `INITIAL_ADMIN_PASSWORD` | 初始管理员（仅无任何 admin 时首次生效；密码留空则随机生成打印日志） | - |
 
 ## 接口概览
 
-完整文档见 Swagger `/api-docs` 或仓库根目录 `openapi.yaml`（45 接口 / 13 分组）。
+完整文档见 Swagger `/api-docs` 或仓库根目录 `openapi.yaml`（46 接口 / 13 分组）。
 
 | 分组 | 代表接口 |
 |------|---------|
@@ -109,7 +111,7 @@ docker compose up -d --build
 | 账号 | 列表（含 `show_deleted`）/ 开通 / 导入 / 停用 / 软删除 |
 | 会话 | 单聊创建 / 我的会话 / 会话详情 |
 | 群组 | 建群 / 成员管理（仅群主；系统管理员可跨群查看与移除成员，群内无管理员角色）/ 群资料 / 群主解散（即焚）/ 管理员解散（留痕，`DELETE /groups/admin/:id`） |
-| 消息 | 发送（支持 E2EE 密文字段）/ 列表 / 编辑 / 撤回 / 已读 / 回执查询 |
+| 消息 | 发送（支持 E2EE 密文字段 / burn_ttl_seconds 点开才焚）/ 列表（按人马赛克视图）/ **点开 reveal** / 编辑 / 撤回 / 已读 / 回执查询 |
 | 密钥 | 上传身份公钥（限 5/min）/ 查询对方公钥（限 60/min，需同会话） |
 | 公告 | 发布 / 列表 / 管理列表 / 未读数 / 已读标记 / 撤回 |
 | 意见反馈 | 提交 / 我的反馈 / 管理列表（按状态筛选）/ 管理员回复 |

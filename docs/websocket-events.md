@@ -77,11 +77,17 @@ token 过期后重连会持续失败，前端应在刷新 token 后先 `disconne
     "is_recalled": false,
     "is_destroyed": false,
     "destroy_at": "2026-08-26T12:00:00.000Z 或 null",
+    "burn_ttl_seconds": "5 或 null",
+    "is_blurred": "true（焚毁消息推送时为马赛克占位，内容字段全 null；普通消息无此字段）",
     "created_at": "2026-08-26T11:00:00.000Z",
     "updated_at": "2026-08-26T11:00:00.000Z"
   }
 }
 ```
+
+> 点开才焚 v2：焚毁消息（`burn_ttl_seconds` 非空）的 `message:new` 推送一律马赛克化——
+> `content / file_url / file_name / file_size / cipher_*` 全部为 null，`is_blurred=true`。
+> 前端渲染占位卡，用户点击后调 `POST /messages/:id/reveal` 才拿到内容并开始倒计时。
 
 ### WsMessageRecalledPayload（message:recalled）
 
@@ -143,7 +149,8 @@ payload 不携带会话实体本身。
 推送失败只记日志，**绝不影响 REST 业务主流程**。
 
 注：阅后即焚的到期销毁（`BurnScheduler` 每分钟整行 DELETE）不产生事件，
-前端靠消息自带的 `destroy_at` 倒计时本地移除，列表接口另有到期过滤兜底。
+前端靠 `reveal` 返回的 `burn_at` / `remain_seconds` 倒计时本地移除，列表接口另有到期过滤兜底。
+另：`receipt:read` 在「点开焚毁消息」时也会广播（点开即已读，发送方实时看到对方已点开）。
 
 ## 前端接入示例（fenxin-app）
 

@@ -49,6 +49,16 @@ export class Message {
   @Column({ type: 'datetime', nullable: true })
   destroy_at: Date | null;
 
+  /**
+   * 点开才焚（阅后即焚 v2）：点开查看后多少秒焚毁（NULL = 非焚毁消息）。
+   * 焚毁消息对所有人（含发送方）都是马赛克占位，调 reveal 接口才下发内容；
+   * 各成员各自点开、各自倒计时（message_receipts.burn_at），互不影响。
+   * destroy_at 在本模式下语义为「兜底强制焚毁时间」（发送时 = created_at + BURN_FALLBACK_TTL_HOURS），
+   * 防止有人一直不点开导致消息永久留存。
+   */
+  @Column({ type: 'int', nullable: true })
+  burn_ttl_seconds: number | null;
+
   // ===== E2E 端到端加密字段（方案 B 简化版，见 docs/E2E_ENCRYPTION.md）=====
   // 三者要么全填（全密文），要么全 null（明文，content 是真明文）。
   // 加密消息的 content 只是占位提示（如 "[加密消息]"），明文在客户端解密 cipher_text 得到。

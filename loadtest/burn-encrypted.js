@@ -1,23 +1,20 @@
 // loadtest/burn-encrypted.js
-// 端到端：E2E 加密消息 + 阅后即焚 → 验证 destroyMessages 链路
+// 端到端：E2E 加密消息 + 点开才焚 v2 → 验证「马赛克 → reveal → 全员到期物理删除」链路
 //
 // 跑法：k6 run -e PHONE_A=13800000000 -e PASSWORD_A='Test@123456' -e PHONE_B=13800000001 -e PASSWORD_B='Test@123456' loadtest/burn-encrypted.js
 // 流程（每个 VU）：
-//   1. 发密文 + expiresIn='5s'（加密 + 阅后即焚组合）
-//   2. sleep 70s（5s destroy_at + 60s burn scheduler tick 间隔 + 5s 兜底）
-//   3. GET /messages/:convId 拉历史，验证：
-//        - 该消息存在（没被硬删，destroyMessages 只置 is_destroyed=true）
-//        - is_encrypted=true（保留标记，前端用这个判断"这条是密文但已销毁"）
-//        - is_destroyed=true
-//        - cipher_text === null（V4.0 §E2E 阅后即焚后密文 + ephemeral key 必须清掉）
-//        - cipher_nonce === null
-//        - sender_ephemeral_pubkey === null
+//   1. 发密文 + burn_ttl_seconds=5（加密 + 点开才焚组合）
+//   2. GET 列表验证马赛克：is_blurred=true 且 cipher_text 等内容字段全 null（未点开前服务端不下发内容）
+//   3. B（接收方）+ A（发送方）都调 POST /messages/:id/reveal —— 全员点开才满足「全员看完」物理删除条件
+//      验证 reveal 响应：is_blurred=false、密文字段齐全、remain_seconds≈5
+//   4. sleep 70s（5s burn_at 倒计时 + 60s BurnScheduler tick + 5s 余量）
+//   5. GET 列表验证：该消息已不存在（全员倒计时到期 → 整行物理删除，不回收到列表）
 //
 // 观察指标：
 //   - checks pass rate 期望 100%
-//   - http_req_failed rate 期望 < 0.05（中间 sleep 70s 期间没流量）
+//   - http_req_failed rate 期望 < 0.1（中间 sleep 70s 期间没流量）
 //
-// 跑完一次大概 80s/iter，10 VU parallel 会 80s 跑完；VU 数小一些（5 个）避免 device/会话过多。
+// 跑完一次大概 80s/iter，3 VU × 1 iter 约 80s 跑完。
 
 import http from 'k6/http';
 import { check, sleep } from 'k6';
@@ -25,8 +22,6 @@ import { check, sleep } from 'k6';
 export const options = {
   scenarios: {
     burn_encrypted: {
-      // per-vu-iterations：每个 VU 跑 1 次，3 VU 并行共 3 次 total（跟 "3 VU × 1 iter" 1:1 匹配）
-      // shared-iterations 要求 iterations >= vus，3 VU × 1 iter 会报 configuration error
       executor: 'per-vu-iterations',
       vus: 3,
       iterations: 1,
@@ -59,7 +54,6 @@ function login(phone, password) {
     }),
     { headers: { 'Content-Type': 'application/json' } },
   );
-  // login 接口返回 201 Created（不是 200），都接受
   if (res.status !== 200 && res.status !== 201) {
     throw new Error(`login ${phone} failed: ${res.status} ${res.body}`);
   }
@@ -96,11 +90,22 @@ export function setup() {
   }
   const convBody = JSON.parse(convRes.body);
   const conversationId = convBody.data?.id || convBody.id;
-  return { aToken: a.token, conversationId };
+  return { aToken: a.token, bToken: b.token, conversationId };
+}
+
+function findMessage(listRes, messageId) {
+  try {
+    const body = JSON.parse(listRes.body);
+    const list = body.data || body;
+    if (!Array.isArray(list)) return undefined;
+    return list.find((m) => m.id === messageId);
+  } catch {
+    return undefined;
+  }
 }
 
 export default function (data) {
-  // 1. 发密文 + expiresIn='5s'
+  // 1. 发密文 + burn_ttl_seconds=5
   const epk = 'EPK_' + Math.random().toString(36).slice(2).padEnd(39, 'x').slice(0, 39) + '=';
   const nonceRaw = Date.now().toString().padStart(12, '0').slice(-12);
   const nonce = Buffer.from(nonceRaw).toString('base64').slice(0, 16).padEnd(16, 'A');
@@ -115,7 +120,7 @@ export default function (data) {
       sender_ephemeral_pubkey: epk,
       cipher_nonce: nonce,
       cipher_text: cipher,
-      expires_in: '5s',
+      burn_ttl_seconds: 5,
     }),
     {
       headers: {
@@ -138,39 +143,61 @@ export default function (data) {
     return;
   }
 
-  // 2. sleep 70s：5s destroy_at + 60s BurnScheduler tick + 5s 兜底
+  // 2. 未点开前拉列表：必须是马赛克（is_blurred=true，内容字段全 null）
+  const beforeList = http.get(`${BASE}/api/v1/messages/${data.conversationId}?limit=50`, {
+    headers: { Authorization: `Bearer ${data.bToken}` },
+  });
+  check(beforeList, {
+    'blurred before reveal': (r) => {
+      const target = findMessage(r, messageId);
+      if (!target) return false;
+      return (
+        target.is_blurred === true &&
+        target.cipher_text === null &&
+        target.cipher_nonce === null &&
+        target.sender_ephemeral_pubkey === null
+      );
+    },
+  });
+
+  // 3. 双方 reveal（全员点开 → 才能触发「全员看完」物理删除）
+  for (const [who, token] of [['B', data.bToken], ['A', data.aToken]]) {
+    const revealRes = http.post(
+      `${BASE}/api/v1/messages/${messageId}/reveal`,
+      null,
+      { headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` } },
+    );
+    check(revealRes, {
+      [`reveal ${who} 200`]: (r) => r.status === 200 || r.status === 201,
+      [`reveal ${who} full content`]: (r) => {
+        try {
+          const body = JSON.parse(r.body);
+          const d = body.data || body;
+          return (
+            d.is_blurred === false &&
+            d.cipher_text !== null &&
+            d.cipher_nonce !== null &&
+            d.sender_ephemeral_pubkey !== null &&
+            typeof d.remain_seconds === 'number' &&
+            d.remain_seconds >= 1 &&
+            d.remain_seconds <= 5
+          );
+        } catch {
+          return false;
+        }
+      },
+    });
+  }
+
+  // 4. sleep 70s：5s burn_at 倒计时 + 60s BurnScheduler tick + 5s 余量
   sleep(70);
 
-  // 3. GET /messages/:convId 拉历史（带 include_destroyed=true 才能查到已销毁消息，验 cipher 清空）
-  const listRes = http.get(
-    `${BASE}/api/v1/messages/${data.conversationId}?limit=50&include_destroyed=true`,
-    { headers: { Authorization: `Bearer ${data.aToken}` } },
-  );
-
-  check(listRes, {
+  // 5. 拉列表验证：消息已物理删除（整行 DELETE，列表里找不到）
+  const afterList = http.get(`${BASE}/api/v1/messages/${data.conversationId}?limit=50`, {
+    headers: { Authorization: `Bearer ${data.aToken}` },
+  });
+  check(afterList, {
     'GET history 200': (r) => r.status === 200,
-    'target message found': (r) => {
-      try {
-        const body = JSON.parse(r.body);
-        const list = body.data || body;
-        if (!Array.isArray(list)) return false;
-        const target = list.find((m) => m.id === messageId);
-        if (!target) return false;
-        // 销毁后字段验证
-        const ok =
-          target.is_encrypted === true &&
-          target.is_destroyed === true &&
-          target.cipher_text === null &&
-          target.cipher_nonce === null &&
-          target.sender_ephemeral_pubkey === null;
-        if (!ok) {
-          console.error(`message state wrong: ${JSON.stringify(target)}`);
-        }
-        return ok;
-      } catch (e) {
-        console.error(`parse error: ${e}`);
-        return false;
-      }
-    },
+    'message physically deleted': (r) => findMessage(r, messageId) === undefined,
   });
 }

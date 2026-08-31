@@ -24,7 +24,7 @@ export class MessageController {
       fileName: dto.file_name,
       fileSize: dto.file_size,
       replyToId: dto.reply_to_id,
-      destroyAt: dto.destroy_at,
+      burnTtlSeconds: dto.burn_ttl_seconds,
       senderEphemeralPubkey: dto.sender_ephemeral_pubkey,
       cipherNonce: dto.cipher_nonce,
       cipherText: dto.cipher_text,
@@ -74,6 +74,13 @@ export class MessageController {
   async recall(@CurrentUser() user: AuthPayload, @Param('id') id: string) {
     await this.messageService.recallMessage(id, user.userId);
     return null;
+  }
+
+  /** 点开查看焚毁消息：返回完整内容并从点开时刻起开始该用户的焚毁倒计时 */
+  @Post(':id/reveal')
+  @ResponseMessage('已点开')
+  reveal(@CurrentUser() user: AuthPayload, @Param('id') id: string) {
+    return this.messageService.revealMessage(id, user.userId);
   }
 
   /** :id 为会话 ID（与旧版 API 保持一致） */

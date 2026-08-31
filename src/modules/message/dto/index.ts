@@ -1,4 +1,4 @@
-import { IsString, IsUUID, IsIn, IsOptional, IsNumber, IsDateString, MaxLength, Length, Matches } from 'class-validator';
+import { IsString, IsUUID, IsIn, IsOptional, IsNumber, MaxLength, Length, Matches } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
 /** X25519 公钥 base64：32 字节 → 44 字符（含结尾 =） */
@@ -42,10 +42,10 @@ export class SendMessageDto {
   @IsUUID()
   reply_to_id?: string;
 
-  @ApiPropertyOptional({ description: '阅后即焚销毁时间（ISO8601），到期后服务端自动销毁' })
+  @ApiPropertyOptional({ description: '点开才焚：点开查看后多少秒焚毁（如 5）。不传 = 普通消息。焚毁消息对全员（含发送方）先显示马赛克占位，调 POST /messages/:id/reveal 才下发内容并开始各自倒计时' })
   @IsOptional()
-  @IsDateString()
-  destroy_at?: string;
+  @IsNumber()
+  burn_ttl_seconds?: number;
 
   @ApiPropertyOptional({ description: 'E2E 加密：发送方临时 X25519 公钥（base64，44 字符）。三个加密字段必须同时提供' })
   @IsOptional()

@@ -18,7 +18,7 @@ V4.0 §M7 性能与质量 — 验证鉴权缓存、限流、登录路径性能�
 | `login-burst.js` | 压 `/api/v1/auth/login` | 限流（5/min/IP）边界 + argon2 verify + 2 次 SQL 写路径 |
 | `api-mix.js` | 压鉴权缓存命中后的业务读 | p(95) < 200ms（cache 命中 0 SQL） |
 | `e2e-send.js` | 压 E2E 加密消息发送 | p(95) < 400ms（密文 3 字段 + 强校验 + 阅后即焚） |
-| `burn-encrypted.js` | 端到端：E2E 加密 + 阅后即焚 → 验证 destroyMessages 链路 | checks pass rate 100%（密文字段销毁后必须全清） |
+| `burn-encrypted.js` | 端到端：E2E 加密 + 点开才焚 v2（马赛克 → reveal → 全员到期物理删除） | checks pass rate 100%（未点开必须马赛克、reveal 必须全内容、到期必须整行消失） |
 
 ## 跑法
 
@@ -89,7 +89,7 @@ k6 run \
 
 注意：k6 不做真 X25519 加解密（需要客户端 Web Crypto API），本脚本只压服务端"接收密文 + 落库 + 强校验"通道，密码学正确性靠客户端实现 + E2E 集成测试。
 
-### 4. 端到端：E2E 加密 + 阅后即焚（验证 §E2E 销毁完整性）
+### 4. 端到端：E2E 加密 + 点开才焚（验证销毁完整性）
 
 ```bash
 # 前置：服务跑着 + 2 个测试账号已就绪（同 §E2E 加密压测）
@@ -105,10 +105,10 @@ k6 run \
 观察：
 - `checks` pass rate 期望 100%
 - `http_req_failed` rate 期望 < 0.1
-- 每个 VU 完整跑 ~80s（5s destroy_at + 60s burn scheduler tick + 5s 兜底 + setup IO）
-- 销毁后消息字段必须：`is_encrypted=true`、`is_destroyed=true`、`cipher_text=null`、`cipher_nonce=null`、`sender_ephemeral_pubkey=null`（V4.0 §E2E 阅后即焚"焚"指消息整体，密文也算）
+- 每个 VU 完整跑 ~80s（5s burn_at 倒计时 + 60s burn scheduler tick + 5s 余量 + setup IO）
+- 验证链路：发送（burn_ttl_seconds=5）→ 列表必须马赛克（is_blurred=true，密文不下发）→ 双方 reveal 拿到全内容 → 倒计时到期 + 调度器扫描后，消息整行物理删除（列表里找不到）
 
-意义：除了 e2e-send 验证"加密落库"，本脚本验证"销毁链路不残留密文" — 这是服务端零持有密文的关键证明。
+意义：除了 e2e-send 验证"加密落库"，本脚本验证"未点开不下发内容 + 点开才计时 + 到期后服务端零残留"——这是点开才焚 v2 的核心承诺。
 
 ## 限流边界速查
 

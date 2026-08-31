@@ -4,7 +4,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { DataSource } from 'typeorm';
+import { DataSource, In } from 'typeorm';
 import { Message } from '../../entities/message.entity';
 import { MessageReceipt } from '../../entities/message-receipt.entity';
 import { Conversation } from '../../entities/conversation.entity';
@@ -12,6 +12,12 @@ import { ConversationMember } from '../../entities/conversation-member.entity';
 import { AppUser } from '../../entities/app-user.entity';
 import { EventsGateway } from '../events/events.gateway';
 import { WS_EVENTS } from '../events/events.types';
+
+/** 兜底强制焚毁时长（毫秒）：env BURN_FALLBACK_TTL_HOURS，默认 24 小时 */
+function burnFallbackTtlMs(): number {
+  const hours = parseInt(process.env.BURN_FALLBACK_TTL_HOURS || '24', 10);
+  return (Number.isFinite(hours) && hours > 0 ? hours : 24) * 3600 * 1000;
+}
 
 @Injectable()
 export class MessageService {
@@ -46,7 +52,7 @@ export class MessageService {
     fileName?: string;
     fileSize?: number;
     replyToId?: string;
-    destroyAt?: string;
+    burnTtlSeconds?: number;
     senderEphemeralPubkey?: string;
     cipherNonce?: string;
     cipherText?: string;
@@ -90,7 +96,10 @@ export class MessageService {
         file_name: params.fileName ?? null,
         file_size: params.fileSize ?? null,
         reply_to_id: params.replyToId ?? null,
-        destroy_at: params.destroyAt ? new Date(params.destroyAt) : null,
+        // 点开才焚 v2：burn_ttl_seconds 非空 = 焚毁消息；
+        // destroy_at 语义为兜底强制焚毁时间（env BURN_FALLBACK_TTL_HOURS，默认 24h），防止有人一直不点开导致消息永久留存
+        burn_ttl_seconds: params.burnTtlSeconds ?? null,
+        destroy_at: params.burnTtlSeconds ? new Date(Date.now() + burnFallbackTtlMs()) : null,
         // E2E 加密字段（明文消息全为 null / false）
         is_encrypted: isEncrypted,
         cipher_nonce: isEncrypted ? params.cipherNonce! : null,
@@ -102,25 +111,27 @@ export class MessageService {
     await convRepo.update(params.conversationId, { last_message_at: new Date() });
 
     const members = await memberRepo.find({ where: { conversation_id: params.conversationId } });
-    const otherMembers = members.filter((m) => m.user_id !== params.senderId);
-    if (otherMembers.length > 0) {
-      await receiptRepo.save(
-        otherMembers.map((m) =>
-          receiptRepo.create({
-            message_id: savedMsg.id,
-            user_id: m.user_id,
-            is_delivered: false,
-            is_read: false,
-          }),
-        ),
-      );
-    }
+    // 点开才焚 v2：全体成员（含发送方）都建回执——发送方这份也要走 reveal 才计时。
+    // 发送方天然已读自己发的消息；receipt 同时承载每人各自的 revealed_at / burn_at。
+    const now = new Date();
+    await receiptRepo.save(
+      members.map((m) =>
+        receiptRepo.create({
+          message_id: savedMsg.id,
+          user_id: m.user_id,
+          is_delivered: false,
+          is_read: m.user_id === params.senderId,
+          read_at: m.user_id === params.senderId ? now : null,
+        }),
+      ),
+    );
 
     // 实时推送：新消息 + 会话列表刷新信号（推给全体成员，含发送者的其他在线设备）
+    // 焚毁消息必须马赛克化推送，否则前端从 WS 推送体里直接拿到内容，马赛克形同虚设
     const memberIds = members.map((m) => m.user_id);
     this.events.emitToUsers(WS_EVENTS.MESSAGE_NEW, memberIds, {
       conversation_id: params.conversationId,
-      message: savedMsg,
+      message: savedMsg.burn_ttl_seconds ? this.maskBurnMessage(savedMsg) : savedMsg,
     });
     this.events.emitToUsers(WS_EVENTS.CONVERSATION_UPDATED, memberIds, {
       conversation_id: params.conversationId,
@@ -130,12 +141,69 @@ export class MessageService {
     return savedMsg;
   }
 
+  /** 焚毁消息马赛克化：未点开前不下发任何内容字段（含密文与附件地址） */
+  private maskBurnMessage(msg: Message): Message & { is_blurred: boolean } {
+    return {
+      ...msg,
+      content: null,
+      file_url: null,
+      file_name: null,
+      file_size: null,
+      cipher_nonce: null,
+      cipher_text: null,
+      sender_ephemeral_pubkey: null,
+      is_blurred: true,
+    };
+  }
+
+  /**
+   * 点开才焚视图：按当前用户的 receipt 状态决定每条焚毁消息返回什么。
+   * - 未点开：马赛克占位（is_blurred=true），不下发内容
+   * - 已点开未到期：完整内容 + burn_at + remain_seconds（前端据此跑本地倒计时）
+   * - 已到期：整条不返回（对该用户而言已焚毁）
+   * 非焚毁消息原样返回。
+   */
+  private async applyBurnView(messages: Message[], userId: string) {
+    const burnIds = messages.filter((m) => m.burn_ttl_seconds !== null).map((m) => m.id);
+    if (burnIds.length === 0) return messages;
+
+    const receipts = await this.dataSource.getRepository(MessageReceipt).find({
+      where: { message_id: In(burnIds), user_id: userId },
+    });
+    const receiptMap = new Map(receipts.map((r) => [r.message_id, r]));
+
+    const now = Date.now();
+    const result: unknown[] = [];
+    for (const m of messages) {
+      if (m.burn_ttl_seconds === null) {
+        result.push(m);
+        continue;
+      }
+      const r = receiptMap.get(m.id);
+      // 已点开且倒计时到期 → 对该用户已焚毁，不返回
+      if (r?.burn_at && new Date(r.burn_at).getTime() <= now) continue;
+      // 未点开（含老数据无 receipt 的防御场景）→ 马赛克占位
+      if (!r?.revealed_at) {
+        result.push(this.maskBurnMessage(m));
+        continue;
+      }
+      // 已点开未到期 → 完整内容 + 剩余秒数（burn_at 必非空：到期分支已 continue）
+      result.push({
+        ...m,
+        is_blurred: false,
+        burn_at: r.burn_at,
+        remain_seconds: Math.max(0, Math.ceil((new Date(r.burn_at!).getTime() - now) / 1000)),
+      });
+    }
+    return result;
+  }
+
   async listMessages(params: {
     conversationId: string;
     userId: string;
     before?: string;
     limit?: number;
-  }): Promise<Message[]> {
+  }): Promise<unknown[]> {
     await this.assertMember(params.conversationId, params.userId);
 
     const limit = params.limit || 50;
@@ -154,7 +222,81 @@ export class MessageService {
     }
 
     const messages = await qb.getMany();
-    return messages.reverse();
+    // 点开才焚：按当前用户 receipt 状态过滤/马赛克化
+    return this.applyBurnView(messages.reverse(), params.userId);
+  }
+
+  /**
+   * 点开查看焚毁消息：返回完整内容，并从点开时刻起为该用户开始倒计时焚毁。
+   * 重复点开不重置计时；自己那份倒计时到期 / 兜底到期后一律按「已焚毁」404 处理。
+   */
+  async revealMessage(messageId: string, userId: string) {
+    const msgRepo = this.dataSource.getRepository(Message);
+    const receiptRepo = this.dataSource.getRepository(MessageReceipt);
+
+    const msg = await msgRepo.findOne({ where: { id: messageId } });
+    if (!msg || msg.is_destroyed) throw new NotFoundException('消息不存在');
+    await this.assertMember(msg.conversation_id, userId);
+    if (!msg.burn_ttl_seconds) throw new BadRequestException('该消息不是焚毁消息，无需点开');
+    if (msg.is_recalled) throw new BadRequestException('消息已撤回');
+
+    const now = new Date();
+    // 兜底到期（一直没点开，超过 BURN_FALLBACK_TTL_HOURS）
+    if (msg.destroy_at && new Date(msg.destroy_at).getTime() <= now.getTime()) {
+      throw new NotFoundException('消息已焚毁');
+    }
+
+    let receipt = await receiptRepo.findOne({
+      where: { message_id: messageId, user_id: userId },
+    });
+    if (!receipt) {
+      // 防御：老数据可能没给该成员建 receipt
+      receipt = await receiptRepo.save(
+        receiptRepo.create({
+          message_id: messageId,
+          user_id: userId,
+          is_delivered: true,
+          is_read: false,
+        }),
+      );
+    }
+
+    // 自己这份倒计时已到期
+    if (receipt.burn_at && new Date(receipt.burn_at).getTime() <= now.getTime()) {
+      throw new NotFoundException('消息已焚毁');
+    }
+
+    if (!receipt.revealed_at) {
+      // 首次点开：开始该用户的焚毁倒计时，点开即已读
+      const burnAt = new Date(now.getTime() + msg.burn_ttl_seconds * 1000);
+      await receiptRepo.update(receipt.id, {
+        revealed_at: now,
+        burn_at: burnAt,
+        is_read: true,
+        read_at: now,
+      });
+      receipt.revealed_at = now;
+      receipt.burn_at = burnAt;
+
+      // 广播已读回执：发送方实时看到「对方已点开」
+      const memberIds = await this.getMemberUserIds(msg.conversation_id);
+      this.events.emitToUsers(WS_EVENTS.RECEIPT_READ, memberIds, {
+        conversation_id: msg.conversation_id,
+        user_id: userId,
+        last_read_message_id: messageId,
+        read_at: now.toISOString(),
+      });
+    }
+
+    return {
+      ...msg,
+      is_blurred: false,
+      burn_at: receipt.burn_at,
+      remain_seconds: Math.max(
+        0,
+        Math.ceil((new Date(receipt.burn_at!).getTime() - now.getTime()) / 1000),
+      ),
+    };
   }
 
   async editMessage(messageId: string, userId: string, newContent: string): Promise<Message> {
@@ -163,6 +305,8 @@ export class MessageService {
     if (!message) throw new NotFoundException('消息不存在');
     if (message.sender_id !== userId) throw new ForbiddenException('You can only edit your own messages');
     if (message.is_recalled) throw new BadRequestException('Cannot edit a recalled message');
+    // 焚毁消息禁止编辑：内容只在点开时下发，编辑会破坏「点开才焚」计时语义
+    if (message.burn_ttl_seconds) throw new BadRequestException('焚毁消息不支持编辑');
 
     const hoursSinceCreated = (Date.now() - new Date(message.created_at).getTime()) / (1000 * 60 * 60);
     if (hoursSinceCreated > 48) throw new BadRequestException('Cannot edit messages older than 48 hours');
@@ -317,6 +461,8 @@ export class MessageService {
       .andWhere('(m.destroy_at IS NULL OR m.destroy_at > :now)', { now: new Date() })
       // E2EE：加密消息后端无法解密，仅搜明文
       .andWhere('m.is_encrypted = :isEncrypted', { isEncrypted: false })
+      // 点开才焚：焚毁消息未点开前内容是受保护的，不参与搜索（防止搜索泄露马赛克内容）
+      .andWhere('m.burn_ttl_seconds IS NULL')
       .andWhere('m.content LIKE :kw', { kw: `%${keyword}%` })
       .orderBy('m.created_at', 'DESC')
       .take(limit);
