@@ -34,16 +34,20 @@ export class BurnScheduler {
       .take(500)
       .getMany();
 
-    // B. 全员看完且各自倒计时都到期：至少有一条回执，且不存在「未点开 / 倒计时未结束」的回执
+        // B. 接收方全部看完且各自倒计时都到期 → 提前物理删。
+    // 发送方不参与判定（r.user_id != m.sender_id）：发送方没点开不阻塞销毁，
+    // 只是他自己从此失去回看机会；私聊即「对方点开看完就删」。
     const allBurned = await msgRepo
       .createQueryBuilder('m')
       .select(['m.id', 'm.file_url'])
       .where('m.is_destroyed = :isDestroyed', { isDestroyed: false })
       .andWhere('m.burn_ttl_seconds IS NOT NULL')
       .andWhere('(m.destroy_at IS NULL OR m.destroy_at > :now)', { now })
-      .andWhere('EXISTS (SELECT 1 FROM message_receipts r WHERE r.message_id = m.id)')
       .andWhere(
-        'NOT EXISTS (SELECT 1 FROM message_receipts r WHERE r.message_id = m.id AND (r.burn_at IS NULL OR r.burn_at > :now))',
+        'EXISTS (SELECT 1 FROM message_receipts r WHERE r.message_id = m.id AND r.user_id != m.sender_id)',
+      )
+      .andWhere(
+        'NOT EXISTS (SELECT 1 FROM message_receipts r WHERE r.message_id = m.id AND r.user_id != m.sender_id AND (r.burn_at IS NULL OR r.burn_at > :now))',
         { now },
       )
       .take(500)
