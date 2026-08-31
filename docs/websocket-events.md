@@ -53,6 +53,10 @@ token 过期后重连会持续失败，前端应在刷新 token 后先 `disconne
 | `message:recalled` | `MessageService.recallMessage()` 撤回成功后 | `WsMessageRecalledPayload` |
 | `receipt:read` | `MessageService.markAsRead()` 确实把未读翻成已读时 | `WsReceiptReadPayload` |
 | `conversation:updated` | 会话创建 / 新消息更新 `last_message_at` / 群成员变动 / 群资料变更 | `WsConversationUpdatedPayload` |
+| `key:changed` | `KeysService.uploadIdentityKey()` 轮换 identity 公钥时（覆盖更新，首次上传不推） | `WsKeyChangedPayload` |
+
+> 注：`key:changed` 是唯一不带 `conversation_id` 的事件 —— 它与单个会话无关，
+> 推送目标为**轮换者的全部共同会话用户**（谁可能缓存了旧公钥就推给谁），而非某个会话的成员。
 
 ## payload 结构
 
@@ -132,6 +136,24 @@ token 过期后重连会持续失败，前端应在刷新 token 后先 `disconne
 这是一个「信号」事件：前端收到后重新拉取会话列表（`GET /api/v1/conversations`）即可，
 payload 不携带会话实体本身。
 
+### WsKeyChangedPayload（key:changed）
+
+```jsonc
+{
+  "user_id": "uuid",        // 轮换了 identity 公钥的用户
+  "updated_at": "2026-08-31T15:00:00.000Z"
+}
+```
+
+TOFU（Trust On First Use）支撑事件：payload **故意不带公钥本体**。
+前端收到后自行 `GET /keys/:userId` 拉取新公钥，与本地钉住的缓存比对：
+
+- 一致 → 幂等（服务端重复通知），无感；
+- 不一致 → 弹「对方安全密钥已变更」告警（可能是对方换手机/重装，也可能是公钥被替换），
+  用户确认后才更新本地缓存并继续加密发送。
+
+触发时机：`POST /keys` 覆盖更新公钥时（首次上传不推——没有人缓存过旧公钥，无比对意义）。
+
 ## 服务端注入点一览
 
 | 文件 | 位置 | 事件 |
@@ -144,6 +166,7 @@ payload 不携带会话实体本身。
 | `src/modules/group/group.service.ts` | `createGroup` | `conversation:updated(reason=created)` |
 | `src/modules/group/group.service.ts` | `addMembers` / `removeMember` | `conversation:updated(reason=members)` |
 | `src/modules/group/group.service.ts` | `updateGroupInfo` | `conversation:updated(reason=info)` |
+| `src/modules/keys/keys.service.ts` | `uploadIdentityKey`（覆盖更新分支） | `key:changed`（推给轮换者的全部共同会话用户） |
 
 推送统一走 `EventsGateway.emitToUsers(event, userIds, payload)`，内部 try/catch：
 推送失败只记日志，**绝不影响 REST 业务主流程**。

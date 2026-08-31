@@ -2817,7 +2817,8 @@ paths:
         【业务规则与注意事项】
         - 一用户一公钥：重复上传相同公钥幂等返回 updated=false；上传不同公钥则覆盖更新（旧公钥协商的会话需重新协商）。
         - 限流：每用户每分钟 5 次，超限返回 429。
-        - 公钥替换风险：当前版本服务端不做公钥防替换校验，威胁模型与协议细节见 docs/E2E_ENCRYPTION.md。
+        - 覆盖更新（轮换）成功时，服务端向该用户全部共同会话用户广播 WS 事件 key:changed（payload 仅含 user_id + updated_at，不带公钥本体）；客户端应重新拉取公钥与本地缓存比对（TOFU），不一致时告警。首次上传不广播。
+        - 公钥防替换：客户端应实现 TOFU（首次使用即信任 + 变更告警），详见 docs/E2E_ENCRYPTION.md §4；服务端不做公钥签名（留待 X3DH 升级）。
         - 上传/更换公钥后，该用户全部设备会收到 WS 事件 device:added，客户端可按 device_id 忽略本机。
       requestBody:
         required: true
@@ -2917,6 +2918,70 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '429':
           description: 触发限流（每用户每分钟 60 次）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /keys/query:
+    post:
+      tags: [密钥]
+      summary: 批量查询 E2E 公钥（TOFU 比对）
+      description: |-
+        【用途】TOFU（首次使用即信任）批量比对：App 启动 / 进入会话时，一次拉取一组联系人的公钥 + 更新时间，
+        与本地钉住的公钥缓存比对——省去逐个 GET /keys/{userId}。公钥轮换时另有 WS 事件 key:changed 实时通知。
+
+        【调用时机】① App 启动初始化公钥通讯录；② 打开会话/进群时批量拉取成员公钥；③ 收到 key:changed 后兜底批量刷新。
+
+        【业务规则与注意事项】
+        - 权限与单个查询一致：只返回「自己 + 与自己至少一个共同会话的成员」的公钥；user_ids 里其他用户直接不出现在结果里（不报错）。
+        - 未上传公钥的用户同样不出现在结果里 —— 前端按「请求 N 个、返回 M 个」自行 diff 出缺失项。
+        - 单次上限 500 个 user_id；限流每用户每分钟 30 次，超限 429。
+        - 返回体不含手机号等 PII，纯 E2E 元数据通道。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_ids]
+              properties:
+                user_ids:
+                  type: array
+                  maxItems: 500
+                  items: { type: string, format: uuid }
+                  description: 要查询的用户 ID 列表（最多 500 个；可包含自己）
+                  example: ['7c9e6679-7425-40de-944b-e07fc1f90ae7', '3f9a2b8e-1111-4222-8333-444455556666']
+      responses:
+        '200':
+          description: 成功（message 为「公钥批量查询成功」）；data 为数组，仅含有权限且已上传公钥的用户
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: 公钥批量查询成功 }
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        user_id: { type: string, format: uuid }
+                        identity_pubkey: { type: string, description: X25519 公钥 base64 }
+                        created_at: { type: string, format: date-time }
+                        updated_at: { type: string, format: date-time, description: 公钥最后更新时间（TOFU 变更侦测依据） }
+        '400':
+          description: user_ids 为空 / 非法 UUID / 超过 500 个
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: 未携带或无效/过期 token；账号已停用或设备已下线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: 触发限流（每用户每分钟 30 次）
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
