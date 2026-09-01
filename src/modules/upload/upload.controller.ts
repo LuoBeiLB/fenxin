@@ -9,7 +9,8 @@ import { FileInterceptor } from '@nestjs/platform-express';
 import { Throttle } from '@nestjs/throttler';
 import { ApiBearerAuth, ApiConsumes, ApiTags } from '@nestjs/swagger';
 import { diskStorage } from 'multer';
-import { extname } from 'path';
+import { extname, resolve } from 'path';
+import * as fs from 'fs';
 import { randomUUID } from 'crypto';
 
 /**
@@ -29,8 +30,12 @@ export class UploadController {
   @UseInterceptors(
     FileInterceptor('file', {
       storage: diskStorage({
-        destination: (_req, _file, cb) =>
-          cb(null, require('path').resolve(process.cwd(), process.env.UPLOAD_DIR || './uploads')),
+        // multer 的 diskStorage 不会自动建目录：uploads/ 不存在时（新服务器首传）会 ENOENT，先建目录
+        destination: (_req, _file, cb) => {
+          const dir = resolve(process.cwd(), process.env.UPLOAD_DIR || './uploads');
+          fs.mkdirSync(dir, { recursive: true });
+          cb(null, dir);
+        },
         filename: (_req, file, cb) => cb(null, `${randomUUID()}${extname(file.originalname)}`),
       }),
       limits: { fileSize: 50 * 1024 * 1024 },
