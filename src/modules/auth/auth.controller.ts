@@ -26,7 +26,7 @@ export class AuthController {
     return this.authService.login(
       dto.phone,
       dto.password,
-      { deviceName: dto.device_name, deviceType: dto.device_type },
+      { deviceName: dto.device_name, deviceType: dto.device_type, deviceId: dto.device_id },
       { ip: req.ip, userAgent: req.headers['user-agent'] },
     );
   }

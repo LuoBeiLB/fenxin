@@ -18,6 +18,16 @@ export class LoginDto {
   @ApiProperty({ example: 'mobile', enum: ['mobile', 'desktop', 'tablet', 'web'] })
   @IsIn(['mobile', 'desktop', 'tablet', 'web'])
   device_type: string;
+
+  @ApiPropertyOptional({
+    example: '550e8400-e29b-41d4-a716-446655440000',
+    description:
+      '客户端生成并持久化的设备唯一标识（localStorage）。重复登录传相同值则复用已有设备记录，不产生重复设备条目；不传则由服务端随机生成（兼容旧客户端）',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(100)
+  device_id?: string;
 }
 
 export class ChangePasswordDto {
