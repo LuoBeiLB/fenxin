@@ -14,7 +14,7 @@ NestJS 10 + TypeORM + MySQL 8，接口文档见 Swagger（`/api-docs`，47 个�
 
 **安全**
 - 端到端加密（E2EE，单聊）：X25519 密钥协商 + HKDF-SHA256 + AES-256-GCM，服务器只存公钥和密文，协议见 [docs/E2E_ENCRYPTION.md](docs/E2E_ENCRYPTION.md)
-- TOFU 公钥钉住（服务端支撑）：批量查询公钥 `POST /keys/query` + 公钥轮换实时广播 WS `key:changed`，客户端本地比对缓存、不一致即告警，防服务端偷换公钥
+- TOFU 公钥防替换（v5.7）：批量查询公钥 `POST /keys/query` + 公钥轮换实时广播 WS `key:changed`，客户端本地钉住比对、不一致即告警，防服务端偷换公钥；前端对接指南见 [docs/TOFU_FRONTEND.md](docs/TOFU_FRONTEND.md)
 - JWT 双密钥认证：access token（2h）+ refresh token（30d，独立密钥）
 - Argon2id 密码哈希；登录限流 5 次/分钟/IP；全局 300 次/分钟
 - JWT 守卫每请求校验账号状态与设备存在性：停用账号 / 下线设备立即吊销

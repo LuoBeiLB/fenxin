@@ -6,6 +6,7 @@ import {
   UseInterceptors,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
+import { Throttle } from '@nestjs/throttler';
 import { ApiBearerAuth, ApiConsumes, ApiTags } from '@nestjs/swagger';
 import { diskStorage } from 'multer';
 import { extname } from 'path';
@@ -21,6 +22,9 @@ import { randomUUID } from 'crypto';
 @Controller('upload')
 export class UploadController {
   @Post()
+  // 上传限流：同一 IP 每分钟最多 10 个文件（50MB 上限 → 磁盘写入 500MB/分封顶），
+  // 正常用户无感，防公网滥用（V5.8 补充，此前该接口仅靠全局限流兜底）
+  @Throttle({ default: { limit: 10, ttl: 60000 } })
   @ApiConsumes('multipart/form-data')
   @UseInterceptors(
     FileInterceptor('file', {

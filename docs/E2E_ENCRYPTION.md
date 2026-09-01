@@ -263,18 +263,40 @@ socket.on('message_created', async ({ message }) => {
     { name: 'X25519' } as any, false, ['deriveBits'],
   );
 
-  // 同样的双路 ECDH
+  // 双路 ECDH（与 §3.2 发送侧对称）：
+  // shared1 = 我的 identity 私钥 × 发送方【临时】公钥（消息里带的）
   const shared1 = await crypto.subtle.deriveBits(
     { name: 'X25519', public: senderEpkPub } as any, myPriv, 256);
+
+  // shared2 = 我的 identity 私钥 × 发送方【identity】公钥 —— 必须额外拉一次发送方的公钥！
+  // TOFU 对接后应替换为 verifyPeerKey(message.sender_id)（见 docs/TOFU_FRONTEND.md §4.2），裸 fetch 仅作协议演示
+  const senderRes = await fetch(`/api/v1/keys/${message.sender_id}`, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  const { data: { identity_pubkey: senderIdPubB64 } } = await senderRes.json();
+  const senderIdPub = await crypto.subtle.importKey(
+    'raw',
+    Uint8Array.from(atob(senderIdPubB64), c => c.charCodeAt(0)),
+    { name: 'X25519' } as any, false, [],
+  );
   const shared2 = await crypto.subtle.deriveBits(
-    { name: 'X25519', public: senderEpkPub } as any, myPriv, 256);  // 注：完整 X3DH 需拿 sender 的 identity pubkey
+    { name: 'X25519', public: senderIdPub } as any, myPriv, 256);
+
+  // 拼接两路 shared（与发送侧第 5 步一致），后续 HKDF(salt=conversation_id) → AES-GCM 同发送侧 6~7 步
+  const shared = new Uint8Array(shared1.length + shared2.length);
+  shared.set(new Uint8Array(shared1), 0);
+  shared.set(new Uint8Array(shared2), shared1.length);
   // ... 后续同发送
 });
 ```
 
-> ⚠️ **简化版注意**：上面 `shared2` 用了两次 `myPriv` + `senderEpkPub`，实际 X3DH 还需要 sender 的 identity pubkey 走另一路。完整简化版实现需要**先 GET /keys/:senderId 拿 sender 的 identity_pubkey**。这是方案 B 的已知限制。
+> 修复记录（2026-08-31）：早期版本此处 `shared2` 误用了两次 `senderEpkPub`（与发送侧不对称，
+> 照抄会导致解密失败或协议退化为单路 ECDH）。正确写法是拉取 sender 的 identity 公钥走第二路。
 
 ## 4. TOFU：公钥钉住与变更告警（客户端必做）
+
+> 📄 **完整独立版对接文档（可直接发前端同事）**：[docs/TOFU_FRONTEND.md](TOFU_FRONTEND.md)
+> —— 含接口速查、可直接抄的 TypeScript 实现（keyStore / verifyPeerKey / WS 监听 / 告警 UI）与联调自测步骤。本节为协议内嵌摘要。
 
 **威胁模型**：E2EE 防不住"服务端作恶换公钥"。Alice 请求 Bob 的公钥时，被攻破的服务端
 可以返回攻击者的公钥 → Alice 用假公钥加密 → 攻击者解密后用 Bob 真公钥重加密转发，

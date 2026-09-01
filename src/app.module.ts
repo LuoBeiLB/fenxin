@@ -27,6 +27,7 @@ import { UploadModule } from './modules/upload/upload.module';
 import { StatsModule } from './modules/stats/stats.module';
 import { AnnouncementModule } from './modules/announcement/announcement.module';
 import { FeedbackModule } from './modules/feedback/feedback.module';
+import { AppVersionModule } from './modules/app-version/app-version.module';
 
 @Module({
   imports: [
@@ -118,6 +119,7 @@ import { FeedbackModule } from './modules/feedback/feedback.module';
     StatsModule,
     AnnouncementModule,
     FeedbackModule,
+    AppVersionModule,
   ],
   controllers: [AppController],
   providers: [
