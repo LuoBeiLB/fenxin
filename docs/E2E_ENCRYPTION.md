@@ -112,6 +112,25 @@ Authorization: Bearer <access_token>
 3. 派生 session_key → AES-256-GCM-decrypt(`message.cipher_text`, `message.cipher_nonce`)
 4. 展示明文（不要展示 `content` 字段，它是占位 `[加密消息]`）
 
+### 2.5 批量查询公钥（TOFU 比对）
+
+`POST /api/v1/keys/query`，一次拉一组联系人的公钥 + 更新时间（限 30/min，单次上限 500 人）：
+
+```json
+{ "user_ids": ["uuid-1", "uuid-2", "uuid-3"] }
+```
+
+**返回**：数组，只含「自己 + 与自己至少一个共同会话且已上传公钥」的成员：
+
+```json
+[
+  { "user_id": "uuid-1", "identity_pubkey": "MCowBQ...", "created_at": "...", "updated_at": "..." }
+]
+```
+
+- 无共同会话 / 未上传公钥的用户**不出现在结果里**（不报错），前端按「请求 N 返回 M」自行 diff；
+- 用途：App 启动、进群时批量拉公钥与本地缓存比对，见 §4 TOFU。
+
 ## 3. 客户端实现（Web Crypto API 示例）
 
 ### 3.1 生成并存储 key pair（首次登录）
@@ -244,30 +263,113 @@ socket.on('message_created', async ({ message }) => {
     { name: 'X25519' } as any, false, ['deriveBits'],
   );
 
-  // 同样的双路 ECDH
+  // 双路 ECDH（与 §3.2 发送侧对称）：
+  // shared1 = 我的 identity 私钥 × 发送方【临时】公钥（消息里带的）
   const shared1 = await crypto.subtle.deriveBits(
     { name: 'X25519', public: senderEpkPub } as any, myPriv, 256);
+
+  // shared2 = 我的 identity 私钥 × 发送方【identity】公钥 —— 必须额外拉一次发送方的公钥！
+  // TOFU 对接后应替换为 verifyPeerKey(message.sender_id)（见 docs/TOFU_FRONTEND.md §4.2），裸 fetch 仅作协议演示
+  const senderRes = await fetch(`/api/v1/keys/${message.sender_id}`, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  const { data: { identity_pubkey: senderIdPubB64 } } = await senderRes.json();
+  const senderIdPub = await crypto.subtle.importKey(
+    'raw',
+    Uint8Array.from(atob(senderIdPubB64), c => c.charCodeAt(0)),
+    { name: 'X25519' } as any, false, [],
+  );
   const shared2 = await crypto.subtle.deriveBits(
-    { name: 'X25519', public: senderEpkPub } as any, myPriv, 256);  // 注：完整 X3DH 需拿 sender 的 identity pubkey
+    { name: 'X25519', public: senderIdPub } as any, myPriv, 256);
+
+  // 拼接两路 shared（与发送侧第 5 步一致），后续 HKDF(salt=conversation_id) → AES-GCM 同发送侧 6~7 步
+  const shared = new Uint8Array(shared1.length + shared2.length);
+  shared.set(new Uint8Array(shared1), 0);
+  shared.set(new Uint8Array(shared2), shared1.length);
   // ... 后续同发送
 });
 ```
 
-> ⚠️ **简化版注意**：上面 `shared2` 用了两次 `myPriv` + `senderEpkPub`，实际 X3DH 还需要 sender 的 identity pubkey 走另一路。完整简化版实现需要**先 GET /keys/:senderId 拿 sender 的 identity_pubkey**。这是方案 B 的已知限制。
+> 修复记录（2026-08-31）：早期版本此处 `shared2` 误用了两次 `senderEpkPub`（与发送侧不对称，
+> 照抄会导致解密失败或协议退化为单路 ECDH）。正确写法是拉取 sender 的 identity 公钥走第二路。
 
-## 4. 已知限制 / TODO
+## 4. TOFU：公钥钉住与变更告警（客户端必做）
+
+> 📄 **完整独立版对接文档（可直接发前端同事）**：[docs/TOFU_FRONTEND.md](TOFU_FRONTEND.md)
+> —— 含接口速查、可直接抄的 TypeScript 实现（keyStore / verifyPeerKey / WS 监听 / 告警 UI）与联调自测步骤。本节为协议内嵌摘要。
+
+**威胁模型**：E2EE 防不住"服务端作恶换公钥"。Alice 请求 Bob 的公钥时，被攻破的服务端
+可以返回攻击者的公钥 → Alice 用假公钥加密 → 攻击者解密后用 Bob 真公钥重加密转发，
+两端毫无察觉（经典 MITM）。ECDH 数学挡得住"偷看"，挡不住"演戏"。
+
+**TOFU（Trust On First Use）= 首次使用即信任 + 之后变更必告警**。服务端已提供两个支撑：
+`POST /keys/query`（批量拉公钥，§2.5）+ WS 事件 `key:changed`（对方轮换公钥时实时通知）。
+
+### 4.1 客户端三步实现
+
+**① 本地公钥通讯录**（IndexedDB / AsyncStorage 一张表，公钥非机密，明文存即可）：
+
+```ts
+{ user_id: string, identity_pubkey: string, first_seen_at: number }
+```
+
+**② 加密封密钥前，先比对**（伪代码）：
+
+```ts
+async function getPeerKey(peerId: string): Promise<string> {
+  const local = await keyStore.get(peerId);
+  const remote = await api.get(`/keys/${peerId}`);          // 或批量 query
+
+  if (!local) {                                               // 首次信任：钉住
+    await keyStore.put({ user_id: peerId, identity_pubkey: remote.identity_pubkey, first_seen_at: Date.now() });
+    return remote.identity_pubkey;
+  }
+  if (local.identity_pubkey === remote.identity_pubkey) {    // 没变
+    return local.identity_pubkey;
+  }
+  showKeyChangeWarning(peerId);                               // 变了 → 告警，阻断加密发送
+  throw new Error('KEY_CHANGED');
+}
+```
+
+**③ 告警 UI**：聊天页顶部横幅「对方的安全密钥已变更（可能是换手机/重装，也可能是攻击）」
++「确认信任新钥匙」按钮。用户确认 → 更新本地缓存 → 恢复加密发送。文案别写太吓人：
+换手机/重装是合法轮换，告警是常态事件，必须能一键确认继续。
+
+### 4.2 WS key:changed 处理
+
+收到 `key:changed { user_id, updated_at }`（见 docs/websocket-events.md）→ 走 ② 的同一条
+比对路径（`GET /keys/:userId` 或批量 query），不一致即告警。payload 故意不带公钥本体，
+保证所有公钥都经过同一条「本地缓存比对」路径。
+
+### 4.3 边界情况
+
+| 场景 | 行为 |
+| --- | --- |
+| 对方换手机 / 重装 App | 公钥合法轮换 → key:changed → 告警 → 用户确认后继续（常态） |
+| 自己清缓存 / 换设备 | 本地通讯录丢失 → 全员回到「首次信任」重新钉住（TOFU 固有弱点，与本产品「密钥丢=消息焚」语义一致） |
+| 多端登录 | 每台设备各自维护各自的通讯录，互不干扰 |
+| 一直没点确认 | 加密发送保持阻断；明文发送不受影响 |
+
+**局限（诚实说明）**：TOFU 防不住「两端首次建立联系之前」的替换，也防不住唯一联系渠道
+就是本 App 的两个用户（在受监听通道里对暗号无意义）。完整解法是 X3DH + 公钥签名（见 §5），
+TOFU 把作恶窗口压缩到最小并让替换行为可被发现、可被审计。
+
+## 5. 已知限制 / TODO
 
 - ❌ **异步首发**：对方首次不在线时拿不到公钥 → 当前 UI 应提示"对方尚未启用加密，请明文发送"
 - ❌ **群聊 / 频道加密**：sender keys 协议（每个发件人生成 symmetric chain），需 X3DH 升级
-- ❌ **MITM 防护**：当前没有 signing key，理论上服务端可偷换公钥 → 后续加 signed_prekey
+- ⚠️ **MITM 防护（部分缓解）**：TOFU + key:changed 变更告警已上线（§4），服务端偷换公钥会被客户端发现；首屏信任仍依赖带外核对 → 完整防护待 X3DH signed_prekey
 - ❌ **跨设备同步**：多设备登录需各自生成独立 key pair，私钥不共享（跟"阅后即焚"契合）
 - ❌ **客户端密钥存储**：当前示例用 localStorage，真实生产应加密存储（PBKDF2(userPassword) → AES key wrap identity_priv_jwk）
 
-## 5. 验证清单
+## 6. 验证清单
 
 - [ ] 上传公钥：`curl -X POST -H "Authorization: Bearer $T" -H "Content-Type: application/json" -d '{"identity_pubkey":"..."}' http://localhost:9091/api/v1/keys`
 - [ ] 查自己公钥：`curl -H "Authorization: Bearer $T" http://localhost:9091/api/v1/keys/<myUserId>`
 - [ ] 查对方公钥（应 200/403 取决于同会话关系）
+- [ ] 批量查询公钥：`curl -X POST -H "Authorization: Bearer $T" -H "Content-Type: application/json" -d '{"user_ids":["<myUserId>","<peerUserId>']}" http://localhost:9091/api/v1/keys/query`
+- [ ] 轮换公钥（另一账号 POST /keys 传新公钥）→ 共同会话的在线账号应实时收到 WS `key:changed`
 - [ ] 发明文消息（无 3 字段）：`is_encrypted=false`、content 是真明文
 - [ ] 发密文消息（3 字段齐）：`is_encrypted=true`、content=`[加密消息]`
 - [ ] 半填加密字段 → `400`

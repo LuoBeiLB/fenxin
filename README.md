@@ -2,7 +2,7 @@
 
 企业内部加密通讯应用后端：阅后即焚 + WebSocket 实时推送 + 端到端加密（E2EE）+ 完整管理后台。
 
-NestJS 10 + TypeORM + MySQL 8，接口文档见 Swagger（`/api-docs`，46 个接口全中文文档）。
+NestJS 10 + TypeORM + MySQL 8，接口文档见 Swagger（`/api-docs`，47 个接口全中文文档）。
 
 ## 功能特性
 
@@ -14,6 +14,7 @@ NestJS 10 + TypeORM + MySQL 8，接口文档见 Swagger（`/api-docs`，46 个�
 
 **安全**
 - 端到端加密（E2EE，单聊）：X25519 密钥协商 + HKDF-SHA256 + AES-256-GCM，服务器只存公钥和密文，协议见 [docs/E2E_ENCRYPTION.md](docs/E2E_ENCRYPTION.md)
+- TOFU 公钥防替换（v5.7）：批量查询公钥 `POST /keys/query` + 公钥轮换实时广播 WS `key:changed`，客户端本地钉住比对、不一致即告警，防服务端偷换公钥；前端对接指南见 [docs/TOFU_FRONTEND.md](docs/TOFU_FRONTEND.md)
 - JWT 双密钥认证：access token（2h）+ refresh token（30d，独立密钥）
 - Argon2id 密码哈希；登录限流 5 次/分钟/IP；全局 300 次/分钟
 - JWT 守卫每请求校验账号状态与设备存在性：停用账号 / 下线设备立即吊销
@@ -46,7 +47,7 @@ NestJS 10 + TypeORM + MySQL 8，接口文档见 Swagger（`/api-docs`，46 个�
 | 认证 | JWT 双密钥 |
 | 日志 | nestjs-pino |
 | 测试 | Jest + supertest；k6 压测 |
-| 文档 | Swagger（优先加载 `openapi.yaml`，46 接口 / 13 分组） |
+| 文档 | Swagger（优先加载 `openapi.yaml`，47 接口 / 13 分组） |
 
 ## 快速开始
 
@@ -103,7 +104,7 @@ docker compose up -d --build
 
 ## 接口概览
 
-完整文档见 Swagger `/api-docs` 或仓库根目录 `openapi.yaml`（46 接口 / 13 分组）。
+完整文档见 Swagger `/api-docs` 或仓库根目录 `openapi.yaml`（47 接口 / 13 分组）。
 
 | 分组 | 代表接口 |
 |------|---------|
@@ -112,7 +113,7 @@ docker compose up -d --build
 | 会话 | 单聊创建 / 我的会话 / 会话详情 |
 | 群组 | 建群 / 成员管理（仅群主；系统管理员可跨群查看与移除成员，群内无管理员角色）/ 群资料 / 群主解散（即焚）/ 管理员解散（留痕，`DELETE /groups/admin/:id`） |
 | 消息 | 发送（支持 E2EE 密文字段 / burn_ttl_seconds 点开才焚）/ 列表（按人马赛克视图）/ **点开 reveal** / 编辑 / 撤回 / 已读 / 回执查询 |
-| 密钥 | 上传身份公钥（限 5/min）/ 查询对方公钥（限 60/min，需同会话） |
+| 密钥 | 上传身份公钥（限 5/min，轮换时广播 key:changed）/ 查询对方公钥（限 60/min，需同会话）/ 批量查询公钥（限 30/min，TOFU 比对，上限 500 人） |
 | 公告 | 发布 / 列表 / 管理列表 / 未读数 / 已读标记 / 撤回 |
 | 意见反馈 | 提交 / 我的反馈 / 管理列表（按状态筛选）/ 管理员回复 |
 | 统计 | 数据总览（12 指标） |

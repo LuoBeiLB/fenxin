@@ -5,7 +5,7 @@ import { KeysService } from './keys.service';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { ResponseMessage } from '../../common/decorators/response-message.decorator';
 import { AuthPayload } from '../../common/guards/jwt-auth.guard';
-import { UploadIdentityKeyDto } from './dto';
+import { UploadIdentityKeyDto, QueryIdentityKeysDto } from './dto';
 
 @ApiTags('加密密钥')
 @ApiBearerAuth()
@@ -26,6 +26,18 @@ export class KeysController {
     @Body() dto: UploadIdentityKeyDto,
   ): Promise<{ updated: boolean }> {
     return this.keysService.uploadIdentityKey(user.userId, dto.identity_pubkey);
+  }
+
+  /**
+   * 批量查询公钥（TOFU 前端比对用）：App 启动 / 进群时一次拉一组联系人的公钥+更新时间，
+   * 与本地钉住的公钥缓存比对。权限同单个查询：自己 + 共同会话成员；
+   * 未上传公钥 / 无共同会话的用户不出现在结果里。单次上限 500 个。
+   */
+  @Throttle({ default: { limit: 30, ttl: 60000 } })
+  @Post('query')
+  @ResponseMessage('公钥批量查询成功')
+  query(@CurrentUser() user: AuthPayload, @Body() dto: QueryIdentityKeysDto) {
+    return this.keysService.getIdentityKeysBatch(user.userId, dto.user_ids);
   }
 
   /**

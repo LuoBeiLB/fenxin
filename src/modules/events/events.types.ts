@@ -21,6 +21,10 @@ export const WS_EVENTS = {
   DEVICE_ADDED: 'device:added',
   /** 设备被下线通知 */
   DEVICE_REMOVED: 'device:removed',
+  /** 身份公钥变更通知（TOFU）：某用户轮换了 identity 公钥，通知其共同会话用户重新比对本地缓存 */
+  KEY_CHANGED: 'key:changed',
+  /** App 新版本发布（V5.8 自更新）：管理员发布/恢复发布/切换强更时推给全部在线用户，客户端弹更新提示 */
+  APP_UPDATE: 'app:update',
 } as const;
 
 export type WsServerEvent = (typeof WS_EVENTS)[keyof typeof WS_EVENTS];
@@ -86,6 +90,42 @@ export interface WsDeviceRemovedPayload {
   device_id: string;
 }
 
+/**
+ * key:changed 的 payload（TOFU 支撑）。
+ * 只带 user_id + updated_at，不带公钥本体：客户端收到后自行 GET /keys/:userId
+ * 与本地钉住的公钥比对，不一致才告警 —— 保证所有公钥都走同一条 TOFU 比对路径。
+ */
+export interface WsKeyChangedPayload {
+  /** 轮换了公钥的用户 ID */
+  user_id: string;
+  /** 服务端记录的公钥更新时间（ISO8601） */
+  updated_at: string;
+}
+
+/**
+ * app:update 的 payload（V5.8 App 自更新）。
+ * 版本判定用整数 version_code：客户端比自己的 versionCode 小才提示更新，
+ * 不要用 version_name 字符串比较（"5.10" < "5.9" 的字符串比较是错的）。
+ */
+export interface WsAppUpdatePayload {
+  /** 平台：android / ios（客户端按自己的平台过滤，另一平台的事件忽略） */
+  platform: string;
+  /** 新版本的 Android versionCode / iOS build number（整数） */
+  version_code: number;
+  /** 展示用版本名，如 "5.8" */
+  version_name: string;
+  /** APK 下载地址（相对路径 /uploads/app/xxx.apk，客户端拼 baseURL） */
+  apk_url: string;
+  /** APK 文件大小（字节） */
+  file_size: number;
+  /** 是否强制更新（true 时客户端弹窗不给"下次再说"） */
+  force: boolean;
+  /** 更新说明 */
+  notes: string;
+  /** 发布时间（ISO8601） */
+  published_at: string;
+}
+
 /** 事件名 → payload 类型映射，供 emitToUsers 做类型约束 */
 export interface WsEventPayloadMap {
   'message:new': WsMessagePayload;
@@ -96,6 +136,8 @@ export interface WsEventPayloadMap {
   'announcement:new': WsAnnouncementNewPayload;
   'device:added': WsDeviceAddedPayload;
   'device:removed': WsDeviceRemovedPayload;
+  'key:changed': WsKeyChangedPayload;
+  'app:update': WsAppUpdatePayload;
 }
 
 /** 每个用户专属的房间名：同一用户的所有在线设备（socket）都会加入该房间 */
