@@ -35,7 +35,7 @@ export class AuthService {
   async login(
     phone: string,
     password: string,
-    deviceInfo: { deviceName: string; deviceType: string },
+    deviceInfo: { deviceName: string; deviceType: string; deviceId?: string },
     meta: { ip?: string; userAgent?: string },
   ) {
     const userRepo = this.dataSource.getRepository(AppUser);
@@ -65,28 +65,47 @@ export class AuthService {
 
     await userRepo.update(user.id, { login_fail_count: 0, locked_until: null });
 
-    const device = await deviceRepo.save(
-      deviceRepo.create({
-        user_id: user.id,
-        device_name: deviceInfo.deviceName,
-        device_type: deviceInfo.deviceType,
-        device_id: crypto.randomUUID(),
-        is_online: true,
-        last_active_at: new Date(),
-      }),
-    );
-
-    // 新设备登录通知：推给同账号全部在线设备（含本设备，客户端按 device_id 自行忽略）
-    // 仅当已是第 2 台以上设备时才打扰用户；首台登录不推
-    const onlineDeviceCount = await deviceRepo.count({ where: { user_id: user.id } });
-    if (onlineDeviceCount > 1) {
-      this.events.emitToUsers(WS_EVENTS.DEVICE_ADDED, [user.id], {
-        device_id: device.id,
-        device_name: device.device_name,
-        device_type: device.device_type,
-        logged_in_at: new Date().toISOString(),
-        ip: meta.ip,
+    // 设备去重：客户端传了 device_id（持久化的设备标识）则按 (user_id, device_id) 查找，
+    // 已存在则复用原记录（同一设备重复登录不再产生重复条目），不存在才新建
+    let device: Device | null = null;
+    if (deviceInfo.deviceId) {
+      device = await deviceRepo.findOne({
+        where: { user_id: user.id, device_id: deviceInfo.deviceId },
       });
+    }
+
+    if (device) {
+      // 同一设备重复登录：刷新设备信息与在线状态，不新建
+      device.device_name = deviceInfo.deviceName;
+      device.device_type = deviceInfo.deviceType;
+      device.is_online = true;
+      device.last_active_at = new Date();
+      await deviceRepo.save(device);
+    } else {
+      device = await deviceRepo.save(
+        deviceRepo.create({
+          user_id: user.id,
+          device_name: deviceInfo.deviceName,
+          device_type: deviceInfo.deviceType,
+          device_id: deviceInfo.deviceId ?? crypto.randomUUID(),
+          is_online: true,
+          last_active_at: new Date(),
+        }),
+      );
+
+      // 新设备登录通知：推给同账号全部在线设备（含本设备，客户端按 device_id 自行忽略）
+      // 仅当已是第 2 台以上设备时才打扰用户；首台登录不推。
+      // 注意：只有真正新建设备时才推，重复登录复用记录不应打扰
+      const onlineDeviceCount = await deviceRepo.count({ where: { user_id: user.id } });
+      if (onlineDeviceCount > 1) {
+        this.events.emitToUsers(WS_EVENTS.DEVICE_ADDED, [user.id], {
+          device_id: device.id,
+          device_name: device.device_name,
+          device_type: device.device_type,
+          logged_in_at: new Date().toISOString(),
+          ip: meta.ip,
+        });
+      }
     }
 
     const payload: AuthPayload = {
