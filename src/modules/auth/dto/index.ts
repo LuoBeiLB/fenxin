@@ -55,4 +55,11 @@ export class UpdateProfileDto {
   @IsString()
   @MaxLength(500)
   avatar_url?: string;
+
+  /** 主题色标识（值域由前端定义，如 default/dark/blue，或 20 字符内的任意标识），不传则不修改 */
+  @ApiPropertyOptional({ description: '用户自选主题色标识（值域由前端定义），用于前端换肤', example: 'dark' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(20)
+  topic?: string;
 }

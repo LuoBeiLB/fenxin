@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: 焚信 BurnMsg API
-  version: 2.0.0
+  version: 2.1.0
   description: |-
     焚信（BurnMsg）是一款企业内部加密即时通讯（IM）应用，支持云聊天与秘密聊天、阅后即焚消息。本文件为其后端（NestJS + TypeORM + MySQL）的标准 OpenAPI 3.0.3 接口文档。
 
@@ -59,6 +59,8 @@ tags:
     description: E2E 端到端加密密钥通道：上传/查询 X25519 identity 公钥，服务端零接触私钥，协议细节见 docs/E2E_ENCRYPTION.md。
   - name: 意见反馈
     description: 意见反馈：用户提交意见与查看回复，管理员在管理后台查看全量反馈并回复（回复即处理）。
+  - name: App 版本管理
+    description: App 自更新版本管理（V5.8）：管理员上传 APK 发版（发布 / 恢复发布 / 切强更时 WS 广播 app:update），App 端启动自检检查更新；含撤回、恢复发布、强更开关与删除版本记录。
 
 paths:
   /health:
@@ -147,7 +149,7 @@ paths:
                     type: object
                     properties:
                       user:
-                        $ref: '#/components/schemas/SafeUser'
+                        $ref: '#/components/schemas/ProfileUser'
                       access_token:
                         type: string
                         description: 'JWT 访问令牌，请求受保护接口时放入 Authorization: Bearer 头'
@@ -306,16 +308,17 @@ paths:
       tags: [认证]
       summary: 获取本人资料
       description: |-
-        【用途】获取当前登录用户自己的资料（SafeUser 白名单字段，不含 password_hash 等敏感信息）。
+        【用途】获取当前登录用户自己的资料（SafeUser 白名单字段 + topic 主题色，不含 password_hash 等敏感信息）。
 
         【调用时机】进入「我的」页面、登录成功后刷新本地用户缓存时。
 
         【业务规则与注意事项】
         - 返回字段为服务端白名单（SAFE_USER_FIELDS），任何接口都不会返回密码哈希。
         - force_change_pwd=true 时前端应强制跳转修改密码。
+        - 附带 topic 字段（用户自选前端主题色标识）：换设备登录后据此恢复主题；通讯录等他人出口不返回该字段。
       responses:
         '200':
-          description: 成功，data 为本人 SafeUser
+          description: 成功，data 为本人 ProfileUser（SafeUser + topic 主题色）
           content:
             application/json:
               schema:
@@ -324,7 +327,7 @@ paths:
                   code: { type: integer, example: 0 }
                   message: { type: string, example: ok }
                   data:
-                    $ref: '#/components/schemas/SafeUser'
+                    $ref: '#/components/schemas/ProfileUser'
         '401':
           description: 未携带或无效/过期 token；账号已停用或设备已下线
           content:
@@ -339,13 +342,14 @@ paths:
       tags: [认证]
       summary: 更新本人资料（均为可选字段）
       description: |-
-        【用途】更新当前登录用户的昵称、签名、头像，三个字段均为可选，仅提交的字段会被更新。
+        【用途】更新当前登录用户的昵称、签名、头像、主题色（topic），四个字段均为可选，仅提交的字段会被更新。
 
         【调用时机】用户在「编辑资料」页保存修改时。
 
         【业务规则与注意事项】
         - 未传的字段保持不变；不能通过本接口修改手机号、部门、角色等字段。
-        - 响应为更新后的完整 SafeUser，前端可直接替换本地缓存。
+        - topic 为前端主题色标识，值域由前端定义（如 default/dark/blue），最长 20 字符；存服务端换设备登录后同步。
+        - 响应为更新后的完整 ProfileUser（含 topic），前端可直接替换本地缓存。
       requestBody:
         required: true
         content:
@@ -368,6 +372,11 @@ paths:
                   maxLength: 500
                   description: 头像 URL，最长 500 字符（可先通过 POST /upload 上传获得）
                   example: /uploads/9b1d2c3e-4f5a-4b6c-8d7e-9f0a1b2c3d4e.jpg
+                topic:
+                  type: string
+                  maxLength: 20
+                  description: 用户自选前端主题色标识（值域由前端定义，如 default/dark/blue），用于前端换肤
+                  example: dark
       responses:
         '200':
           description: 更新成功（message 为「个人资料更新成功」），data 为更新后的 SafeUser
@@ -379,7 +388,7 @@ paths:
                   code: { type: integer, example: 0 }
                   message: { type: string, example: 个人资料更新成功 }
                   data:
-                    $ref: '#/components/schemas/SafeUser'
+                    $ref: '#/components/schemas/ProfileUser'
         '400':
           description: 参数校验失败（如字段超长）
           content:
@@ -2424,6 +2433,7 @@ paths:
 
         【业务规则与注意事项】
         - multipart/form-data 上传，文件字段名 file，单文件最大 50MB（超出返回 413）。
+        - 限流：每 IP 每分钟最多 10 次上传，超出返回 429（V5.8 新增接口级限流，防公网滥用磁盘写入）。
         - 文件保存到服务端本地 UPLOAD_DIR（默认 ./uploads），落盘文件名为 <UUID><原扩展名>，通过 /uploads/<filename> 静态路径访问。
         - 返回的 file_name 为原始文件名（服务端已修正中文文件名的 latin1→utf8 编码问题）。
         - Word/Excel 文档由前端端内解析预览；后续迭代将切换 MinIO 对象存储 + 分片断点续传。
@@ -2476,6 +2486,11 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '413':
           description: 文件超过 50MB 限制
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: 触发限流（每 IP 每分钟 10 次）
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -3206,6 +3221,313 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /app-versions/latest:
+    get:
+      tags: [App 版本管理]
+      summary: App 端检查更新（公开接口，无需登录）
+      description: |-
+        【用途】App 启动时拉取指定平台的最新已发布版本，与本地 versionCode 比对决定是否提示更新。
+        在线期间的实时感知走 WS 事件 app:update，本接口是启动自检的兜底通道（未登录也可调用）。
+
+        【调用时机】① App 启动 / 回到前台时自检更新；② 收到 app:update 推送后按需再拉一次核对。
+
+        【业务规则与注意事项】
+        - 公开接口（App 启动时可能尚未登录），带独立限流：每 IP 每分钟 30 次，超出返回 429。
+        - platform 可选，仅支持 android / ios，默认 android；传入其他值一律按 android 处理（不报错）。
+        - current_code 为客户端当前 versionCode；传入且已大于等于最新版的 version_code 时，data 为 null（已是最新）。
+        - 新旧判断一律用整数 version_code 比较，不要用 version_name 字符串比较（"5.10" < "5.9" 的字符串比较是错的）。
+        - apk_url 为相对路径（/uploads/app/xxx.apk），客户端需自行拼接服务器地址。
+      security: []
+      parameters:
+        - name: platform
+          in: query
+          required: false
+          schema: { type: string, enum: [android, ios], default: android }
+          description: 客户端平台（默认 android；非法值按 android 处理，不报错）
+          example: android
+        - name: current_code
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1 }
+          description: 客户端当前 versionCode（供服务端判断是否已是最新）
+          example: 57
+      responses:
+        '200':
+          description: '成功；有更新时 data 为版本信息对象（AppVersionLatest），已是最新或该平台无已发布版本时 data 为 null'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: ok }
+                  data:
+                    nullable: true
+                    allOf:
+                      - $ref: '#/components/schemas/AppVersionLatest'
+        '429':
+          description: 触发限流（每 IP 每分钟 30 次）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /app-versions:
+    post:
+      tags: [App 版本管理]
+      summary: 发布新版本（仅 admin，上传 APK 并登记版本）
+      description: |-
+        【用途】管理后台发版：上传新 APK 并登记版本元信息，成功后立即向全部在线用户广播 WS 事件 app:update，
+        离线用户下次启动走 GET /app-versions/latest 兜底。
+
+        【调用时机】管理后台「版本管理」页提交发布新版本时。
+
+        【业务规则与注意事项】
+        - 仅 admin 角色可调用；multipart/form-data 上传，文件字段名 file；发版低频操作，限流每 IP 每分钟 5 次，超出返回 429。
+        - 仅接受 .apk 文件（按扩展名判定——APK 的 mimetype 五花八门，不可靠），体积上限 50MB（与附件一致，nginx 60m 配置无需调整）。
+        - version_code 必须为整数且大于该平台当前最大 version_code（含已撤回 / 已删除前的历史记录，同平台内全局递增）；违反返回 400 并提示当前最大值。
+        - platform 可选，默认 android；(platform, version_code) 联合唯一——两个平台的版本号各自独立递增互不影响。
+        - force / notes 均可选；force=true 为强制更新（客户端弹窗不给「下次再说」按钮）。
+        - multipart 场景下布尔值以字符串 'true'/'false' 传输，服务端已做归一化，前端按字符串传即可。
+        - 发版成功即 published=true 并广播 app:update；校验失败或落库失败会自动清理已落盘的临时 APK 文件。
+        - 操作写入审计日志（publish_app_version）。
+        - versionCode 纪律：build.gradle 的 versionCode 必须与本接口的 version_code 一致递增，version_name 仅作展示。
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, version_name, version_code]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: APK 安装包（最大 50MB）
+                platform:
+                  type: string
+                  enum: [android, ios]
+                  description: 平台，默认 android
+                  example: android
+                version_name:
+                  type: string
+                  maxLength: 20
+                  description: 版本名，仅弹窗展示用（如 5.8），不参与大小比较
+                  example: '5.8'
+                version_code:
+                  type: integer
+                  minimum: 1
+                  description: versionCode，同平台内必须递增的整数（如 58）
+                  example: 58
+                force:
+                  type: boolean
+                  description: 是否强制更新，默认 false
+                  example: false
+                notes:
+                  type: string
+                  maxLength: 2000
+                  description: 更新说明（发版日志，弹窗内展示）
+                  example: "1. 新增 App 自更新\n2. 修复若干问题"
+      responses:
+        '200':
+          description: 发布成功（message 为「版本发布成功」），data 为新建的版本记录
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: 版本发布成功 }
+                  data:
+                    $ref: '#/components/schemas/AppVersion'
+        '400':
+          description: 未接收到 APK 文件 / 非 .apk 文件 / 体积超 50MB / version_code 未大于该平台当前最大值 / 参数校验失败
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: 未携带或无效/过期 token；账号已停用或设备已下线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: 非 admin 角色（Admin access required）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: 触发限流（每 IP 每分钟 5 次）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /app-versions/manage:
+    get:
+      tags: [App 版本管理]
+      summary: 版本管理列表（仅 admin）
+      description: |-
+        【用途】管理后台「版本管理」列表页：查看全部版本记录（含已撤回），配套撤回 / 恢复发布 / 强更开关 / 删除操作。
+
+        【调用时机】管理后台版本管理页加载 / 刷新时。
+
+        【业务规则与注意事项】
+        - 仅 admin 角色可调用；返回全部平台的记录，按 version_code 倒序混排（不分平台）。
+      parameters:
+        - name: page
+          in: query
+          schema: { type: integer, minimum: 1, default: 1 }
+          description: 页码，默认 1
+        - name: pageSize
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 20 }
+          description: 每页条数，默认 20
+      responses:
+        '200':
+          description: '成功，data 为 { data: 版本记录数组, total }'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: ok }
+                  data:
+                    type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/AppVersion'
+                      total: { type: integer, example: 8 }
+        '401':
+          description: 未携带或无效/过期 token；账号已停用或设备已下线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: 非 admin 角色（Admin access required）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /app-versions/{id}:
+    patch:
+      tags: [App 版本管理]
+      summary: 修改版本（仅 admin：撤回 / 恢复发布 / 强更开关 / 更新说明）
+      description: |-
+        【用途】对已有版本做不发新包的调整：撤回（published=false，App 端 latest 不再返回该版本）、恢复发布、
+        切换强更开关、编辑更新说明——发错版本紧急止血或上线后补强更的入口。
+
+        【调用时机】误发版本紧急下架、想把在发版本临时改为强制更新、补充更新说明时。
+
+        【业务规则与注意事项】
+        - 仅 admin 角色可调用；三个字段均可选，只传要改的。
+        - 恢复发布（published 由 false 改 true）或已发布版本的强更开关变化（force 变化）时，
+          会重新广播 WS 事件 app:update，在线用户立即感知；仅修改 notes 时不会广播（不打扰在线用户）。
+        - 撤回后磁盘 APK 文件保留，已发出的下载链接仍可访问；仅 latest 接口不再返回该版本。
+        - 操作写入审计日志（update_app_version）。
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+          description: 版本记录 ID（UUID）
+          example: 5a8c3e1f-2b4d-4f6a-9c8e-1a2b3c4d5e6f
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                force:
+                  type: boolean
+                  description: 是否强制更新
+                  example: true
+                notes:
+                  type: string
+                  maxLength: 2000
+                  description: 更新说明（整体覆盖旧值）
+                published:
+                  type: boolean
+                  description: '发布状态：false=撤回（App 端不再返回该版本），true=恢复发布'
+      responses:
+        '200':
+          description: 修改成功（message 为「版本信息已更新」），data 为更新后的版本记录
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: 版本信息已更新 }
+                  data:
+                    $ref: '#/components/schemas/AppVersion'
+        '400':
+          description: 参数校验失败（如 notes 超长）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: 未携带或无效/过期 token；账号已停用或设备已下线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: 非 admin 角色（Admin access required）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: 版本记录不存在
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    delete:
+      tags: [App 版本管理]
+      summary: 删除版本记录（仅 admin，磁盘 APK 保留）
+      description: |-
+        【用途】从版本管理列表删除一条版本记录；磁盘上的 APK 文件保留，已推送 / 已分发的下载链接不立即失效。
+
+        【调用时机】清理误发或测试版本的记录时。
+
+        【业务规则与注意事项】
+        - 仅 admin 角色可调用；只删数据库记录，不删 UPLOAD_DIR/app/ 下的物理文件。
+        - 记录删除后 latest 接口自然不再返回该版本；该 version_code 之后可重新发版。
+        - 操作写入审计日志（delete_app_version）。
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+          description: 版本记录 ID（UUID）
+          example: 5a8c3e1f-2b4d-4f6a-9c8e-1a2b3c4d5e6f
+      responses:
+        '200':
+          description: 删除成功（message 为「版本记录已删除」），data 为 null
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: 版本记录已删除 }
+                  data: { nullable: true, example: null }
+        '401':
+          description: 未携带或无效/过期 token；账号已停用或设备已下线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: 非 admin 角色（Admin access required）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: 版本记录不存在
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -3230,6 +3552,20 @@ components:
           description: 错误描述
           example: 手机号格式不正确
       required: [code, message]
+
+    ProfileUser:
+      allOf:
+        - $ref: '#/components/schemas/SafeUser'
+        - type: object
+          description: >-
+            本人资料出口专用（登录响应的 user、GET/PUT /auth/profile 的 data）：
+            SafeUser 全部字段 + topic 主题色。通讯录、会话成员、群成员等他人出口仍为 SafeUser，不暴露 topic。
+          properties:
+            topic:
+              type: string
+              maxLength: 20
+              description: 用户自选前端主题色标识（值域由前端定义，如 default/dark/blue），存服务端换设备同步；PUT /auth/profile 可修改，未传保持不变
+              example: dark
 
     SafeUser:
       type: object
@@ -3763,3 +4099,97 @@ components:
           nullable: true
           description: 提交人部门（仅管理端列表附带）
           example: 技术部
+
+    AppVersion:
+      type: object
+      description: App 版本发布记录（管理端发布 / 列表 / 修改接口返回的完整实体）
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: 版本记录 ID（UUID v4）
+        platform:
+          type: string
+          enum: [android, ios]
+          description: 平台；(platform, version_code) 联合唯一，两平台版本号各自独立递增
+          example: android
+        version_code:
+          type: integer
+          description: versionCode（Android）/ build number（iOS），同平台内全局递增整数，客户端据此判断有无新版本
+          example: 58
+        version_name:
+          type: string
+          description: 版本名（如 5.8），仅弹窗展示用，不参与大小比较
+          example: '5.8'
+        apk_url:
+          type: string
+          description: APK 下载地址（相对路径 /uploads/app/xxx.apk，客户端拼接 baseURL）
+          example: /uploads/app/fenxin-android-v5.8-9b1d2c3e.apk
+        file_size:
+          type: integer
+          description: APK 文件大小（字节），客户端用于展示与下载进度估算
+          example: 18874368
+        force:
+          type: boolean
+          description: 是否强制更新（true 时客户端弹窗不给「下次再说」按钮）
+          example: false
+        notes:
+          type: string
+          description: 更新说明（发版日志，弹窗内展示）
+          example: '1. 新增 App 自更新'
+        published:
+          type: boolean
+          description: 发布状态；false=已撤回（App 端 latest 不再返回该版本，文件保留）
+          example: true
+        created_by:
+          type: string
+          format: uuid
+          description: 发布操作的管理员用户 ID
+        created_at:
+          type: string
+          format: date-time
+          description: 发布时间（latest 接口与 WS 广播 payload 中的 published_at 即此字段）
+          example: '2026-09-01T03:00:00.000Z'
+        updated_at:
+          type: string
+          format: date-time
+          example: '2026-09-01T03:00:00.000Z'
+
+    AppVersionLatest:
+      type: object
+      description: GET /app-versions/latest 返回的最新版本信息（精简字段；已是最新时整个 data 为 null）
+      properties:
+        platform:
+          type: string
+          enum: [android, ios]
+          description: 平台
+          example: android
+        version_code:
+          type: integer
+          description: 最新版本 versionCode
+          example: 58
+        version_name:
+          type: string
+          description: 最新版本名
+          example: '5.8'
+        apk_url:
+          type: string
+          description: APK 下载地址（相对路径，客户端拼接 baseURL）
+          example: /uploads/app/fenxin-android-v5.8-9b1d2c3e.apk
+        file_size:
+          type: integer
+          description: APK 文件大小（字节）
+          example: 18874368
+        force:
+          type: boolean
+          description: 是否强制更新
+          example: false
+        notes:
+          type: string
+          description: 更新说明（发版日志）
+          example: '1. 新增 App 自更新'
+        published_at:
+          type: string
+          format: date-time
+          description: 发布时间（ISO8601）
+          example: '2026-09-01T03:00:00.000Z'

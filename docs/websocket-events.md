@@ -54,9 +54,11 @@ token 过期后重连会持续失败，前端应在刷新 token 后先 `disconne
 | `receipt:read` | `MessageService.markAsRead()` 确实把未读翻成已读时 | `WsReceiptReadPayload` |
 | `conversation:updated` | 会话创建 / 新消息更新 `last_message_at` / 群成员变动 / 群资料变更 | `WsConversationUpdatedPayload` |
 | `key:changed` | `KeysService.uploadIdentityKey()` 轮换 identity 公钥时（覆盖更新，首次上传不推） | `WsKeyChangedPayload` |
+| `app:update` | `AppVersionService` 发布新版本 / 恢复发布 / 已发布版本切强更时 | `WsAppUpdatePayload` |
 
-> 注：`key:changed` 是唯一不带 `conversation_id` 的事件 —— 它与单个会话无关，
-> 推送目标为**轮换者的全部共同会话用户**（谁可能缓存了旧公钥就推给谁），而非某个会话的成员。
+> 注：`key:changed` 与 `app:update` 不带 `conversation_id` —— 它们与单个会话无关。
+> `key:changed` 推送给**轮换者的全部共同会话用户**（谁可能缓存了旧公钥就推给谁）；
+> `app:update` 推送给**全部 active 在线用户**（全员发版通知，客户端按 platform 过滤）。
 
 ## payload 结构
 
@@ -154,6 +156,29 @@ TOFU（Trust On First Use）支撑事件：payload **故意不带公钥本体**�
 
 触发时机：`POST /keys` 覆盖更新公钥时（首次上传不推——没有人缓存过旧公钥，无比对意义）。
 
+### WsAppUpdatePayload（app:update）
+
+```jsonc
+{
+  "platform": "android",        // 平台；客户端按自身平台过滤（android 端忽略 ios 的推送）
+  "version_code": 58,           // 新版本 versionCode（整数，与本地比较）
+  "version_name": "5.8",        // 版本名（展示用）
+  "apk_url": "/uploads/app/fenxin-android-v5.8-9b1d2c3e.apk",  // 相对路径，客户端拼 baseURL
+  "file_size": 18874368,        // 字节数，用于展示与下载进度估算
+  "force": false,               // 强更标记：true 时弹窗不给「下次再说」
+  "notes": "1. 新增 App 自更新\n2. ...",  // 更新说明
+  "published_at": "2026-09-01T03:00:00.000Z"
+}
+```
+
+App 自更新（V5.8）事件：管理员发布新版本、恢复发布（published false→true）、
+或已发布版本切换强更开关时，广播给**全部 active 在线用户**；离线用户下次启动走
+`GET /app-versions/latest` 兜底自检。仅修改 notes 不会广播。
+
+客户端收到后：按 `platform` 过滤 → 与本地 versionCode 做**整数比较**（不要用
+version_name 字符串比较）→ 有新版本则弹更新窗（force=true 时不给「下次再说」）→
+下载 `apk_url` → 唤起系统安装器。完整对接细节（含下载安装插件代码）见 `docs/APP_UPDATE.md`。
+
 ## 服务端注入点一览
 
 | 文件 | 位置 | 事件 |
@@ -167,6 +192,7 @@ TOFU（Trust On First Use）支撑事件：payload **故意不带公钥本体**�
 | `src/modules/group/group.service.ts` | `addMembers` / `removeMember` | `conversation:updated(reason=members)` |
 | `src/modules/group/group.service.ts` | `updateGroupInfo` | `conversation:updated(reason=info)` |
 | `src/modules/keys/keys.service.ts` | `uploadIdentityKey`（覆盖更新分支） | `key:changed`（推给轮换者的全部共同会话用户） |
+| `src/modules/app-version/app-version.service.ts` | `publishVersion` / `updateVersion`（恢复发布或已发布版本强更变化分支） | `app:update`（推给全部 active 用户） |
 
 推送统一走 `EventsGateway.emitToUsers(event, userIds, payload)`，内部 try/catch：
 推送失败只记日志，**绝不影响 REST 业务主流程**。

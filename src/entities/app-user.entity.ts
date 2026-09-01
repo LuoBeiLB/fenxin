@@ -22,6 +22,10 @@ export class AppUser {
   @Column({ length: 200, nullable: true })
   signature: string | null;
 
+  /** 用户自选前端主题色标识（如 default / dark / blue 或前端自定义枚举），存服务端换设备同步；值域由前端定义，后端只存取 */
+  @Column({ length: 20, default: 'default' })
+  topic: string;
+
   @Index('idx_users_department')
   @Column({ length: 100, nullable: true })
   department: string | null;
@@ -77,4 +81,14 @@ export function sanitizeUser(user: AppUser | null): Partial<AppUser> | null {
     (out as any)[k] = user[k];
   }
   return out;
+}
+
+/**
+ * 个人资料出口专用：SafeUser 基础上附加 topic（用户自选主题色）。
+ * 仅用于登录响应 / GET|PUT /auth/profile —— 主题是用户自己的偏好，
+ * 通讯录、会话成员、群成员等出口继续用 sanitizeUser，不暴露他人 topic。
+ */
+export function sanitizeUserWithPrefs(user: AppUser | null): (Partial<AppUser> & { topic: string }) | null {
+  if (!user) return null;
+  return { ...sanitizeUser(user), topic: user.topic ?? 'default' };
 }

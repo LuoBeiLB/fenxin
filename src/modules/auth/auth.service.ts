@@ -7,7 +7,7 @@ import {
 import { DataSource } from 'typeorm';
 import * as argon2 from 'argon2';
 import * as crypto from 'crypto';
-import { AppUser, sanitizeUser } from '../../entities/app-user.entity';
+import { AppUser, sanitizeUser, sanitizeUserWithPrefs } from '../../entities/app-user.entity';
 import { Device } from '../../entities/device.entity';
 import { AuditService } from '../audit/audit.service';
 import { TokenService } from './token.service';
@@ -106,7 +106,8 @@ export class AuthService {
     });
 
     return {
-      user: sanitizeUser(user),
+      // 登录即返回 topic（主题色）：前端登录后无需再拉一次 profile 即可应用用户主题
+      user: sanitizeUserWithPrefs(user),
       ...tokens,
       device,
       force_change_pwd: user.force_change_pwd,
@@ -165,22 +166,23 @@ export class AuthService {
   async getProfile(userId: string) {
     const user = await this.dataSource.getRepository(AppUser).findOne({ where: { id: userId } });
     if (!user) throw new NotFoundException('User not found');
-    return sanitizeUser(user);
+    return sanitizeUserWithPrefs(user);
   }
 
   async updateProfile(
     userId: string,
-    updates: { display_name?: string; signature?: string; avatar_url?: string },
+    updates: { display_name?: string; signature?: string; avatar_url?: string; topic?: string },
   ) {
     const userRepo = this.dataSource.getRepository(AppUser);
     const updateData: Partial<AppUser> = {};
     if (updates.display_name !== undefined) updateData.display_name = updates.display_name;
     if (updates.signature !== undefined) updateData.signature = updates.signature;
     if (updates.avatar_url !== undefined) updateData.avatar_url = updates.avatar_url;
+    if (updates.topic !== undefined) updateData.topic = updates.topic;
 
     await userRepo.update(userId, updateData);
     const updated = await userRepo.findOne({ where: { id: userId } });
-    return sanitizeUser(updated);
+    return sanitizeUserWithPrefs(updated);
   }
 
   async getDevices(userId: string) {

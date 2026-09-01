@@ -63,7 +63,6 @@ export class AppVersionService {
     ip?: string;
   }): Promise<AppVersion> {
     const { file, dto, operatorId, ip } = params;
-
     // 1. 文件校验：只认扩展名（APK 的 mimetype 五花八门，application/octet-stream 也常见，不可靠）
     if (!file) throw new BadRequestException('未接收到 APK 文件');
     if (!/^\.apk$/i.test(path.extname(file.originalname))) {
