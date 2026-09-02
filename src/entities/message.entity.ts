@@ -84,13 +84,15 @@ export class Message {
    * content 里的「@昵称」纯文本仅供展示（同名/改名会漂移误判），mentions 才是精确身份，
    * 前端用它判定「有人@我」。发送时仅保留会话成员 uid（非成员过滤）；
    * uid 属群成员关系同级元数据（不在加密范围内），不涉消息内容泄露。
-   * 注意：这里不能写 default: '[]'——TypeORM synchronize 会把它生成 DEFAULT '[]'（字面量），
-   * MySQL 禁止 JSON 列使用字面量默认值，启动即报
-   * "BLOB, TEXT, GEOMETRY or JSON column 'mentions' can't have a default value"。
+   * 类型必须用 'json'，不能用 'simple-json'（2026-09-02 修复启动后查询 500）：
+   * mysql2 驱动对 json 列会自动 JSON.parse 成 JS 值，而 TypeORM(0.3.20) 的 simple-json
+   * hydrate 分支无 typeof string 保护会二次 parse——JSON.parse([]) 等价于 JSON.parse('')，
+   * 抛 "Unexpected end of JSON input" 使历史消息查询 500；json 分支有保护直接透传，安全。
+   * 注意：仍不能写 default（数组 default 会被 TypeORM 序列化成空串 DEFAULT，MySQL json 列拒绝）；
    * DB 端默认值只由 migration 用表达式 DEFAULT (JSON_ARRAY()) 提供（生产 DB_SYNC=false 时执行）；
-   * 应用层兜底见 applyBurnView 入口的归一化。
+   * 存量/异常值兜底见 applyBurnView 入口的归一化（null → []）。
    */
-  @Column({ type: 'simple-json' })
+  @Column({ type: 'json' })
   mentions: string[];
 
   @Index('idx_messages_created_at')
