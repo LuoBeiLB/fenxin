@@ -1,3 +1,10 @@
+// 必须在所有 import 之前：TS5 的 `import * as fs` 会把内置模块包装成
+// non-configurable getter 属性，jest.spyOn(fs, 'mkdirSync') 报 "Cannot redefine property"
+// （同款坑与解法见 test/common/auth-cache-invalidation.spec.ts 顶部注释）。
+// jest.mock 整模块替换成自动 mock：所有方法共享同一批 jest.fn()，直接配置即可；
+// 用例只断言 mkdirSync/renameSync/existsSync/unlinkSync 这 4 个，全在下面显式配置。
+jest.mock('fs');
+
 import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { AppVersionService } from 'src/modules/app-version/app-version.service';
@@ -6,6 +13,8 @@ import { AppUser } from 'src/entities/app-user.entity';
 import { EventsGateway } from 'src/modules/events/events.gateway';
 import { AuditService } from 'src/modules/audit/audit.service';
 import * as fs from 'fs';
+
+const mockedFs = fs as jest.Mocked<typeof fs>;
 
 /**
  * App 版本服务单测（V5.8）。
@@ -54,10 +63,11 @@ describe('AppVersionService', () => {
     );
 
     // fs mock：rename/unlink/mkdir 全部假成功
-    jest.spyOn(fs, 'mkdirSync').mockImplementation(() => undefined);
-    jest.spyOn(fs, 'renameSync').mockImplementation(() => undefined);
-    jest.spyOn(fs, 'existsSync').mockReturnValue(true);
-    jest.spyOn(fs, 'unlinkSync').mockImplementation(() => undefined);
+    // （不能用 jest.spyOn(fs,...)：TS5 import* 包装属性不可重定义，改直接配置共享 fn）
+    mockedFs.mkdirSync.mockImplementation(() => undefined);
+    mockedFs.renameSync.mockImplementation(() => undefined);
+    mockedFs.existsSync.mockReturnValue(true);
+    mockedFs.unlinkSync.mockImplementation(() => undefined);
   });
 
   describe('latestForClient', () => {

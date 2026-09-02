@@ -1,3 +1,9 @@
+// 必须在所有 import 之前：TS5 的 `import * as argon2` 会把模块包装成
+// non-configurable getter 属性，jest.spyOn(argon2, 'verify') 报 "Cannot redefine property"
+// （同款坑与解法见 test/common/auth-cache-invalidation.spec.ts 顶部注释）。
+// jest.mock 整模块替换成自动 mock：所有方法共享同一批 jest.fn()，直接设返回值即可。
+jest.mock('argon2');
+
 import { DataSource } from 'typeorm';
 import * as argon2 from 'argon2';
 import { AuthService } from 'src/modules/auth/auth.service';
@@ -7,6 +13,8 @@ import { AuditService } from 'src/modules/audit/audit.service';
 import { TokenService } from 'src/modules/auth/token.service';
 import { AuthCacheService } from 'src/common/cache/auth-cache.service';
 import { EventsGateway } from 'src/modules/events/events.gateway';
+
+const mockedArgon2 = argon2 as jest.Mocked<typeof argon2>;
 
 /**
  * 用户主题色 topic 单测（V5.8 用户自选前端主题色）。
@@ -60,7 +68,7 @@ describe('AuthService topic（用户主题色）', () => {
     const authCache = { invalidate: jest.fn() };
     const events = { emitToUsers: jest.fn() };
 
-    jest.spyOn(argon2, 'verify').mockResolvedValue(true as never);
+    mockedArgon2.verify.mockResolvedValue(true);
 
     service = new AuthService(
       dataSource,

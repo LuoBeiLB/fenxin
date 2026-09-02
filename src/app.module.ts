@@ -41,7 +41,11 @@ import { AppVersionModule } from './modules/app-version/app-version.module';
           process.env.LOG_LEVEL ||
           (process.env.NODE_ENV === 'production' ? 'info' : 'debug'),
         transport:
-          (process.env.LOG_PRETTY || process.env.NODE_ENV !== 'production') === 'true'
+          // LOG_PRETTY 显式设置优先（'true' 开 / 'false' 强制关）；
+          // 未设置时开发环境（NODE_ENV ≠ production）默认开。
+          // 不能写 `LOG_PRETTY || NODE_ENV !== 'production'`：后者是布尔值，
+          // 布尔与字符串 'true' 恒不相等，彩色日志会被永远关掉（v5.8 起实际踩过的坑）
+          (process.env.LOG_PRETTY ?? String(process.env.NODE_ENV !== 'production')) === 'true'
             ? {
                 target: 'pino-pretty',
                 options: {
