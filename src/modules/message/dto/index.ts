@@ -1,4 +1,4 @@
-import { IsString, IsUUID, IsIn, IsOptional, IsNumber, MaxLength, Length, Matches } from 'class-validator';
+import { IsString, IsUUID, IsIn, IsOptional, IsNumber, MaxLength, Length, Matches, IsArray, ArrayMaxSize } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
 /** X25519 公钥 base64：32 字节 → 44 字符（含结尾 =） */
@@ -65,6 +65,16 @@ export class SendMessageDto {
   @IsOptional()
   @IsString()
   cipher_text?: string;
+
+  @ApiPropertyOptional({
+    description: '@提及：被@的成员用户 ID 数组（前端 @ 选人后传入）。仅保留会话成员，非成员/重复 uid 自动过滤；前端据此精确判定「有人@我」，替代按昵称文本匹配（同名/改名会误判）',
+    example: ['5e6f7a8b-9c0d-41e2-83f4-a5b6c7d8e9f0'],
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(50)
+  @IsUUID('4', { each: true })
+  mentions?: string[];
 }
 
 export class EditMessageDto {

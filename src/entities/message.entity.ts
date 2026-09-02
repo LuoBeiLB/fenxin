@@ -79,6 +79,20 @@ export class Message {
   @Column({ length: 100, nullable: true })
   sender_ephemeral_pubkey: string | null;
 
+  /**
+   * @提及（V5.8 前端「有人@我」）：本条消息实际@到的成员用户 ID 数组。
+   * content 里的「@昵称」纯文本仅供展示（同名/改名会漂移误判），mentions 才是精确身份，
+   * 前端用它判定「有人@我」。发送时仅保留会话成员 uid（非成员过滤）；
+   * uid 属群成员关系同级元数据（不在加密范围内），不涉消息内容泄露。
+   * 注意：这里不能写 default: '[]'——TypeORM synchronize 会把它生成 DEFAULT '[]'（字面量），
+   * MySQL 禁止 JSON 列使用字面量默认值，启动即报
+   * "BLOB, TEXT, GEOMETRY or JSON column 'mentions' can't have a default value"。
+   * DB 端默认值只由 migration 用表达式 DEFAULT (JSON_ARRAY()) 提供（生产 DB_SYNC=false 时执行）；
+   * 应用层兜底见 applyBurnView 入口的归一化。
+   */
+  @Column({ type: 'simple-json' })
+  mentions: string[];
+
   @Index('idx_messages_created_at')
   @CreateDateColumn({ type: 'datetime' })
   created_at: Date;

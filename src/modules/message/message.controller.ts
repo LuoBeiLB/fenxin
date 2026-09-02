@@ -28,6 +28,7 @@ export class MessageController {
       senderEphemeralPubkey: dto.sender_ephemeral_pubkey,
       cipherNonce: dto.cipher_nonce,
       cipherText: dto.cipher_text,
+      mentions: dto.mentions,
     });
   }
 

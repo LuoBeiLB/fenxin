@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: 焚信 BurnMsg API
-  version: 2.1.0
+  version: 2.2.0
   description: |-
     焚信（BurnMsg）是一款企业内部加密即时通讯（IM）应用，支持云聊天与秘密聊天、阅后即焚消息。本文件为其后端（NestJS + TypeORM + MySQL）的标准 OpenAPI 3.0.3 接口文档。
 
@@ -105,7 +105,7 @@ paths:
         - 限流：每 IP 每分钟 5 次，超出返回 429（收紧限流，防手机号遍历与暴力破解）。
         - 连续密码错误累计 login_fail_count，满 5 次账号临时锁定 15 分钟（locked_until），锁定期间登录返回 401 并提示剩余秒数；登录成功后失败计数清零。
         - 账号被停用（status=disabled）时登录返回 401「账号已被停用」。
-        - 每次登录都会新建一条设备记录（device_id 为服务端生成的设备指纹 UUID），token payload 中携带该设备记录主键；后续「下线设备」即删除该记录使 token 立即失效。
+        - 设备登记：传 device_id（客户端生成并持久化的设备唯一标识）时按 (user_id, device_id) 复用已有设备记录，同一设备重复登录不再产生重复条目、不触发新设备通知；不传则由服务端随机生成（兼容旧客户端）。token payload 中携带该设备记录主键；后续「下线设备」即删除该记录使 token 立即失效。
         - 响应中 force_change_pwd=true 时（新开通或被重置密码的账号），前端必须强制跳转修改密码（POST /auth/change-password）。
       security: []
       requestBody:
@@ -135,6 +135,11 @@ paths:
                   enum: [mobile, desktop, tablet, web]
                   description: 设备类型：mobile 手机 / desktop 桌面端 / tablet 平板 / web 网页端
                   example: mobile
+                device_id:
+                  type: string
+                  maxLength: 100
+                  description: 可选。客户端生成并持久化的设备唯一标识（建议 localStorage 存储 UUID）。重复登录传相同值则复用已有设备记录，不产生重复设备条目；不传则由服务端随机生成（兼容旧客户端，但无去重效果）
+                  example: 550e8400-e29b-41d4-a716-446655440000
       responses:
         '200':
           description: 登录成功（message 为「登录成功」）
@@ -1408,6 +1413,7 @@ paths:
         - 发送成功后：会话 last_message_at 更新为当前时间（影响会话列表排序）；为全体成员（含发送方）各创建一条消息回执（发送方 is_read=true，其余 is_read=false）。
         - reply_to_id 传入被回复消息的 Message.id 实现引用回复。
         - E2E 加密：cipher_text / cipher_nonce / sender_ephemeral_pubkey 三个字段「全有或全无」——全传则按加密消息入库（is_encrypted=true，content 可置空或留占位），只传部分返回 400；都不传则为普通明文消息。协商流程见 docs/E2E_ENCRYPTION.md。
+        - @提及（V5.8）：传 mentions（被@成员用户 ID 数组，最多 50 个）时仅保留会话成员，非成员/重复 uid 自动过滤；消息对象与 WS message:new 推送均原样返回该数组。前端据此精确判定「有人@我」，替代按昵称文本匹配（同名/改名会误判）。
       requestBody:
         required: true
         content:
@@ -1464,6 +1470,14 @@ paths:
                   type: string
                   pattern: '^[A-Za-z0-9+/_-]{43,44}$'
                   description: 发送方临时 X25519 公钥（base64，43-44 字符），接收方用它做 ECDH 还原密钥
+                mentions:
+                  type: array
+                  maxItems: 50
+                  items:
+                    type: string
+                    format: uuid
+                  description: '@提及：被@的成员用户 ID 数组（前端 @ 选人后传入）。仅保留会话成员，非成员自动过滤；content 中的「@昵称」纯文本仅展示用，mentions 才是「有人@我」的精确身份判定依据'
+                  example: ['5e6f7a8b-9c0d-41e2-83f4-a5b6c7d8e9f0']
       responses:
         '200':
           description: 发送成功（message 为「发送成功」），data 为已入库的 Message
@@ -3774,6 +3788,13 @@ components:
           nullable: true
           description: 发送方临时 X25519 公钥（base64）；明文消息为 null
           example: null
+        mentions:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: 本条消息@到的成员用户 ID 数组（V5.8；无人@时为 []）；前端据此精确判定「有人@我」，焚毁消息马赛克化时该字段仍返回（uid 非内容）
+          example: []
         created_at:
           type: string
           format: date-time

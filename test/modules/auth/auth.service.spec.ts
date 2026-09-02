@@ -36,7 +36,7 @@ const baseUser = {
 describe('AuthService topic（用户主题色）', () => {
   let service: AuthService;
   let userRepo: { findOne: jest.Mock; update: jest.Mock };
-  let deviceRepo: { save: jest.Mock; count: jest.Mock };
+  let deviceRepo: { findOne: jest.Mock; create: jest.Mock; save: jest.Mock; count: jest.Mock };
   let tokenService: { issueTokenPair: jest.Mock };
 
   beforeEach(() => {
@@ -44,6 +44,8 @@ describe('AuthService topic（用户主题色）', () => {
 
     userRepo = { findOne: jest.fn(), update: jest.fn() };
     deviceRepo = {
+      findOne: jest.fn(),
+      create: jest.fn((x: any) => x),
       save: jest.fn((x: any) => ({ ...x, id: 'd-1' })),
       count: jest.fn().mockResolvedValue(1),
     };
@@ -133,5 +135,47 @@ describe('AuthService topic（用户主题色）', () => {
       expect.objectContaining({ user_id: 'u-1', device_name: 'P40', device_type: 'mobile' }),
     );
     expect(eventsSpy.emitToUsers).not.toHaveBeenCalled();
+  });
+
+  it('登录传 device_id 且记录已存在：复用设备记录，不新建不推送（fbs 设备去重合并回归）', async () => {
+    const eventsSpy = (service as any).events as { emitToUsers: jest.Mock };
+    userRepo.findOne.mockResolvedValue({ ...baseUser });
+    deviceRepo.findOne.mockResolvedValue({
+      id: 'd-old',
+      user_id: 'u-1',
+      device_id: 'dev-x',
+      device_name: '旧名',
+      device_type: 'mobile',
+      is_online: false,
+      last_active_at: new Date('2026-08-01T00:00:00Z'),
+    });
+
+    const result = await service.login(
+      '13800000000',
+      'pw',
+      { deviceName: 'P40', deviceType: 'mobile', deviceId: 'dev-x' },
+      {},
+    );
+
+    // 复用分支：不 create 新记录；刷新名称与在线状态；重复登录不应打扰用户
+    expect(deviceRepo.create).not.toHaveBeenCalled();
+    expect(result.device).toMatchObject({ id: 'd-old', device_name: 'P40', is_online: true });
+    expect(eventsSpy.emitToUsers).not.toHaveBeenCalled();
+  });
+
+  it('登录传 device_id 但无记录：按客户端 device_id 新建（不另起随机 UUID）', async () => {
+    userRepo.findOne.mockResolvedValue({ ...baseUser });
+    deviceRepo.findOne.mockResolvedValue(null);
+
+    await service.login(
+      '13800000000',
+      'pw',
+      { deviceName: 'P40', deviceType: 'mobile', deviceId: 'dev-new' },
+      {},
+    );
+
+    expect(deviceRepo.create).toHaveBeenCalledWith(
+      expect.objectContaining({ user_id: 'u-1', device_id: 'dev-new' }),
+    );
   });
 });

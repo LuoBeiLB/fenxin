@@ -56,6 +56,7 @@ export class MessageService {
     senderEphemeralPubkey?: string;
     cipherNonce?: string;
     cipherText?: string;
+    mentions?: string[];
   }): Promise<Message> {
     const msgRepo = this.dataSource.getRepository(Message);
     const convRepo = this.dataSource.getRepository(Conversation);
@@ -67,6 +68,12 @@ export class MessageService {
     const conv = await convRepo.findOne({ where: { id: params.conversationId } });
     if (!conv) throw new NotFoundException('会话不存在');
     if (conv.dissolved_at) throw new ForbiddenException('群组已解散，不能再发送消息');
+
+    // 成员列表一次查询两用：@提及过滤（V5.8）+ 落库后建回执
+    const members = await memberRepo.find({ where: { conversation_id: params.conversationId } });
+    // @提及（V5.8）：只保留真实成员的 uid（防伪造脏数据），Set 去重
+    const memberUids = new Set(members.map((m) => m.user_id));
+    const mentions = [...new Set(params.mentions ?? [])].filter((uid) => memberUids.has(uid));
 
     // E2E：三个加密字段必须同时提供（全密文）或同时缺省（明文），不允许半加密状态
     const encFields = [params.senderEphemeralPubkey, params.cipherNonce, params.cipherText];
@@ -105,12 +112,12 @@ export class MessageService {
         cipher_nonce: isEncrypted ? params.cipherNonce! : null,
         cipher_text: isEncrypted ? params.cipherText! : null,
         sender_ephemeral_pubkey: isEncrypted ? params.senderEphemeralPubkey! : null,
+        mentions,
       }),
     );
 
     await convRepo.update(params.conversationId, { last_message_at: new Date() });
 
-    const members = await memberRepo.find({ where: { conversation_id: params.conversationId } });
     // 点开才焚 v2：全体成员（含发送方）都建回执——发送方这份也要走 reveal 才计时。
     // 发送方天然已读自己发的消息；receipt 同时承载每人各自的 revealed_at / burn_at。
     const now = new Date();
@@ -164,6 +171,12 @@ export class MessageService {
    * 非焚毁消息原样返回。
    */
   private async applyBurnView(messages: Message[], userId: string) {
+    // 加列前的存量老消息 mentions 为 JSON null（NOT NULL 无默认值时的隐式填充），
+    // 统一归一化为 []，保证前端 m.mentions?.includes(...) 永远拿到数组
+    for (const m of messages) {
+      if (!Array.isArray(m.mentions)) m.mentions = [];
+    }
+
     const burnIds = messages.filter((m) => m.burn_ttl_seconds !== null).map((m) => m.id);
     if (burnIds.length === 0) return messages;
 
