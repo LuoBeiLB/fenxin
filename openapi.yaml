@@ -2447,8 +2447,9 @@ paths:
 
         【业务规则与注意事项】
         - multipart/form-data 上传，文件字段名 file，单文件最大 50MB（超出返回 413）。
-        - 限流：每 IP 每分钟最多 10 次上传，超出返回 429（V5.8 新增接口级限流，防公网滥用磁盘写入）。
+        - 限流：每 IP 每分钟最多 30 次上传，超出返回 429（防公网滥用磁盘写入；V5.8.3 由 10 放宽至 30，正常聊天连发无感）。
         - 文件保存到服务端本地 UPLOAD_DIR（默认 ./uploads），落盘文件名为 <UUID><原扩展名>，通过 /uploads/<filename> 静态路径访问。
+        - 图片自动生成缩略图（V5.8.3）：480 宽 webp（质量 75，典型 30~80KB），存 uploads/thumb/，返回 thumb_url；聊天列表加载缩略图、点开大图加载原图。gif 跳过（保留动图）、非图片、生成失败时 thumb_url 为 null，前端回退用 url 即原图。
         - 返回的 file_name 为原始文件名（服务端已修正中文文件名的 latin1→utf8 编码问题）。
         - Word/Excel 文档由前端端内解析预览；后续迭代将切换 MinIO 对象存储 + 分片断点续传。
       requestBody:
@@ -2480,6 +2481,11 @@ paths:
                         type: string
                         description: 静态访问路径（/uploads/<filename>），发消息时填入 file_url
                         example: /uploads/9b1d2c3e-4f5a-4b6c-8d7e-9f0a1b2c3d4e.pdf
+                      thumb_url:
+                        type: string
+                        nullable: true
+                        description: 图片缩略图路径（/uploads/thumb/<UUID>_thumb.webp，480 宽 webp，V5.8.3）；聊天列表用它、点开大图用 url。非图片 / gif / 生成失败时为 null，前端回退用 url
+                        example: /uploads/thumb/9b1d2c3e-4f5a-4b6c-8d7e-9f0a1b2c3d4e_thumb.webp
                       file_name:
                         type: string
                         description: 原始文件名（UTF-8）
@@ -2504,7 +2510,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '429':
-          description: 触发限流（每 IP 每分钟 10 次）
+          description: 触发限流（每 IP 每分钟 30 次）
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

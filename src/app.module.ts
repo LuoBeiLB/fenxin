@@ -108,6 +108,9 @@ import { AppVersionModule } from './modules/app-version/app-version.module';
     ServeStaticModule.forRoot({
       rootPath: join(process.cwd(), process.env.UPLOAD_DIR || './uploads'),
       serveRoot: '/uploads',
+      // 静态附件强缓存：文件名是 UUID、内容不可变，客户端放心缓存 30 天；
+      // 二次进聊天页图片秒开，不再重复下载原图（V5.8.3）
+      serveStaticOptions: { maxAge: '30d', immutable: true },
     }),
     TokenModule,
     KeysModule,
