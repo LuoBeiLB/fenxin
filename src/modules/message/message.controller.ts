@@ -1,10 +1,10 @@
-import { Body, Controller, DefaultValuePipe, Get, Param, ParseIntPipe, Post, Put, Query } from '@nestjs/common';
+import { Body, Controller, DefaultValuePipe, Get, Param, ParseIntPipe, Patch, Post, Put, Query } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { MessageService } from './message.service';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { ResponseMessage } from '../../common/decorators/response-message.decorator';
 import { AuthPayload } from '../../common/guards/jwt-auth.guard';
-import { SendMessageDto, EditMessageDto, SearchMessagesDto } from './dto';
+import { SendMessageDto, EditMessageDto, SearchMessagesDto, UpdateOriginalFileDto } from './dto';
 
 @ApiTags('消息管理')
 @ApiBearerAuth()
@@ -84,6 +84,20 @@ export class MessageController {
       before,
       limit,  // service 内 Math.min(limit, 200) 二次兜底
     });
+  }
+
+  /**
+   * 补传原图地址（v5.8.7）：双上传策略——前端先发压缩版消息（file_url），原图上传完成后回填。
+   * 仅发送者本人、仅允许从空补填一次；已撤回/已焚毁消息不允许补。
+   */
+  @Patch(':id/original-file')
+  @ResponseMessage('原图已更新')
+  updateOriginalFile(
+    @CurrentUser() user: AuthPayload,
+    @Param('id') id: string,
+    @Body() dto: UpdateOriginalFileDto,
+  ) {
+    return this.messageService.updateOriginalFile(id, user.userId, dto.file_original_url);
   }
 
   @Put(':id')

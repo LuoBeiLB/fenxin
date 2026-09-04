@@ -33,6 +33,15 @@ export class Message {
   } })
   file_size: number | null;
 
+  /**
+   * 原图地址（v5.8.7 图片链路优化）：file_url 存前端压缩版（聊天流秒开、省 5Mbps 出带宽），
+   * 本字段存发送端原图，供「下载原图」使用。双上传策略见 docs/migration-20260904-image-original.sql。
+   * NULL = 无原图（老消息/纯文本/语音/压缩失败直传原图时），前端回退用 file_url 下载。
+   * 补传时序：先发消息（file_url=压缩版）→ 后台传原图 → PATCH /messages/:id/original-file 回填本字段。
+   */
+  @Column({ length: 500, nullable: true })
+  file_original_url: string | null;
+
   @Column({ length: 36, nullable: true })
   reply_to_id: string | null;
 

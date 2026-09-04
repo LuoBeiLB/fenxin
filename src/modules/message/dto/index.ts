@@ -38,6 +38,12 @@ export class SendMessageDto {
   @IsNumber()
   file_size?: number;
 
+  @ApiPropertyOptional({ description: '原图地址（v5.8.7）：file_url 为前端压缩版时，此字段存原图供下载原图。发送时可直接带，也可事后 PATCH /messages/:id/original-file 补传回填' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
+  file_original_url?: string;
+
   @ApiPropertyOptional()
   @IsOptional()
   @IsUUID()
@@ -82,6 +88,14 @@ export class EditMessageDto {
   @ApiProperty()
   @IsString()
   content: string;
+}
+
+/** PATCH /messages/:id/original-file：发送者补传原图地址（v5.8.7 双上传策略：压缩版先发、原图后补） */
+export class UpdateOriginalFileDto {
+  @ApiProperty({ description: '原图文件 URL（由 POST /upload 上传原图后获得）' })
+  @IsString()
+  @MaxLength(500)
+  file_original_url: string;
 }
 
 export class SearchMessagesDto {

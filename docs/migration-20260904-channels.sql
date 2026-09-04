@@ -1,6 +1,6 @@
 -- v5.8.6 个人频道（个人空间）P0 数据库迁移
 -- 幂等说明：重复执行报 Duplicate column name 属正常（说明已加过），可忽略
-USE burnmsg;
+USE yy;
 
 ALTER TABLE conversations
   ADD COLUMN visibility VARCHAR(20) NOT NULL DEFAULT 'public'

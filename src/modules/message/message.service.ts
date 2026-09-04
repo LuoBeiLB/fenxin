@@ -82,6 +82,7 @@ export class MessageService {
     fileUrl?: string;
     fileName?: string;
     fileSize?: number;
+    fileOriginalUrl?: string;
     replyToId?: string;
     burnTtlSeconds?: number;
     senderEphemeralPubkey?: string;
@@ -138,6 +139,7 @@ export class MessageService {
         file_url: params.fileUrl ?? null,
         file_name: params.fileName ?? null,
         file_size: params.fileSize ?? null,
+        file_original_url: params.fileOriginalUrl ?? null,
         reply_to_id: params.replyToId ?? null,
         // 点开才焚 v2：burn_ttl_seconds 非空 = 焚毁消息；
         // destroy_at 语义为兜底强制焚毁时间（env BURN_FALLBACK_TTL_HOURS，默认 24h），防止有人一直不点开导致消息永久留存
@@ -465,16 +467,37 @@ export class MessageService {
       await em.getRepository(Message).update({ reply_to_id: messageId }, { reply_to_id: null });
       await em.getRepository(Message).delete({ id: messageId });
     });
-    if (msg.file_url) {
+    // v5.8.7：压缩版 + 原图（如有）一并删除，避免原图成为焚毁残留
+    const urls = [msg.file_url, msg.file_original_url].filter(Boolean);
+    if (urls.length) {
       const fs = require('fs');
       const path = require('path');
       const uploadDir = path.resolve(process.cwd(), process.env.UPLOAD_DIR || './uploads');
-      try {
-        fs.unlinkSync(path.join(uploadDir, path.basename(msg.file_url)));
-      } catch {
-        // 文件可能已不存在，不影响销毁
+      for (const u of urls) {
+        try {
+          fs.unlinkSync(path.join(uploadDir, path.basename(u)));
+        } catch {
+          // 文件可能已不存在，不影响销毁
+        }
       }
     }
+  }
+
+  /**
+   * 补传原图地址（v5.8.7 双上传策略）：
+   * 前端先发压缩版消息（file_url，聊天流秒开），原图上传完成后再回填 file_original_url。
+   * 约束：① 仅发送者本人可补；② 仅允许从 NULL 补填一次（防止覆盖/篡改已回填的原图）；
+   * ③ 不允许补到已撤回/已焚毁的消息上。返回更新后的完整消息。
+   */
+  async updateOriginalFile(messageId: string, userId: string, fileOriginalUrl: string): Promise<Message> {
+    const repo = this.dataSource.getRepository(Message);
+    const msg = await repo.findOne({ where: { id: messageId } });
+    if (!msg) throw new NotFoundException('消息不存在');
+    if (msg.sender_id !== userId) throw new ForbiddenException('仅发送者本人可补传原图');
+    if (msg.is_recalled || msg.is_destroyed) throw new BadRequestException('消息已撤回或已焚毁，不能补传原图');
+    if (msg.file_original_url) throw new BadRequestException('原图已存在，不能重复补传');
+    await repo.update({ id: messageId }, { file_original_url: fileOriginalUrl });
+    return repo.findOne({ where: { id: messageId } });
   }
 
   /**
@@ -651,3 +674,4 @@ export class MessageService {
     return { list, total, page, pageSize };
   }
 }
+
