@@ -23,6 +23,7 @@ import { ContactModule } from './modules/contact/contact.module';
 import { ConversationModule } from './modules/conversation/conversation.module';
 import { MessageModule } from './modules/message/message.module';
 import { GroupModule } from './modules/group/group.module';
+import { ChannelModule } from './modules/channel/channel.module';
 import { UploadModule } from './modules/upload/upload.module';
 import { StatsModule } from './modules/stats/stats.module';
 import { AnnouncementModule } from './modules/announcement/announcement.module';
@@ -122,6 +123,7 @@ import { AppVersionModule } from './modules/app-version/app-version.module';
     ConversationModule,
     MessageModule,
     GroupModule,
+    ChannelModule,
     UploadModule,
     StatsModule,
     AnnouncementModule,

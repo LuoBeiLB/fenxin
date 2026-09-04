@@ -1,5 +1,6 @@
-import { IsString, IsUUID, IsIn, IsOptional, IsNumber, MaxLength, Length, Matches, IsArray, ArrayMaxSize } from 'class-validator';
+import { IsString, IsUUID, IsIn, IsOptional, IsNumber, IsInt, Min, Max, MaxLength, Length, Matches, IsArray, ArrayMaxSize } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { Type } from 'class-transformer';
 
 /** X25519 公钥 base64：32 字节 → 44 字符（含结尾 =） */
 const PUBKEY_BASE64_RE = /^[A-Za-z0-9+/]{43}=$/;
@@ -81,4 +82,40 @@ export class EditMessageDto {
   @ApiProperty()
   @IsString()
   content: string;
+}
+
+export class SearchMessagesDto {
+  @ApiProperty({ description: '搜索关键词（trim 后 2~64 字符；单字无法命中 ngram 二元分词，返回 400）', example: '项目进度' })
+  @IsString()
+  keyword: string;
+
+  @ApiPropertyOptional({ description: '限定会话 ID（UUID）；不传 = 搜索我所在的全部会话（权限仍在 SQL 层限定为我是成员的会话）' })
+  @IsOptional()
+  @IsUUID()
+  conversation_id?: string;
+
+  @ApiPropertyOptional({ description: '页码，从 1 开始', default: 1 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  page?: number = 1;
+
+  @ApiPropertyOptional({ description: '每页条数 1~50，默认 20', default: 20 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(50)
+  pageSize?: number = 20;
+
+  @ApiPropertyOptional({ description: '时间范围下界（ISO8601 日期或毫秒时间戳），只返回该时刻之后的消息' })
+  @IsOptional()
+  @IsString()
+  after?: string;
+
+  @ApiPropertyOptional({ description: '时间范围上界（ISO8601 日期或毫秒时间戳），只返回该时刻之前的消息' })
+  @IsOptional()
+  @IsString()
+  before?: string;
 }

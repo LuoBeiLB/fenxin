@@ -1563,6 +1563,115 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /messages/search:
+    get:
+      tags: [消息]
+      summary: 消息全局搜索（全文检索，v5.8.5 新增）
+      description: |-
+        【用途】跨我所在的全部会话按关键词全文搜索消息，支持限定单个会话、时间范围与分页。
+
+        【调用时机】用户在全局搜索入口输入关键词触发搜索时（可选：先选会话再搜、按时间范围过滤）。
+
+        【底层】MySQL FULLTEXT 索引 ft_messages_search(content, file_name) + ngram 二元分词，
+        响应目标 < 200ms（依赖 docs/migration-20260904-messages-fulltext.sql 已执行）。
+
+        【业务规则与注意事项】
+        - 搜索范围严格限定「我是成员的会话」：SQL 层 INNER JOIN conversation_members 焊死权限，
+          从查询结构上杜绝跨会话消息泄露，不依赖上层代码加过滤。
+        - keyword 必填，trim 后 2~64 字符；单字无法命中 ngram 二元分词，返回 400。
+        - 文本消息匹配 content；图片/语音/视频/文件消息匹配 file_name（文件名）。
+        - 仅明文消息可搜：加密消息（is_encrypted=true）后端无密钥、content 仅为「[加密消息]」占位，
+          直接排除；加密消息请走客户端本地搜索（客户端持有明文）。
+        - 点开才焚（burn_ttl_seconds 非空）与已焚毁（is_destroyed / destroy_at 到期）消息不纳入搜索。
+        - 已撤回消息（is_recalled=true）不纳入搜索。
+        - 传 conversation_id 时校验成员资格，非成员返回 403（与老接口 GET /messages/{conversationId}/search 行为一致）。
+        - 按 created_at 倒序分页（page/pageSize），返回 total 总命中数。
+        - content_snippet 为关键词上下文摘要：命中位置前后各约 15 字，越界补 …；
+          媒体消息（图/语音/视频/文件）的 snippet 为文件名。
+        - keyword 中的 BOOLEAN MODE 操作符字符（+ - > < ( ) ~ * " @）会被自动清洗，不会引发 SQL 错误。
+      parameters:
+        - name: keyword
+          in: query
+          required: true
+          schema: { type: string, minLength: 2, maxLength: 64 }
+          description: 搜索关键词（trim 后 2~64 字符；单字返回 400）
+          example: 项目进度
+        - name: conversation_id
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+          description: 限定会话 ID；不传 = 搜索我所在的全部会话。非该会话成员返回 403
+          example: 1b2c3d4e-5f6a-47b8-89c0-d1e2f3a4b5c6
+        - name: page
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, default: 1 }
+          description: 页码，从 1 开始
+          example: 1
+        - name: pageSize
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 50, default: 20 }
+          description: 每页条数，默认 20，最大 50
+          example: 20
+        - name: after
+          in: query
+          required: false
+          schema: { type: string }
+          description: 时间范围下界（ISO8601 日期或毫秒时间戳），只返回该时刻之后的消息
+          example: '2026-09-01T00:00:00Z'
+        - name: before
+          in: query
+          required: false
+          schema: { type: string }
+          description: 时间范围上界（ISO8601 日期或毫秒时间戳），只返回该时刻之前的消息
+          example: '2026-09-04T00:00:00Z'
+      responses:
+        '200':
+          description: 搜索成功，data.list 为匹配列表，data.total 为命中总数
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: ok }
+                  data:
+                    type: object
+                    properties:
+                      list:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            id: { type: string, format: uuid, description: 消息 ID }
+                            conversation_id: { type: string, format: uuid, description: 所属会话 ID }
+                            sender_id: { type: string, format: uuid, description: 发送者用户 ID }
+                            sender_name: { type: string, description: 发送者显示名（app_users.display_name，查不到时为 Unknown） }
+                            content_snippet: { type: string, description: 关键词上下文摘要（前后约 15 字，越界补 …）；媒体消息为文件名 }
+                            type: { type: string, enum: [text, image, voice, video, file], description: 消息类型 }
+                            is_encrypted: { type: boolean, example: false, description: 恒为 false（加密消息已在服务端排除） }
+                            created_at: { type: string, format: date-time, description: 消息发送时间 }
+                      total: { type: integer, description: 命中总数（不含分页截断） }
+                      page: { type: integer, description: 当前页码 }
+                      pageSize: { type: integer, description: 当前每页条数 }
+        '400':
+          description: 关键词为空/单字/超长/全部为非法字符，或 after/before 格式错误
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: 未携带或无效/过期 token；账号已停用或设备已下线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: conversation_id 限定的会话非成员
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+
   /messages/{conversationId}/search:
     get:
       tags: [消息]
@@ -2840,6 +2949,246 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /channels:
+    post:
+      tags: [个人频道]
+      summary: 创建我的频道
+      description: |
+        创建个人频道（个人空间），一人只能拥有一个频道（重复创建返回 409）。
+        创建后自动成为频道主（owner 成员）；频道默认公开（visibility=public），进频道广场可被自主订阅。
+        纯广播模式：仅频道主可发布内容（发消息走 POST /messages，服务端会拦截非频道主发送），
+        订阅者只读；消息收发/历史/WS 推送全部复用现有会话通道。
+        权限：登录用户。
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  maxLength: 200
+                  description: 频道名称（个人空间的名字）
+                  example: 萝卜的实验室
+                description:
+                  type: string
+                  maxLength: 1000
+                  description: 个人描述（对外展示在广场与详情页）
+                  example: 折腾加密通讯的日常，欢迎围观
+                avatar_url:
+                  type: string
+                  maxLength: 500
+                  description: 频道头像 URL
+      responses:
+        '201':
+          description: 创建成功，返回频道完整信息
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChannelDetail'
+        '400':
+          description: 参数校验失败（name 为空或超长）
+        '401':
+          description: 未登录或 token 失效
+        '409':
+          description: 你已创建过频道，一人只能拥有一个频道
+
+  /channels/mine:
+    get:
+      tags: [个人频道]
+      summary: 我的频道资料
+      description: 获取当前用户自己的频道（管理入口）；未创建过返回 404，前端引导去创建。
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: 频道完整信息
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChannelDetail'
+        '401':
+          description: 未登录或 token 失效
+        '404':
+          description: 你还没有创建频道
+
+  /channels/discover:
+    get:
+      tags: [个人频道]
+      summary: 频道广场
+      description: |
+        全部公开频道列表（type=channel 且 visibility=public），按订阅数降序（热门优先）、创建时间降序排列。
+        每项带 is_subscribed / is_owner 标记，前端据此渲染「订阅/已订阅」按钮。
+        只返回元信息（名称/描述/头像/订阅数/频道主），不返回任何消息内容。
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: page
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, default: 1 }
+          description: 页码（从 1 开始）
+        - name: pageSize
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+          description: 每页数量（1-100）
+      responses:
+        '200':
+          description: 频道列表（含我的订阅状态）
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ChannelSummary'
+                  total: { type: integer, description: 公开频道总数 }
+                  page: { type: integer }
+                  pageSize: { type: integer }
+        '401':
+          description: 未登录或 token 失效
+
+  /channels/{id}:
+    get:
+      tags: [个人频道]
+      summary: 频道详情
+      description: |
+        频道元信息（名称/描述/头像/订阅数/频道主/可见性），任何人可查。
+        注意：本接口不返回消息；内容流走 GET /messages/{conversationId}（该接口要求会话成员，
+        未订阅者会被 403——「只有订阅才能看」由数据层 INNER JOIN 保证，不靠前端隐藏）。
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+          description: 频道 ID（即 conversation ID）
+      responses:
+        '200':
+          description: 频道详情（带 is_subscribed / is_owner 标记）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChannelDetail'
+        '401':
+          description: 未登录或 token 失效
+        '404':
+          description: 频道不存在
+    patch:
+      tags: [个人频道]
+      summary: 修改频道资料
+      description: 修改频道名称/个人描述/头像/可见性，仅频道主可操作。visibility 切为 private 后频道从广场消失（P1 支持邀请链接订阅）。
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+          description: 频道 ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                  minLength: 1
+                  maxLength: 200
+                  description: 频道名称
+                description:
+                  type: string
+                  maxLength: 1000
+                  description: 个人描述
+                avatar_url:
+                  type: string
+                  maxLength: 500
+                  description: 频道头像 URL
+                visibility:
+                  type: string
+                  enum: [public, private]
+                  description: public=进广场可自主订阅；private=不进广场
+      responses:
+        '200':
+          description: 更新后的频道完整信息
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChannelDetail'
+        '400':
+          description: 参数校验失败
+        '401':
+          description: 未登录或 token 失效
+        '403':
+          description: 仅频道主可以修改频道资料
+        '404':
+          description: 频道不存在
+
+  /channels/{id}/subscribe:
+    post:
+      tags: [个人频道]
+      summary: 订阅频道
+      description: |
+        订阅公开频道：自动加入频道成员（role=member），频道出现在我的会话列表，可看全部内容流。
+        幂等：已订阅直接返回成功。私密频道（visibility=private）暂不支持自主订阅（P1 邀请链接）。
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+          description: 频道 ID
+      responses:
+        '201':
+          description: 订阅成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  conversation_id: { type: string, format: uuid, description: 频道（会话）ID }
+                  subscribed: { type: boolean, example: true }
+        '401':
+          description: 未登录或 token 失效
+        '403':
+          description: 私密频道暂不支持自主订阅
+        '404':
+          description: 频道不存在
+    delete:
+      tags: [个人频道]
+      summary: 退订频道
+      description: |
+        退订频道：移除我的订阅成员记录，频道从会话列表消失（历史消息保留在库中，重新订阅后可再看）。
+        幂等：未订阅直接返回成功。频道主不能退订自己的频道。
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+          description: 频道 ID
+      responses:
+        '200':
+          description: 已退订
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  conversation_id: { type: string, format: uuid, description: 频道（会话）ID }
+                  subscribed: { type: boolean, example: false }
+        '400':
+          description: 频道主不能退订自己的频道
+        '401':
+          description: 未登录或 token 失效
+        '404':
+          description: 频道不存在
+
   /keys:
     post:
       tags: [密钥]
@@ -3549,6 +3898,7 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
 
 components:
+
   securitySchemes:
     bearerAuth:
       type: http
@@ -3559,6 +3909,38 @@ components:
         Authorization: Bearer <access_token>
         默认有效期 7200 秒；每个受保护请求都会实时校验账号状态与设备存在性，账号停用或设备下线后 token 立即失效。
   schemas:
+    ChannelOwner:
+      type: object
+      description: 频道主公开信息（不含手机号等敏感字段）
+      properties:
+        id: { type: string, format: uuid }
+        display_name: { type: string, example: 萝卜 }
+        avatar_url: { type: string, nullable: true }
+    ChannelSummary:
+      type: object
+      description: 频道广场列表项（只有元信息，无任何消息内容）
+      properties:
+        id: { type: string, format: uuid, description: 频道 ID（即 conversation ID） }
+        name: { type: string, example: 萝卜的实验室 }
+        description: { type: string, nullable: true, description: 个人描述 }
+        avatar_url: { type: string, nullable: true }
+        member_count: { type: integer, description: 订阅数（含频道主） }
+        created_at: { type: string, format: date-time }
+        is_owner: { type: boolean, description: 是否我的频道 }
+        is_subscribed: { type: boolean, description: 是否已订阅 }
+        owner:
+          $ref: '#/components/schemas/ChannelOwner'
+    ChannelDetail:
+      type: object
+      description: 频道详情（创建/我的频道/修改接口的返回体）
+      allOf:
+        - $ref: '#/components/schemas/ChannelSummary'
+        - type: object
+          properties:
+            visibility: { type: string, enum: [public, private], description: 可见性 }
+            ai_enabled: { type: boolean, description: AI 成员开关（P2 预留，当前恒为 false） }
+            last_message_at: { type: string, format: date-time, nullable: true, description: 最近内容发布时间 }
+
     Error:
       type: object
       description: 统一错误响应（code 为 HTTP 状态码；参数校验失败时 message 为多条错误以 '; ' 拼接）

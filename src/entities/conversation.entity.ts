@@ -2,6 +2,9 @@ import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn, UpdateDateCol
 
 export type ConversationType = 'private' | 'group' | 'channel';
 
+/** 频道可见性：public=进频道广场可自主订阅；private=不进广场（P1 支持邀请链接订阅） */
+export type ChannelVisibility = 'public' | 'private';
+
 @Entity('conversations')
 export class Conversation {
   @PrimaryGeneratedColumn('uuid')
@@ -25,6 +28,14 @@ export class Conversation {
 
   @Column({ default: false })
   is_channel: boolean;
+
+  /** 频道可见性（仅 type=channel 有意义）：public=广场可见可自主订阅；private=不进广场 */
+  @Column({ length: 20, default: 'public' })
+  visibility: ChannelVisibility;
+
+  /** AI 成员开关（P2 预留）：开启后频道主可与 AI 对话，订阅者可围观 */
+  @Column({ default: false })
+  ai_enabled: boolean;
 
   @Column({ type: 'int', default: 0 })
   member_count: number;

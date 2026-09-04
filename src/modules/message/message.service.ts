@@ -19,6 +19,37 @@ function burnFallbackTtlMs(): number {
   return (Number.isFinite(hours) && hours > 0 ? hours : 24) * 3600 * 1000;
 }
 
+
+/** 解析搜索时间参数：ISO8601 字符串或毫秒时间戳（10~13 位）→ Date；非法抛 400 */
+function parseDateParam(name: 'after' | 'before', raw?: string): Date | undefined {
+  if (!raw) return undefined;
+  const d = /^\d{10,13}$/.test(raw) ? new Date(Number(raw)) : new Date(raw);
+  if (isNaN(d.getTime())) {
+    throw new BadRequestException(`${name} 参数格式错误，应为 ISO8601 日期或毫秒时间戳`);
+  }
+  return d;
+}
+
+/**
+ * 生成搜索结果摘要（content_snippet）：关键词首个命中位置前后各 15 个 Unicode 码点，越界补 …。
+ * 用 Array.from 按码点切片（emoji / 代理对安全），不用 SQL 的 SUBSTRING（其对 4 字节字符有截断风险）。
+ * 未直接命中完整 keyword（如多词 OR 命中分词组合）时兜底截前 34 个码点。
+ */
+function buildSnippet(text: string, keyword: string): string {
+  if (!text) return '';
+  const chars = Array.from(text);
+  const pos = text.toLowerCase().indexOf(keyword.toLowerCase());
+  if (pos < 0) {
+    const head = chars.slice(0, 34).join('');
+    return chars.length > 34 ? head + '…' : head;
+  }
+  const kwLen = Array.from(keyword).length;
+  const cpIdx = Array.from(text.slice(0, pos)).length;
+  const start = Math.max(0, cpIdx - 15);
+  const end = Math.min(chars.length, cpIdx + kwLen + 15);
+  return (start > 0 ? '…' : '') + chars.slice(start, end).join('') + (end < chars.length ? '…' : '');
+}
+
 @Injectable()
 export class MessageService {
   constructor(
@@ -63,11 +94,16 @@ export class MessageService {
     const memberRepo = this.dataSource.getRepository(ConversationMember);
     const receiptRepo = this.dataSource.getRepository(MessageReceipt);
 
-    await this.assertMember(params.conversationId, params.senderId);
+    const membership = await this.assertMember(params.conversationId, params.senderId);
 
     const conv = await convRepo.findOne({ where: { id: params.conversationId } });
     if (!conv) throw new NotFoundException('会话不存在');
     if (conv.dissolved_at) throw new ForbiddenException('群组已解散，不能再发送消息');
+
+    // 个人频道为纯广播（v5.8.6）：仅频道主（owner）可以发布内容，订阅者只读
+    if (conv.type === 'channel' && membership.role !== 'owner') {
+      throw new ForbiddenException('频道为广播模式，仅频道主可以发布内容');
+    }
 
     // 成员列表一次查询两用：@提及过滤（V5.8）+ 落库后建回执
     const members = await memberRepo.find({ where: { conversation_id: params.conversationId } });
@@ -497,5 +533,121 @@ export class MessageService {
 
     const messages = await qb.getMany();
     return messages.reverse();
+  }
+
+  /**
+   * 全局消息搜索（v5.8.5，GET /messages/search）：
+   * - 范围：我所在的全部会话 —— INNER JOIN conversation_members 在 SQL 层焊死权限，杜绝跨会话泄露；
+   *         传 conversationId 时先 assertMember 校验（非成员 403，与老会话内搜索接口行为一致）
+   * - 引擎：MySQL FULLTEXT（ft_messages_search(content, file_name) WITH PARSER ngram）；
+   *         MATCH 列清单必须与索引列完全一致才能命中索引
+   * - 过滤（与老 searchMessages 语义对齐并加固）：
+   *         加密消息（content 只是「[加密消息]」占位，密文在 cipher_text，服务端无明文）、
+   *         已焚毁（is_destroyed / destroy_at）、点开才焚（burn_ttl_seconds，防止搜索泄露受保护内容）、
+   *         已撤回（is_recalled）
+   * - 文本消息命中 content；图片/语音/视频/文件消息命中 file_name（2026-09-04 决策）
+   * - keyword trim 后 2~64 字符（ngram 最小切 2 字，单字 400）；清洗 BOOLEAN MODE 操作符防语法错
+   */
+  async searchGlobal(params: {
+    userId: string;
+    keyword: string;
+    conversationId?: string;
+    page?: number;
+    pageSize?: number;
+    after?: string;
+    before?: string;
+  }): Promise<{
+    list: Array<{
+      id: string;
+      conversation_id: string;
+      sender_id: string;
+      sender_name: string;
+      content_snippet: string;
+      type: string;
+      is_encrypted: boolean;
+      created_at: Date;
+    }>;
+    total: number;
+    page: number;
+    pageSize: number;
+  }> {
+    const keyword = (params.keyword ?? '').trim();
+    if (keyword.length < 2) {
+      throw new BadRequestException('关键词至少 2 个字符（中文按二元分词，单字无法命中）');
+    }
+    if (keyword.length > 64) {
+      throw new BadRequestException('关键词过长（最长 64 字符）');
+    }
+    // BOOLEAN MODE 操作符清洗：+ - > < ( ) ~ * " @ 会被 MySQL 当语法解析，直接移除防 500
+    const ftKeyword = keyword.replace(/[+\-><()~*"@]/g, ' ').replace(/\s+/g, ' ').trim();
+    if (!ftKeyword) {
+      throw new BadRequestException('关键词包含非法字符');
+    }
+    const afterDate = parseDateParam('after', params.after);
+    const beforeDate = parseDateParam('before', params.before);
+    const page = params.page || 1;
+    const pageSize = params.pageSize || 20;
+
+    if (params.conversationId) {
+      await this.assertMember(params.conversationId, params.userId);
+    }
+
+    const qb = this.dataSource
+      .getRepository(Message)
+      .createQueryBuilder('m')
+      .select('m.id', 'id')
+      .addSelect('m.conversation_id', 'conversation_id')
+      .addSelect('m.sender_id', 'sender_id')
+      .addSelect('m.type', 'type')
+      .addSelect('m.content', 'content')
+      .addSelect('m.file_name', 'file_name')
+      .addSelect('m.created_at', 'created_at')
+      .addSelect('u.display_name', 'sender_name')
+      .innerJoin(
+        ConversationMember,
+        'cm',
+        'cm.conversation_id = m.conversation_id AND cm.user_id = :uid',
+        { uid: params.userId },
+      )
+      .leftJoin(AppUser, 'u', 'u.id = m.sender_id')
+      .where('MATCH(m.content, m.file_name) AGAINST (:kw IN BOOLEAN MODE)', { kw: ftKeyword })
+      .andWhere('m.is_encrypted = :isEncrypted', { isEncrypted: false })
+      .andWhere('m.is_destroyed = :isDestroyed', { isDestroyed: false })
+      .andWhere('(m.destroy_at IS NULL OR m.destroy_at > :now)', { now: new Date() })
+      .andWhere('m.is_recalled = :isRecalled', { isRecalled: false })
+      .andWhere('m.burn_ttl_seconds IS NULL')
+      .orderBy('m.created_at', 'DESC')
+      .skip((page - 1) * pageSize)
+      .take(pageSize);
+
+    if (params.conversationId) {
+      qb.andWhere('m.conversation_id = :cid', { cid: params.conversationId });
+    }
+    if (afterDate) {
+      qb.andWhere('m.created_at > :after', { after: afterDate });
+    }
+    if (beforeDate) {
+      qb.andWhere('m.created_at < :before', { before: beforeDate });
+    }
+
+    // raw 拿列表（带别名列），getCount 单独算总数（COUNT 天然忽略 LIMIT/OFFSET）
+    const rows = await qb.getRawMany();
+    const total = await qb.getCount();
+
+    const list = rows.map((r: any) => {
+      // 文本消息用 content 生成摘要；媒体消息（图/语音/视频/文件）用 file_name
+      const source = (r.type === 'text' && r.content) || r.file_name || r.content || '';
+      return {
+        id: r.id,
+        conversation_id: r.conversation_id,
+        sender_id: r.sender_id,
+        sender_name: r.sender_name || 'Unknown',
+        content_snippet: buildSnippet(source, keyword),
+        type: r.type,
+        is_encrypted: false,
+        created_at: r.created_at,
+      };
+    });
+    return { list, total, page, pageSize };
   }
 }

@@ -59,8 +59,22 @@ export interface WsReceiptReadPayload {
 /** conversation:updated 的 payload */
 export interface WsConversationUpdatedPayload {
   conversation_id: string;
-  /** 触发原因：message=新消息/last_message_at 更新；created=新建会话；members=成员变动；info=群资料变更；dissolved=群被解散；owner_changed=群主转让 */
-  reason: 'message' | 'created' | 'members' | 'info' | 'dissolved' | 'owner_changed';
+  /**
+   * 触发原因：message=新消息/last_message_at 更新；created=新建会话；members=成员变动；
+   * info=群资料变更；dissolved=群被解散；owner_changed=群主转让；
+   * updated=频道资料变更（v5.8.6）；subscribed=订阅频道/退订频道（v5.8.6，频道从我的会话列表出现/消失）
+   * 前端对未识别的 reason 按默认逻辑刷新会话列表即可，无需单独适配
+   */
+  reason:
+    | 'message'
+    | 'created'
+    | 'members'
+    | 'info'
+    | 'dissolved'
+    | 'owner_changed'
+    | 'updated'
+    | 'subscribed'
+    | 'unsubscribed';
   /** 当 reason=owner_changed 时携带：新群主用户 ID（UUIDv4） */
   new_owner_id?: string;
 }

@@ -4,7 +4,7 @@ import { MessageService } from './message.service';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { ResponseMessage } from '../../common/decorators/response-message.decorator';
 import { AuthPayload } from '../../common/guards/jwt-auth.guard';
-import { SendMessageDto, EditMessageDto } from './dto';
+import { SendMessageDto, EditMessageDto, SearchMessagesDto } from './dto';
 
 @ApiTags('消息管理')
 @ApiBearerAuth()
@@ -29,6 +29,28 @@ export class MessageController {
       cipherNonce: dto.cipher_nonce,
       cipherText: dto.cipher_text,
       mentions: dto.mentions,
+    });
+  }
+
+  /**
+   * 全局消息搜索（v5.8.5）：跨我所在的全部会话搜索关键词，可传 conversation_id 限定单会话。
+   * 底层 MySQL FULLTEXT + ngram（索引见 docs/migration-20260904-messages-fulltext.sql，必须手工执行）。
+   * ⚠️ 必须声明在 @Get(':conversationId') 之前：NestJS 按声明顺序匹配路由，
+   *    放后面 'search' 会被 :conversationId 动态参数吞掉（表现为 404 / 空列表）。
+   */
+  @Get('search')
+  searchGlobal(
+    @CurrentUser() user: AuthPayload,
+    @Query() dto: SearchMessagesDto,
+  ) {
+    return this.messageService.searchGlobal({
+      userId: user.userId,
+      keyword: dto.keyword,
+      conversationId: dto.conversation_id,
+      page: dto.page,
+      pageSize: dto.pageSize,
+      after: dto.after,
+      before: dto.before,
     });
   }
 
