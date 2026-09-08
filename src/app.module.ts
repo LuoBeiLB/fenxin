@@ -25,6 +25,7 @@ import { MessageModule } from './modules/message/message.module';
 import { GroupModule } from './modules/group/group.module';
 import { ChannelModule } from './modules/channel/channel.module';
 import { UploadModule } from './modules/upload/upload.module';
+import { OssModule } from './modules/upload/oss.module';
 import { StatsModule } from './modules/stats/stats.module';
 import { AnnouncementModule } from './modules/announcement/announcement.module';
 import { FeedbackModule } from './modules/feedback/feedback.module';
@@ -125,6 +126,7 @@ import { AppVersionModule } from './modules/app-version/app-version.module';
     GroupModule,
     ChannelModule,
     UploadModule,
+    OssModule,
     StatsModule,
     AnnouncementModule,
     FeedbackModule,

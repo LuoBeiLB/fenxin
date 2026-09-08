@@ -11,6 +11,7 @@ import { Conversation } from '../../entities/conversation.entity';
 import { ConversationMember } from '../../entities/conversation-member.entity';
 import { AppUser } from '../../entities/app-user.entity';
 import { EventsGateway } from '../events/events.gateway';
+import { OssService } from '../upload/oss.service';
 import { WS_EVENTS } from '../events/events.types';
 
 /** 兜底强制焚毁时长（毫秒）：env BURN_FALLBACK_TTL_HOURS，默认 24 小时 */
@@ -41,7 +42,7 @@ function buildSnippet(text: string, keyword: string): string {
   const pos = text.toLowerCase().indexOf(keyword.toLowerCase());
   if (pos < 0) {
     const head = chars.slice(0, 34).join('');
-    return chars.length > 34 ? head + '…' : head;
+    return chars.length > 34 ? head + '…' : '';
   }
   const kwLen = Array.from(keyword).length;
   const cpIdx = Array.from(text.slice(0, pos)).length;
@@ -55,6 +56,7 @@ export class MessageService {
   constructor(
     private readonly dataSource: DataSource,
     private readonly events: EventsGateway,
+    private readonly oss: OssService,
   ) {}
 
   private async assertMember(conversationId: string, userId: string) {
@@ -449,7 +451,7 @@ export class MessageService {
       where: { message_id: messageId },
     });
 
-    const userRepo = this.dataSource.getRepository(AppUser);
+    const userRepo = await this.dataSource.getRepository(AppUser);
     return Promise.all(
       receipts.map(async (receipt) => {
         const user = await userRepo.findOne({ where: { id: receipt.user_id } });
@@ -479,6 +481,8 @@ export class MessageService {
         } catch {
           // 文件可能已不存在，不影响销毁
         }
+        // v5.9.0 OSS 外置：完整 http(s) URL 的附件（OSS 签名地址）同步删 OSS 对象，避免焚毁残留
+        if (/^https?:/.test(u)) await this.oss.deleteByUrl(u);
       }
     }
   }
@@ -674,4 +678,3 @@ export class MessageService {
     return { list, total, page, pageSize };
   }
 }
-

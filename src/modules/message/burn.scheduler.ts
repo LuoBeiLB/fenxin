@@ -5,6 +5,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Message } from '../../entities/message.entity';
 import { MessageReceipt } from '../../entities/message-receipt.entity';
+import { OssService } from '../upload/oss.service';
 
 /**
  * 阅后即焚调度器（点开才焚 v2）：每分钟扫描并彻底销毁两类消息——
@@ -17,7 +18,10 @@ import { MessageReceipt } from '../../entities/message-receipt.entity';
 export class BurnScheduler {
   private readonly logger = new Logger('BurnScheduler');
 
-  constructor(private readonly dataSource: DataSource) {}
+  constructor(
+    private readonly dataSource: DataSource,
+    private readonly oss: OssService,
+  ) {}
 
   @Cron(CronExpression.EVERY_MINUTE)
   async destroyExpiredMessages() {
@@ -82,6 +86,8 @@ export class BurnScheduler {
       } catch {
         // 文件可能已不存在（如未上传成功），不影响销毁流程
       }
+      // v5.9.0 OSS 外置：OSS 签名 URL 同步删除云端对象，避免焚毁残留
+      if (/^https?:/.test(m.file_url)) await this.oss.deleteByUrl(m.file_url);
     }
 
     this.logger.log(`Destroyed ${ids.length} expired message(s) (rows + attachments)`);
