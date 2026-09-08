@@ -20,6 +20,38 @@ function burnFallbackTtlMs(): number {
   return (Number.isFinite(hours) && hours > 0 ? hours : 24) * 3600 * 1000;
 }
 
+/**
+ * 音视频焚毁消息的消费窗口（秒）：max(用户设的 burn_ttl_seconds, 窗口值)。
+ * v5.8.9 播完才焚：reveal 只发内容并开启一个「消费窗口」，前端播放完成/放弃时调
+ * POST /messages/:id/consume 把自己的 burn_at 提前置为当下；窗口到期未 consume
+ * 则由 BurnScheduler 按既有规则兜底焚毁（防杀进程/断网导致永不销毁）。
+ * - duration > 0：窗口 = duration + BURN_MEDIA_BUFFER_SECONDS（默认 30s 缓冲，留给切后台接电话等场景）
+ * - duration 缺失：窗口 = BURN_MEDIA_DEFAULT_WINDOW_SECONDS（默认 300s）
+ * - 用户 ttl 更大时以 ttl 为准（用户设定的保护期不被缩短，如设 1 小时焚毁的窗口就是 1 小时）
+ */
+function burnMediaWindowSeconds(ttlSeconds: number, durationSeconds?: number): number {
+  const buffer = parseInt(process.env.BURN_MEDIA_BUFFER_SECONDS || '30', 10);
+  const fallbackWindow = parseInt(process.env.BURN_MEDIA_DEFAULT_WINDOW_SECONDS || '300', 10);
+  const bufferSec = Number.isFinite(buffer) && buffer > 0 ? buffer : 30;
+  const fallbackSec = Number.isFinite(fallbackWindow) && fallbackWindow > 0 ? fallbackWindow : 300;
+  const windowSec =
+    durationSeconds && durationSeconds > 0 ? durationSeconds + bufferSec : fallbackSec;
+  return Math.max(ttlSeconds, windowSec);
+}
+
+/** 视频文件扩展名（与前端 isVideoMsg 判断保持一致：前端发送视频实际走 type='file'，靠扩展名识别） */
+const VIDEO_FILE_EXT = /\.(mp4|webm|mov|m4v|mkv|avi|3gp)$/i;
+
+/**
+ * 是否音视频焚毁消息（v5.8.9 播完才焚的适用范围，对齐前端 is_media_burn 契约）：
+ * type 为 voice / video，或 type='file' 但 file_name 扩展名是视频格式。
+ * 文本 / 图片 / 普通文件焚毁消息不适用（reveal 即倒计时，无 consume）。
+ */
+function isMediaBurnMsg(msg: Pick<Message, 'type' | 'file_name'>): boolean {
+  if (msg.type === 'voice' || msg.type === 'video') return true;
+  return msg.type === 'file' && !!msg.file_name && VIDEO_FILE_EXT.test(msg.file_name);
+}
+
 
 /** 解析搜索时间参数：ISO8601 字符串或毫秒时间戳（10~13 位）→ Date；非法抛 400 */
 function parseDateParam(name: 'after' | 'before', raw?: string): Date | undefined {
@@ -84,6 +116,8 @@ export class MessageService {
     fileUrl?: string;
     fileName?: string;
     fileSize?: number;
+    /** 音视频时长（秒，v5.8.9 播完才焚）：语音=录音秒数、视频=播放器 metadata duration */
+    mediaDurationSeconds?: number;
     fileOriginalUrl?: string;
     replyToId?: string;
     burnTtlSeconds?: number;
@@ -141,6 +175,8 @@ export class MessageService {
         file_url: params.fileUrl ?? null,
         file_name: params.fileName ?? null,
         file_size: params.fileSize ?? null,
+        // v5.8.9 播完才焚：发送端上报音视频时长，reveal 时计算消费窗口（老消息 null 走默认窗口）
+        media_duration: params.mediaDurationSeconds ?? null,
         file_original_url: params.fileOriginalUrl ?? null,
         reply_to_id: params.replyToId ?? null,
         // 点开才焚 v2：burn_ttl_seconds 非空 = 焚毁消息；
@@ -196,6 +232,7 @@ export class MessageService {
       file_url: null,
       file_name: null,
       file_size: null,
+      file_original_url: null,
       cipher_nonce: null,
       cipher_text: null,
       sender_ephemeral_pubkey: null,
@@ -282,8 +319,11 @@ export class MessageService {
   /**
    * 点开查看焚毁消息：返回完整内容，并从点开时刻起为该用户开始倒计时焚毁。
    * 重复点开不重置计时；自己那份倒计时到期 / 兜底到期后一律按「已焚毁」404 处理。
+   *
+   * v5.8.9 播完才焚：voice/video 焚毁消息的倒计时为消费窗口（max(ttl, 媒体时长+缓冲)），
+   * 返回 media_burn_pending / consume_deadline 提示前端播完调 consume 提前焚毁。
    */
-  async revealMessage(messageId: string, userId: string) {
+  async revealMessage(messageId: string, userId: string, mediaDurationSeconds?: number) {
     const msgRepo = this.dataSource.getRepository(Message);
     const receiptRepo = this.dataSource.getRepository(MessageReceipt);
 
@@ -321,7 +361,15 @@ export class MessageService {
 
     if (!receipt.revealed_at) {
       // 首次点开：开始该用户的焚毁倒计时，点开即已读
-      const burnAt = new Date(now.getTime() + msg.burn_ttl_seconds * 1000);
+      // v5.8.9 播完才焚（仅音视频焚毁消息，含 type=file 的视频扩展名）：倒计时不再是短 ttl
+      // （防 10s ttl 焚毁 30s 视频），而是 max(ttl, 消费窗口)——窗口内可反复播放；
+      // 前端播完/放弃时调 consume 提前焚，窗口到期未调则 BurnScheduler 按既有规则兜底焚毁。
+      // 时长优先级：发送时存库的 media_duration > reveal 请求带的 media_duration_seconds > 默认窗口。
+      const isMedia = isMediaBurnMsg(msg);
+      const burnSeconds = isMedia
+        ? burnMediaWindowSeconds(msg.burn_ttl_seconds, msg.media_duration ?? mediaDurationSeconds)
+        : msg.burn_ttl_seconds;
+      const burnAt = new Date(now.getTime() + burnSeconds * 1000);
       await receiptRepo.update(receipt.id, {
         revealed_at: now,
         burn_at: burnAt,
@@ -349,6 +397,95 @@ export class MessageService {
         0,
         Math.ceil((new Date(receipt.burn_at!).getTime() - now.getTime()) / 1000),
       ),
+      // v5.8.9 播完才焚（仅音视频焚毁消息）：media_burn_pending=true 提示前端
+      // 播放完成/放弃时调 POST /messages/:id/consume 提前焚毁（对齐前端契约字段名）；
+      // consume_deadline = 消费窗口截止（ISO8601），到点未 consume 由调度器兜底焚毁。
+      // 文本/图片焚毁消息两者均为 undefined / false，老前端可安全忽略新增字段。
+      media_burn_pending: isMediaBurnMsg(msg),
+      consume_deadline: isMediaBurnMsg(msg) && receipt.burn_at
+        ? new Date(receipt.burn_at).toISOString()
+        : undefined,
+    };
+  }
+
+  /**
+   * 消费音视频焚毁消息（v5.8.9 播完才焚）：前端播放完成或中途放弃时调用。
+   * 语义 = 把「该成员这份内容」的焚毁截止时间（burn_at）提前置为当下——此后他再 reveal
+   * 即得「已焚毁」；物理删除仍由 BurnScheduler 统一执行（所有接收方都到期才删行删文件，
+   * 群聊「各看各的」语义不变，未看成员不受影响）。
+   * - 幂等：重复调用 / 自己窗口已到期 / 消息已被调度器物理删除 → 均返回 already=true 成功
+   * - 仅音视频焚毁消息支持（voice/video 或 file+视频扩展名，对齐前端 is_media_burn 契约）；
+   *   必须先 reveal（拿到过内容才谈得上消费）
+   * - 返回焚毁视图：is_blurred=true、content/file_url 置 null、burned=true（对齐前端契约）
+   * - 广播 message:consumed 事件：对端与本人其他设备实时切「已焚毁」态
+   */
+  async consumeMessage(messageId: string, userId: string) {
+    const msgRepo = this.dataSource.getRepository(Message);
+    const receiptRepo = this.dataSource.getRepository(MessageReceipt);
+
+    // 与调度器竞态：消息行可能已被物理删除 → 视为已焚毁，幂等成功
+    const msg = await msgRepo.findOne({ where: { id: messageId } });
+    if (!msg) return { burned: true, already: true };
+
+    await this.assertMember(msg.conversation_id, userId);
+    if (!msg.burn_ttl_seconds) {
+      throw new BadRequestException('该消息不是焚毁消息，无需消费');
+    }
+    if (!isMediaBurnMsg(msg)) {
+      throw new BadRequestException('仅音视频焚毁消息支持播完才焚（consume）');
+    }
+    if (msg.is_recalled) throw new BadRequestException('消息已撤回');
+
+    const receipt = await receiptRepo.findOne({
+      where: { message_id: messageId, user_id: userId },
+    });
+    // 未点开过（无 receipt 或从未 reveal）：没拿过内容谈不上消费
+    if (!receipt || !receipt.revealed_at) {
+      throw new BadRequestException('请先点开查看后再消费');
+    }
+
+    const now = new Date();
+    // 自己这份已到期（已 consume 过 / 消费窗口已烧完）→ 幂等成功
+    // 返回焚毁视图（对齐前端契约：200 + 已焚毁的消息结构，内容字段置 null，不吐密文）
+    if (receipt.burn_at && new Date(receipt.burn_at).getTime() <= now.getTime()) {
+      return {
+        id: msg.id,
+        conversation_id: msg.conversation_id,
+        type: msg.type,
+        is_blurred: true,
+        content: null,
+        file_url: null,
+        file_original_url: null,
+        burn_at: receipt.burn_at,
+        burned: true,
+        already: true,
+      };
+    }
+
+    // 核心动作：把自己这份的钟拨到现在（物理删除交给调度器按既有规则统一执行）
+    await receiptRepo.update(receipt.id, { burn_at: now });
+
+    // 广播消费事件：对端与本人其他在线设备实时切「已焚毁」态
+    const memberIds = await this.getMemberUserIds(msg.conversation_id);
+    this.events.emitToUsers(WS_EVENTS.MESSAGE_CONSUMED, memberIds, {
+      conversation_id: msg.conversation_id,
+      message_id: messageId,
+      user_id: userId,
+      consumed_at: now.toISOString(),
+    });
+
+    // 返回焚毁视图（前端契约：is_blurred=true + content/file_url 置 null + burned=true）
+    return {
+      id: msg.id,
+      conversation_id: msg.conversation_id,
+      type: msg.type,
+      is_blurred: true,
+      content: null,
+      file_url: null,
+      file_original_url: null,
+      burn_at: now.toISOString(),
+      burned: true,
+      already: false,
     };
   }
 

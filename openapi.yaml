@@ -1450,6 +1450,17 @@ paths:
                   type: integer
                   description: 附件大小（字节）
                   example: 204800
+                file_original_url:
+                  type: string
+                  maxLength: 500
+                  description: 原图地址（v5.8.7 双上传）：file_url 为前端压缩版时此字段存原图，供「下载原图」用；发送时可直接带，也可事后 PATCH /messages/{id}/original-file 补传回填
+                  example: /uploads/9b1d2c3e-4f5a-4b6c-8d7e-9f0a1b2c3d4e-orig.jpg
+                media_duration_seconds:
+                  type: integer
+                  minimum: 1
+                  maximum: 7200
+                  description: 音视频时长（秒，v5.8.9 播完才焚）：语音=录音时长、视频=播放器 metadata duration。音视频焚毁消息点开后的消费窗口 = max(burn_ttl_seconds, media_duration_seconds + 缓冲30s)，确保播完才焚；不传则 reveal 时走默认窗口 300s
+                  example: 30
                 reply_to_id:
                   type: string
                   format: uuid
@@ -1457,7 +1468,7 @@ paths:
                   example: 5e6f7a8b-9c0d-41e2-83f4-a5b6c7d8e9f0
                 burn_ttl_seconds:
                   type: integer
-                  description: 点开才焚：点开查看后多少秒焚毁（如 5）；不传 = 普通消息永久保留。焚毁消息对全员先给马赛克占位，调 POST /messages/{id}/reveal 点开才下发内容并开始各自倒计时
+                  description: 点开才焚：点开查看后多少秒焚毁（如 5）；不传 = 普通消息永久保留。焚毁消息对全员先给马赛克占位，调 POST /messages/{id}/reveal 点开才下发内容并开始各自倒计时。音视频焚毁消息（voice/video 或 file+视频扩展名）的倒计时为消费窗口 = max(burn_ttl_seconds, media_duration_seconds+30s 缓冲)，播完/放弃时调 POST /messages/{id}/consume 提前焚毁
                   example: 5
                 cipher_text:
                   type: string
@@ -1871,7 +1882,7 @@ paths:
   /messages/{id}/reveal:
     post:
       tags: [消息]
-      summary: 点开查看焚毁消息（返回完整内容并开始该用户的焚毁倒计时）
+      summary: 点开查看焚毁消息（音视频进入消费窗口，播完调 consume 提前焚毁）
       description: |-
         【用途】点开一条焚毁消息（burn_ttl_seconds 非空）：首次调用返回完整内容，并从点开时刻起为当前用户开始倒计时焚毁。
 
@@ -1879,11 +1890,27 @@ paths:
 
         【业务规则与注意事项】
         - 仅会话成员可点开，非成员返回 403。
-        - 首次点开：写入 revealed_at=当前时间、burn_at=当前时间+burn_ttl_seconds、is_read=true，并广播已读回执（receipt:read，发送方实时看到「对方已点开」）。
+        - 首次点开：写入 revealed_at=当前时间、burn_at=当前时间+倒计时秒数、is_read=true，并广播已读回执（receipt:read，发送方实时看到「对方已点开」）。
         - 重复点开不重置计时：在 burn_at 到期前重复调用返回同样的内容与剩余秒数。
-        - 返回完整消息 + is_blurred=false + burn_at（该用户的焚毁截止时间）+ remain_seconds（剩余秒数），前端拿到后跑本地倒计时，到 0 就把消息从界面移除。
+        - v5.8.9 播完才焚（仅音视频焚毁消息）：is_media_burn 判断规则 = type 为 voice/video，或 type='file' 且 file_name 扩展名 ∈ {mp4,webm,mov,m4v,mkv,avi,3gp}（与前端 isVideoMsg 一致，前端发视频实际走 type='file'）。音视频焚毁消息首次点开的倒计时为「消费窗口」= max(burn_ttl_seconds, 媒体时长 + 30s 缓冲)，防「10s 焚毁 + 30s 视频」播不完就被焚；窗口内可反复播放，前端播放完成/中途放弃时调 POST /messages/{id}/consume 提前焚毁，窗口到期未调则由调度器兜底焚毁（防杀进程/断网漏调 consume）。时长优先级：发送时存库的 media_duration > 本请求 media_duration_seconds > 默认窗口 300s。
+        - 文本/图片/普通文件焚毁消息：reveal 逻辑完全不变（严格按 burn_ttl_seconds 倒计时），无 consume。
+        - 返回完整消息 + is_blurred=false + burn_at（该用户的焚毁截止时间）+ remain_seconds（剩余秒数；音视频=消费窗口剩余，其余=倒计时剩余），前端拿到后跑本地倒计时，到 0 就把消息从界面移除。
+        - 音视频焚毁消息额外返回 media_burn_pending=true（提示前端要等播放完再调 consume）与 consume_deadline（消费窗口截止，ISO8601）；文本/图片焚毁消息 media_burn_pending=false、consume_deadline 缺省，老前端可安全忽略。
         - 已到期（自己那份 burn_at 已过，或兜底 destroy_at 已过）返回 404「消息已焚毁」。
         - 非焚毁消息（burn_ttl_seconds 为空）返回 400「该消息不是焚毁消息，无需点开」；已撤回消息返回 400。
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                media_duration_seconds:
+                  type: integer
+                  minimum: 1
+                  maximum: 7200
+                  description: 音视频时长（秒，1~7200，可选）。仅音视频焚毁消息生效：消费窗口 = max(burn_ttl_seconds, 时长+缓冲30s)。时长优先用发送时存库的 media_duration，本参数仅在存库值缺失时兜底（老消息）；都不传走默认窗口 300s。文本/图片焚毁消息忽略此参数
+                  example: 30
       parameters:
         - name: id
           in: path
@@ -1893,7 +1920,7 @@ paths:
           example: 5e6f7a8b-9c0d-41e2-83f4-a5b6c7d8e9f0
       responses:
         '200':
-          description: 点开成功（message 为「已点开」），data 为完整 Message + burn_at + remain_seconds + is_blurred=false
+          description: 点开成功（message 为「已点开」），data 为完整 Message + burn_at + remain_seconds + is_blurred=false；音视频焚毁消息额外带 media_burn_pending=true 与 consume_deadline
           content:
             application/json:
               schema:
@@ -1902,7 +1929,18 @@ paths:
                   code: { type: integer, example: 0 }
                   message: { type: string, example: 已点开 }
                   data:
-                    $ref: '#/components/schemas/Message'
+                    allOf:
+                      - $ref: '#/components/schemas/Message'
+                      - type: object
+                        properties:
+                          media_burn_pending:
+                            type: boolean
+                            description: true=音视频焚毁消息（voice/video 或 file+视频扩展名），已进入「消费窗口」，前端播放完成/放弃时调 POST /messages/{id}/consume 提前焚毁；false/缺省=文本/图片等普通焚毁消息（reveal 即倒计时，无 consume）
+                            example: true
+                          consume_deadline:
+                            type: string
+                            format: date-time
+                            description: 消费窗口截止时间（ISO8601，仅音视频焚毁消息返回）；窗口内可反复播放，到点未 consume 由调度器兜底焚毁
         '400':
           description: 非焚毁消息 / 消息已撤回
           content:
@@ -1920,6 +1958,69 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '404':
           description: 消息不存在或已焚毁（倒计时到期 / 兜底到期）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /messages/{id}/consume:
+    post:
+      tags: [消息]
+      summary: 消费音视频焚毁消息（播放完成/中途放弃时调用，播完才焚）
+      description: |-
+        【用途】v5.8.9 播完才焚：音视频焚毁消息（is_media_burn：type 为 voice/video，或 type='file' 且 file_name 扩展名 ∈ {mp4,webm,mov,m4v,mkv,avi,3gp}）在播放完成或用户中途退出播放器/离开聊天页时调用，把当前用户这份消息的焚毁截止时间（burn_at）提前置为当下——此后他再 reveal 即得「已焚毁」。
+
+        【调用时机】前端监听语音/视频 ended 事件，或用户关闭播放器、切换页面、离开聊天页时。请求体为空对象即可。
+
+        【业务规则与注意事项】
+        - 仅会话成员可消费自己的那份，非成员 403（鉴权 + 归属校验与 reveal 一致，不能焚别人的消息）。
+        - 仅音视频焚毁消息支持：文本/图片/普通文件焚毁消息走 reveal 倒计时，consume 返回 400（不能被提前强焚）。
+        - 必须先 reveal（拿过内容才谈得上消费）：未点开过返回 400「请先点开查看后再消费」。
+        - 幂等：重复调用、自己窗口已到期（已消费过/烧完）、消息已被调度器物理删除（竞态）均返回 200 成功（already=true），前端 ended + 退出双触发不报错。
+        - 群聊「各看各的」语义不变：consume 只焚当前用户这份，其他成员不受影响；物理删除仍由调度器在全员到期后统一执行（删回执 + 断引用 + 删行 + 删磁盘/OSS 附件）。
+        - 成功后广播 message:consumed（WS），对端与本人其他在线设备实时切「已焚毁」态。
+        - 返回焚毁视图：is_blurred=true、content/file_url/file_original_url=null、burned=true、already（false=本次消费生效 / true=此前已焚）。
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+          description: 消息 ID（UUID）
+          example: 5e6f7a8b-9c0d-41e2-83f4-a5b6c7d8e9f0
+      responses:
+        '200':
+          description: 已消费（幂等，重复调用也返回 200）；message 为「已消费，进入焚毁」，data 为焚毁视图（内容字段已置 null，不吐密文）
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: 已消费，进入焚毁 }
+                  data:
+                    type: object
+                    properties:
+                      id: { type: string, format: uuid, description: 消息 ID }
+                      conversation_id: { type: string, format: uuid, description: 会话 ID }
+                      type: { type: string, description: 消息类型（voice / video / file） }
+                      is_blurred: { type: boolean, example: true, description: 已焚毁占位态 }
+                      content: { type: string, nullable: true, example: null, description: 已焚毁，内容置 null }
+                      file_url: { type: string, nullable: true, example: null, description: 已焚毁，附件地址置 null }
+                      file_original_url: { type: string, nullable: true, example: null, description: 已焚毁，原图地址置 null }
+                      burn_at: { type: string, format: date-time, description: 焚毁时间（本次消费生效时刻，或此前到期时刻） }
+                      burned: { type: boolean, example: true, description: 已焚毁标志（对齐前端契约） }
+                      already: { type: boolean, example: false, description: true=此前已焚毁（幂等命中）；false=本次消费生效 }
+        '400':
+          description: 非焚毁消息 / 非音视频焚毁消息（文本/图片/普通文件不支持 consume）/ 未点开过 / 消息已撤回
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: 未携带或无效/过期 token；账号已停用或设备已下线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: 非会话成员（Access denied to this conversation）
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -4114,6 +4215,17 @@ components:
           nullable: true
           description: 附件大小（字节）
           example: 204800
+        file_original_url:
+          type: string
+          nullable: true
+          maxLength: 500
+          description: 原图地址（v5.8.7 双上传）：file_url 为压缩版时存原图供「下载原图」；NULL = 无原图（老消息/纯文本/语音），前端回退用 file_url。马赛克态与已焚毁态均为 null
+          example: /uploads/9b1d2c3e-orig.jpg
+        media_duration:
+          type: integer
+          nullable: true
+          description: 音视频时长（秒，v5.8.9 播完才焚）：发送端上报（语音=录音秒数、视频=播放器 metadata duration）；焚毁消费窗口 = max(burn_ttl_seconds, media_duration + 30s 缓冲)。NULL = 未上报（老消息走默认窗口 300s）
+          example: 30
         reply_to_id:
           type: string
           format: uuid

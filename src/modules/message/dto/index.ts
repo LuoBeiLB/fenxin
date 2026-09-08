@@ -38,6 +38,13 @@ export class SendMessageDto {
   @IsNumber()
   file_size?: number;
 
+  @ApiPropertyOptional({ description: '音视频时长（秒，v5.8.9 播完才焚）：语音=录音时长、视频=播放器 metadata duration。焚毁消息点开后的消费窗口 = max(burn_ttl_seconds, media_duration_seconds + 缓冲30s)，确保播完才焚；不传则 reveal 时走默认窗口' })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(7200)
+  media_duration_seconds?: number;
+
   @ApiPropertyOptional({ description: '原图地址（v5.8.7）：file_url 为前端压缩版时，此字段存原图供下载原图。发送时可直接带，也可事后 PATCH /messages/:id/original-file 补传回填' })
   @IsOptional()
   @IsString()
@@ -88,6 +95,26 @@ export class EditMessageDto {
   @ApiProperty()
   @IsString()
   content: string;
+}
+
+/**
+ * POST /messages/:id/reveal body（v5.8.9 播完才焚）：音视频焚毁消息点开时可带媒体时长，
+ * 后端据此计算「消费窗口」= max(用户设的 burn_ttl_seconds, 时长 + BURN_MEDIA_BUFFER_SECONDS)。
+ * 时长优先用发送时存库的 media_duration，本参数仅在存库值缺失时兜底（老消息）。
+ * 都不传 → 窗口用 BURN_MEDIA_DEFAULT_WINDOW_SECONDS 兜底。文本/图片焚毁消息忽略此参数（逻辑不变）。
+ */
+export class RevealMessageDto {
+  @ApiPropertyOptional({
+    description:
+      '音视频时长（秒，1~7200）。仅音视频焚毁消息生效（voice/video 或 file+视频扩展名）：消费窗口 = max(ttl, 时长+缓冲)；窗口内可反复播放，播放完成/放弃时前端调 POST /messages/:id/consume 提前焚毁，窗口到期未调则调度器兜底焚毁',
+    example: 30,
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(7200)
+  media_duration_seconds?: number;
 }
 
 /** PATCH /messages/:id/original-file：发送者补传原图地址（v5.8.7 双上传策略：压缩版先发、原图后补） */

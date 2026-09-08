@@ -42,6 +42,14 @@ export class Message {
   @Column({ length: 500, nullable: true })
   file_original_url: string | null;
 
+  /**
+   * 音视频时长（秒，v5.8.9 播完才焚）：发送端上报（语音=录音秒数、视频=播放器 metadata duration）。
+   * 焚毁消息 reveal 时消费窗口 = max(burn_ttl_seconds, media_duration + BURN_MEDIA_BUFFER_SECONDS)，
+   * 保证「10s 焚毁 + 30s 视频」这类组合能播完再焚。NULL = 未上报，reveal 走默认窗口兜底。
+   */
+  @Column({ type: 'int', nullable: true })
+  media_duration: number | null;
+
   @Column({ length: 36, nullable: true })
   reply_to_id: string | null;
 

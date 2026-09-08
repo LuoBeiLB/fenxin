@@ -11,6 +11,8 @@ export const WS_EVENTS = {
   MESSAGE_EDITED: 'message:edited',
   /** 消息被撤回 */
   MESSAGE_RECALLED: 'message:recalled',
+  /** 音视频焚毁消息被消费（v5.8.9 播完才焚）：前端播放完成/放弃调 consume，对端与本人其他设备实时切「已焚毁」态 */
+  MESSAGE_CONSUMED: 'message:consumed',
   /** 已读回执（谁读到了哪条消息） */
   RECEIPT_READ: 'receipt:read',
   /** 会话列表刷新信号（新建会话 / last_message_at 变化 / 成员变动） */
@@ -43,6 +45,16 @@ export interface WsMessageRecalledPayload {
   message_id: string;
   /** 撤回时间（ISO8601） */
   recalled_at: string;
+}
+
+/** message:consumed 的 payload（v5.8.9 播完才焚：音视频焚毁消息被消费） */
+export interface WsMessageConsumedPayload {
+  conversation_id: string;
+  message_id: string;
+  /** 执行消费的用户 ID（谁的这份被焚了） */
+  user_id: string;
+  /** 消费时间（ISO8601） */
+  consumed_at: string;
 }
 
 /** receipt:read 的 payload */
@@ -145,6 +157,7 @@ export interface WsEventPayloadMap {
   'message:new': WsMessagePayload;
   'message:edited': WsMessagePayload;
   'message:recalled': WsMessageRecalledPayload;
+  'message:consumed': WsMessageConsumedPayload;
   'receipt:read': WsReceiptReadPayload;
   'conversation:updated': WsConversationUpdatedPayload;
   'announcement:new': WsAnnouncementNewPayload;

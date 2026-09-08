@@ -4,7 +4,7 @@ import { MessageService } from './message.service';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { ResponseMessage } from '../../common/decorators/response-message.decorator';
 import { AuthPayload } from '../../common/guards/jwt-auth.guard';
-import { SendMessageDto, EditMessageDto, SearchMessagesDto, UpdateOriginalFileDto } from './dto';
+import { SendMessageDto, EditMessageDto, SearchMessagesDto, UpdateOriginalFileDto, RevealMessageDto } from './dto';
 
 @ApiTags('消息管理')
 @ApiBearerAuth()
@@ -23,6 +23,7 @@ export class MessageController {
       fileUrl: dto.file_url,
       fileName: dto.file_name,
       fileSize: dto.file_size,
+      mediaDurationSeconds: dto.media_duration_seconds,
       replyToId: dto.reply_to_id,
       burnTtlSeconds: dto.burn_ttl_seconds,
       senderEphemeralPubkey: dto.sender_ephemeral_pubkey,
@@ -113,11 +114,32 @@ export class MessageController {
     return null;
   }
 
-  /** 点开查看焚毁消息：返回完整内容并从点开时刻起开始该用户的焚毁倒计时 */
+  /**
+   * 点开查看焚毁消息：返回完整内容并从点开时刻起开始该用户的焚毁倒计时。
+   * v5.8.9 播完才焚：音视频焚毁消息的倒计时为「消费窗口」（max(ttl, 媒体时长+缓冲)），
+   * body 可带 media_duration_seconds（前端播放器 metadata 时长，仅存库缺失时兜底）；
+   * 返回 media_burn_pending=true 提示前端播放完成/放弃时调 POST /messages/:id/consume
+   * 提前焚毁。文本/图片逻辑不变。
+   */
   @Post(':id/reveal')
   @ResponseMessage('已点开')
-  reveal(@CurrentUser() user: AuthPayload, @Param('id') id: string) {
-    return this.messageService.revealMessage(id, user.userId);
+  reveal(
+    @CurrentUser() user: AuthPayload,
+    @Param('id') id: string,
+    @Body() dto?: RevealMessageDto,
+  ) {
+    return this.messageService.revealMessage(id, user.userId, dto?.media_duration_seconds);
+  }
+
+  /**
+   * 消费音视频焚毁消息（v5.8.9 播完才焚）：前端播放完成/中途放弃时调用，
+   * 后端把该用户的焚毁截止时间提前置为当下（此后再 reveal 即「已焚毁」；物理删除仍由
+   * 调度器统一执行，群聊未看成员不受影响）。幂等接口：重复调用/已焚毁均返回成功。
+   */
+  @Post(':id/consume')
+  @ResponseMessage('已消费，进入焚毁')
+  consume(@CurrentUser() user: AuthPayload, @Param('id') id: string) {
+    return this.messageService.consumeMessage(id, user.userId);
   }
 
   /** :id 为会话 ID（与旧版 API 保持一致） */
