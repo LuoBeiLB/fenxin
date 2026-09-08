@@ -110,9 +110,18 @@ export class GroupService {
     );
   }
 
-  // 系统管理员（operatorRole=admin，数据库默认管理员）可移除任意群的成员；否则仅本群群主可移除
+  // 系统管理员（operatorRole=admin，数据库默认管理员）可移除任意群的成员；否则仅本群群主可移除；
+  // v5.9.2：成员可移除自己（主动退群），无需群主/管理员权限
   async removeMember(conversationId: string, targetUserId: string, operatorId: string, operatorRole?: string): Promise<void> {
-    if (operatorRole !== 'admin') {
+    const selfLeave = targetUserId === operatorId;
+    if (selfLeave) {
+      // 主动退群：仅校验自己是本群成员；群主不能退群（需先转让群主或解散群组）
+      const membership = await this.getMembership(conversationId, operatorId);
+      if (!membership) throw new NotFoundException('不在该群成员中，无法退群');
+      if (membership.role === 'owner') {
+        throw new ForbiddenException('群主不能移除自己退群，请先转让群主或解散群组');
+      }
+    } else if (operatorRole !== 'admin') {
       await this.assertOwner(conversationId, operatorId, 'remove members');
     }
 

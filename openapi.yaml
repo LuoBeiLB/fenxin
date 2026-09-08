@@ -46,7 +46,7 @@ tags:
   - name: 消息
     description: 消息管理：发送（含阅后即焚）、历史消息游标分页、编辑、撤回、已读标记与消息回执。
   - name: 群组
-    description: 群组/频道管理：建群、群资料、群成员增删（群内仅 owner 群主 / member 成员两种角色；系统管理员 app_users.role=admin 可跨群查看成员与移除成员）。
+    description: 群组/频道管理：建群、群资料、群成员增删（群内仅 owner 群主 / member 成员两种角色；系统管理员 app_users.role=admin 可跨群查看成员与移除成员；普通成员可移除自己=主动退群）。
   - name: 文件上传
     description: 消息附件上传（multipart），返回的 url 在发消息时填入 file_url。
   - name: 审计日志
@@ -2607,10 +2607,10 @@ paths:
         【调用时机】群主在成员列表中执行「移出群聊」时；或系统管理员在管理后台移除任意群成员时。
 
         【业务规则与注意事项】
-        - 两种调用身份：本群群主（owner），或系统管理员（app_users.role=admin，数据库默认管理员）——系统管理员可移除**任意群**的成员；普通成员调用返回 403（Only group owner can remove members）。群内无管理员角色。
-        - 源码未对「本人退群」做单独豁免，普通成员调用同样返回 403。
-        - 群主不可被移除，尝试移除群主返回 403（Cannot remove the group owner）。
-        - 移除成功后同步更新会话 member_count。
+        - 三种调用身份：① 本群群主（owner）；② 系统管理员（app_users.role=admin，数据库默认管理员，可移除**任意群**的成员）；③ **本群成员移除自己=主动退群（v5.9.2 新增，userId 传自己的用户 ID），无需群主/管理员权限**。群内无管理员角色。
+        - 主动退群：userId=自己 ID 即退群成功，前端「退出群聊」按钮直接复用本接口；非本群成员调用返回 404（不在该群成员中，无法退群）。
+        - 群主不可被移除：他人移除群主返回 403（Cannot remove the group owner）；群主移除自己（退群）同样返回 403——需先调 POST /groups/{id}/transfer 转让群主，或 DELETE /groups/{id} 解散群组。
+        - 移除成功后同步更新会话 member_count；主动退群与被移除共用同一 WS 推送（conversation:updated，reason=members）。
       parameters:
         - name: id
           in: path
@@ -2641,7 +2641,12 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '403':
-          description: 权限不足（非本群群主且非系统管理员）；或尝试移除群主（Cannot remove the group owner）
+          description: 权限不足（移除他人时：非本群群主且非系统管理员）；或尝试移除群主 / 群主退群（Cannot remove the group owner / 群主不能移除自己退群，请先转让群主或解散群组）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: 主动退群时不在该群成员中（不在该群成员中，无法退群）
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

@@ -90,7 +90,7 @@ export class GroupController {
     @Param('id') id: string,
     @Param('userId') userId: string,
   ) {
-    // 系统管理员（user.role=admin）可移除任意群成员；否则仅本群群主
+    // 成员可移除自己（主动退群，userId 传自己的 ID）；系统管理员（user.role=admin）可移除任意群成员；否则仅本群群主
     await this.groupService.removeMember(id, userId, user.userId, user.role);
     return null;
   }
