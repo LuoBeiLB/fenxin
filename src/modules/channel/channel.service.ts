@@ -5,11 +5,13 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { DataSource, In } from 'typeorm';
+import { DataSource, In, IsNull } from 'typeorm';
 import { Conversation } from '../../entities/conversation.entity';
 import { ConversationMember } from '../../entities/conversation-member.entity';
 import { AppUser } from '../../entities/app-user.entity';
+import { Message } from '../../entities/message.entity';
 import { EventsGateway } from '../events/events.gateway';
+import { AuditService } from '../audit/audit.service';
 import { WS_EVENTS } from '../events/events.types';
 
 /**
@@ -27,6 +29,7 @@ export class ChannelService {
   constructor(
     private readonly dataSource: DataSource,
     private readonly events: EventsGateway,
+    private readonly audit: AuditService,
   ) {}
 
   /** 频道对外展示的 owner 信息（只挑安全字段，不带手机号等敏感信息） */
@@ -35,16 +38,16 @@ export class ChannelService {
     return { id: owner.id, display_name: owner.display_name, avatar_url: owner.avatar_url };
   }
 
-  /** 查频道实体：必须是 type='channel' 的会话，否则按不存在处理 */
+  /** 查频道实体：必须是 type='channel' 且未解散的会话，否则按不存在处理（已解散频道对详情/订阅/退订/修改均不可见） */
   private async getChannelOr404(channelId: string): Promise<Conversation> {
     const conv = await this.dataSource.getRepository(Conversation).findOne({
-      where: { id: channelId, type: 'channel' },
+      where: { id: channelId, type: 'channel', dissolved_at: IsNull() },
     });
     if (!conv) throw new NotFoundException('频道不存在');
     return conv;
   }
 
-  /** 创建我的频道（一人一个）：自动把自己加为 owner 成员 */
+  /** 创建我的频道（一人一个，已解散的不挡重建）：自动把自己加为 owner 成员 */
   async createChannel(params: {
     name: string;
     description?: string;
@@ -54,8 +57,9 @@ export class ChannelService {
     const convRepo = this.dataSource.getRepository(Conversation);
     const memberRepo = this.dataSource.getRepository(ConversationMember);
 
+    // 「一人一个」仅对活跃频道生效：已解散的不挡重建
     const existing = await convRepo.findOne({
-      where: { type: 'channel', owner_id: params.ownerId },
+      where: { type: 'channel', owner_id: params.ownerId, dissolved_at: IsNull() },
     });
     if (existing) throw new ConflictException('你已创建过频道，一人只能拥有一个频道');
 
@@ -88,10 +92,10 @@ export class ChannelService {
     return { ...saved, is_owner: true, is_subscribed: true, owner: this.toOwnerInfo(owner) };
   }
 
-  /** 我的频道资料（未创建返回 404，前端引导去创建） */
+  /** 我的频道资料（未创建或已解散返回 404，前端引导去创建/重建） */
   async getMyChannel(userId: string): Promise<Record<string, unknown>> {
     const conv = await this.dataSource.getRepository(Conversation).findOne({
-      where: { type: 'channel', owner_id: userId },
+      where: { type: 'channel', owner_id: userId, dissolved_at: IsNull() },
     });
     if (!conv) throw new NotFoundException('你还没有创建频道');
     const owner = await this.dataSource.getRepository(AppUser).findOne({ where: { id: userId } });
@@ -134,7 +138,7 @@ export class ChannelService {
 
     const [channels, total] = await convRepo
       .createQueryBuilder('c')
-      .where("c.type = 'channel' AND c.visibility = 'public'")
+      .where("c.type = 'channel' AND c.visibility = 'public' AND c.dissolved_at IS NULL")
       .orderBy('c.member_count', 'DESC')
       .addOrderBy('c.created_at', 'DESC')
       .skip((page - 1) * pageSize)
@@ -241,6 +245,53 @@ export class ChannelService {
       reason: 'unsubscribed',
     });
     return { conversation_id: channelId, subscribed: false };
+  }
+
+  /**
+   * 频道主解散自己的频道（解散即焚语义，与群主解散群组同一条链路）：
+   * ① 频道标记 dissolved_at/dissolved_by，订阅者立即不可再进入（detail/订阅/发消息全部拦截）；
+   * ② 频道全部未焚消息 destroy_at 置为解散时刻——内容流立即不可见，
+   *    下一分钟由 BurnScheduler 统一物理清除（含磁盘附件），与单条焚毁同一条链路；
+   * ③ WS 推 conversation:updated(reason=dissolved)，全体订阅者会话列表立即移除该频道。
+   * 解散后频道主可重新创建新频道（一人一个仅对活跃频道生效）。
+   */
+  async dissolveChannel(channelId: string, operatorId: string) {
+    const convRepo = this.dataSource.getRepository(Conversation);
+    const conv = await convRepo.findOne({ where: { id: channelId, type: 'channel' } });
+    if (!conv) throw new NotFoundException('频道不存在');
+    if (conv.dissolved_at) throw new BadRequestException('该频道已被解散');
+    if (conv.owner_id !== operatorId) throw new ForbiddenException('仅频道主可解散频道');
+
+    const dissolvedAt = new Date();
+    await this.dataSource.transaction(async (em) => {
+      await em.getRepository(Conversation).update(channelId, {
+        dissolved_at: dissolvedAt,
+        dissolved_by: operatorId,
+      });
+      // 到期时间设为解散时刻 → 消息立即对订阅者不可见，等待 BurnScheduler 物理清除
+      await em
+        .createQueryBuilder()
+        .update(Message)
+        .set({ destroy_at: dissolvedAt })
+        .where('conversation_id = :conversationId', { conversationId: channelId })
+        .andWhere('is_destroyed = :destroyed', { destroyed: false })
+        .execute();
+    });
+
+    // 实时推送：频道被解散，全体订阅者会话列表立即移除该频道
+    const memberIds = await this.getMemberUserIds(channelId);
+    this.events.emitToUsers(WS_EVENTS.CONVERSATION_UPDATED, memberIds, {
+      conversation_id: channelId,
+      reason: 'dissolved',
+    });
+
+    await this.audit.log({
+      userId: operatorId,
+      action: 'dissolve_channel_by_owner',
+      targetType: 'conversation',
+      targetId: channelId,
+      detail: `Owner dissolved channel "${conv.name ?? channelId}" (${memberIds.length} subscribers, messages scheduled for burn)`,
+    });
   }
 
   /** 频道全体成员的用户 ID 列表（用于 WS 定向推送） */

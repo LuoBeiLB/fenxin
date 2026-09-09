@@ -71,4 +71,12 @@ export class ChannelController {
   unsubscribe(@CurrentUser() user: AuthPayload, @Param('id') id: string) {
     return this.channelService.unsubscribe(id, user.userId);
   }
+
+  /** 解散频道（仅频道主）：解散即焚，订阅者会话列表立即移除，内容流随后物理清除 */
+  @Delete(':id')
+  @ResponseMessage('频道已解散')
+  async dissolveByOwner(@CurrentUser() user: AuthPayload, @Param('id') id: string) {
+    await this.channelService.dissolveChannel(id, user.userId);
+    return null;
+  }
 }
