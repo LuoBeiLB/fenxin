@@ -8,11 +8,17 @@ import { MigrationInterface, QueryRunner } from 'typeorm';
  * 字段：id / version_code（唯一，全局递增整数）/ version_name / apk_url /
  *       file_size / force / notes / published / created_by / created_at / updated_at
  * 生产环境（DB_SYNC=false）执行：npm run migration:run
+ *
+ * 幂等（2026-10-13 加固）：用 information_schema 判断表是否已存在，重复执行不报错。
+ * 必须如此的原因：用 DB_SYNC=true 建过表的库（开发库等）app_versions 表已由 synchronize
+ * 建出，这类库首次跑 migration:run 会全量重放历史迁移，无守卫会以
+ * "Table 'app_versions' already exists" 中断整个批次。
  */
 export class AddAppVersions1767300000000 implements MigrationInterface {
   name = 'AddAppVersions1767300000000';
 
   public async up(queryRunner: QueryRunner): Promise<void> {
+    if (await this.tableExists(queryRunner)) return; // 已存在（DB_SYNC 建过 / 重复执行）→ 幂等跳过
     await queryRunner.query(`
       CREATE TABLE \`app_versions\` (
         \`id\` varchar(36) NOT NULL,
@@ -35,6 +41,17 @@ export class AddAppVersions1767300000000 implements MigrationInterface {
   }
 
   public async down(queryRunner: QueryRunner): Promise<void> {
+    if (!(await this.tableExists(queryRunner))) return;
     await queryRunner.query(`DROP TABLE \`app_versions\``);
+  }
+
+  /** 查当前库是否已有 app_versions 表 */
+  private async tableExists(queryRunner: QueryRunner): Promise<boolean> {
+    const rows: Array<{ cnt: number | string }> = await queryRunner.query(
+      `SELECT COUNT(*) AS cnt FROM information_schema.tables
+        WHERE table_schema = DATABASE()
+          AND table_name = 'app_versions'`,
+    );
+    return Number(rows?.[0]?.cnt ?? 0) > 0;
   }
 }
