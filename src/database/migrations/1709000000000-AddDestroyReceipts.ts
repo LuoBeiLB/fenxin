@@ -8,11 +8,20 @@ import { MigrationInterface, QueryRunner } from 'typeorm';
  * 字段：id / message_id / conversation_id / destroyed_at / destroy_method /
  *       server_signature（sha256 签名）/ created_at
  * 索引：message_id（按消息查）/ conversation_id（按会话查）/ destroyed_at（按时间窗查）
+ *
+ * 幂等（2026-10-13 加固）：用 information_schema 判断表是否已存在，重复执行不报错。
+ * 注意本表与其余 4 个迁移的差异：destroy_receipts **没有对应的 entity**（全仓库仅本文件引用），
+ * 所以 synchronize 永远不会替你建它，DB_SYNC=true 的库上不会出现"抢建冲突"。
+ * 但仍需守卫，因为下列场景同样会撞 "Table 'destroy_receipts' already exists" 并中断整个批次：
+ *   ① 从备份恢复库 / 库里有本表但 typeorm_migrations 记录丢失
+ *   ② 同一台实例重复执行 migration:run
+ *   ③ 手工建过本表
  */
 export class AddDestroyReceipts1709000000000 implements MigrationInterface {
   name = 'AddDestroyReceipts1709000000000';
 
   public async up(queryRunner: QueryRunner): Promise<void> {
+    if (await this.tableExists(queryRunner)) return; // 已存在 → 幂等跳过
     await queryRunner.query(`
       CREATE TABLE \`destroy_receipts\` (
         \`id\` varchar(36) NOT NULL,
@@ -31,6 +40,17 @@ export class AddDestroyReceipts1709000000000 implements MigrationInterface {
   }
 
   public async down(queryRunner: QueryRunner): Promise<void> {
+    if (!(await this.tableExists(queryRunner))) return;
     await queryRunner.query(`DROP TABLE \`destroy_receipts\``);
+  }
+
+  /** 查当前库是否已有 destroy_receipts 表 */
+  private async tableExists(queryRunner: QueryRunner): Promise<boolean> {
+    const rows: Array<{ cnt: number | string }> = await queryRunner.query(
+      `SELECT COUNT(*) AS cnt FROM information_schema.tables
+        WHERE table_schema = DATABASE()
+          AND table_name = 'destroy_receipts'`,
+    );
+    return Number(rows?.[0]?.cnt ?? 0) > 0;
   }
 }
