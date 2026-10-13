@@ -26,6 +26,19 @@ export class AppUser {
   @Column({ length: 20, default: 'default' })
   topic: string;
 
+  /**
+   * 用户默认焚毁时长偏好（秒，V5.9.4 与 topic 同模式的用户偏好字段）。
+   * 语义：**该用户下次发消息时前端自动带上的 burn_ttl_seconds 默认值**。
+   * - 正整数（如 600 = 10 分钟、86400 = 1 天）：焚毁消息默认时长
+   * - NULL = 默认不焚毁（用户选择"关闭"或从未选择过）
+   *
+   * 与消息级 messages.burn_ttl_seconds 的区别：本字段只是「用户偏好/上次选择」，
+   * 服务端只存取不参与任何焚毁判定；真正生效的仍以发送请求体里的 burn_ttl_seconds 为准。
+   * 客户端选择后同步到服务端，换设备 / 重启浏览器登录即可恢复，无需重新选择。
+   */
+  @Column({ type: 'int', nullable: true })
+  default_burn_ttl_seconds: number | null;
+
   @Index('idx_users_department')
   @Column({ length: 100, nullable: true })
   department: string | null;
@@ -84,11 +97,21 @@ export function sanitizeUser(user: AppUser | null): Partial<AppUser> | null {
 }
 
 /**
- * 个人资料出口专用：SafeUser 基础上附加 topic（用户自选主题色）。
- * 仅用于登录响应 / GET|PUT /auth/profile —— 主题是用户自己的偏好，
- * 通讯录、会话成员、群成员等出口继续用 sanitizeUser，不暴露他人 topic。
+ * 个人资料出口专用：SafeUser 基础上附加用户偏好（topic 主题色、default_burn_ttl_seconds 默认焚毁时长）。
+ * 仅用于登录响应 / GET|PUT /auth/profile —— 这些都是用户自己的偏好，
+ * 通讯录、会话成员、群成员等出口继续用 sanitizeUser，不暴露他人的偏好设置。
  */
-export function sanitizeUserWithPrefs(user: AppUser | null): (Partial<AppUser> & { topic: string }) | null {
+export function sanitizeUserWithPrefs(
+  user: AppUser | null,
+): (Partial<AppUser> & { topic: string; default_burn_ttl_seconds: number | null }) | null {
   if (!user) return null;
-  return { ...sanitizeUser(user), topic: user.topic ?? 'default' };
+  return {
+    ...sanitizeUser(user),
+    topic: user.topic ?? 'default',
+    // 归一化：存量行（迁移前）与异常值一律落到 null = 默认不焚毁，前端无需区分 undefined/null
+    default_burn_ttl_seconds:
+      typeof user.default_burn_ttl_seconds === 'number' && user.default_burn_ttl_seconds > 0
+        ? user.default_burn_ttl_seconds
+        : null,
+  };
 }

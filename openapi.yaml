@@ -158,7 +158,7 @@ paths:
                     type: object
                     properties:
                       user:
-                        $ref: '#/components/schemas/SafeUser'
+                        $ref: '#/components/schemas/UserWithPrefs'
                       access_token:
                         type: string
                         description: 'JWT 访问令牌，请求受保护接口时放入 Authorization: Bearer 头'
@@ -323,10 +323,12 @@ paths:
 
         【业务规则与注意事项】
         - 返回字段为服务端白名单（SAFE_USER_FIELDS），任何接口都不会返回密码哈希。
+        - 额外返回本人偏好（UserWithPrefs）：topic 主题色、default_burn_ttl_seconds 默认焚毁时长；
+          这两个字段只在登录响应与本人 profile 出口出现，通讯录/成员等接口不返回他人偏好。
         - force_change_pwd=true 时前端应强制跳转修改密码。
       responses:
         '200':
-          description: 成功，data 为本人 SafeUser
+          description: 成功，data 为本人 UserWithPrefs（SafeUser + 偏好字段）
           content:
             application/json:
               schema:
@@ -335,7 +337,7 @@ paths:
                   code: { type: integer, example: 0 }
                   message: { type: string, example: ok }
                   data:
-                    $ref: '#/components/schemas/SafeUser'
+                    $ref: '#/components/schemas/UserWithPrefs'
         '401':
           description: 未携带或无效/过期 token；账号已停用或设备已下线
           content:
@@ -350,13 +352,18 @@ paths:
       tags: [认证]
       summary: 更新本人资料（均为可选字段）
       description: |-
-        【用途】更新当前登录用户的昵称、签名、头像，三个字段均为可选，仅提交的字段会被更新。
+        【用途】更新当前登录用户的昵称、签名、头像，以及本人偏好（主题色、默认焚毁时长）；
+        均为可选字段，仅提交的字段会被更新。
 
-        【调用时机】用户在「编辑资料」页保存修改时。
+        【调用时机】用户在「编辑资料」页保存修改时；或在设置页选好主题色 / 默认焚毁时长后同步偏好。
 
         【业务规则与注意事项】
         - 未传的字段保持不变；不能通过本接口修改手机号、部门、角色等字段。
-        - 响应为更新后的完整 SafeUser，前端可直接替换本地缓存。
+        - default_burn_ttl_seconds 三态语义：传正整数(1~2592000) = 设置默认焚毁时长；
+          显式传 null = 清除偏好（恢复"默认不焚毁"）；不传 = 保持不变。
+          该值只是用户偏好，服务端只存取不参与焚毁判定，发消息时仍以请求体的 burn_ttl_seconds 为准。
+        - 响应为更新后的完整 UserWithPrefs（SafeUser + topic + default_burn_ttl_seconds），
+          前端可直接替换本地缓存。
       requestBody:
         required: true
         content:
@@ -379,9 +386,23 @@ paths:
                   maxLength: 500
                   description: 头像 URL，最长 500 字符（可先通过 POST /upload 上传获得）
                   example: /uploads/9b1d2c3e-4f5a-4b6c-8d7e-9f0a1b2c3d4e.jpg
+                topic:
+                  type: string
+                  maxLength: 20
+                  description: 用户自选主题色标识（值域由前端定义），用于前端换肤；不传则不变
+                  example: dark
+                default_burn_ttl_seconds:
+                  type: integer
+                  nullable: true
+                  minimum: 1
+                  maximum: 2592000
+                  description: |-
+                    默认焚毁时长偏好（秒）。传正整数 = 设置（600 = 10 分钟、86400 = 1 天）；
+                    显式传 null = 清除偏好（默认不焚毁）；不传 = 不变。超范围（0 / 负数 / 非整数 / 大于 30 天）返回 400。
+                  example: 600
       responses:
         '200':
-          description: 更新成功（message 为「个人资料更新成功」），data 为更新后的 SafeUser
+          description: 更新成功（message 为「个人资料更新成功」），data 为更新后的 UserWithPrefs
           content:
             application/json:
               schema:
@@ -390,7 +411,7 @@ paths:
                   code: { type: integer, example: 0 }
                   message: { type: string, example: 个人资料更新成功 }
                   data:
-                    $ref: '#/components/schemas/SafeUser'
+                    $ref: '#/components/schemas/UserWithPrefs'
         '400':
           description: 参数校验失败（如字段超长）
           content:
@@ -4671,6 +4692,33 @@ components:
           format: date-time
           description: 更新时间（服务端 datetime）
           example: '2026-08-20T09:30:00.000Z'
+
+    UserWithPrefs:
+      type: object
+      description: |-
+        本人资料 + 用户偏好（仅登录响应、GET/PUT /auth/profile 返回）。
+        比 SafeUser 多 topic 与 default_burn_ttl_seconds 两个偏好字段：
+        通讯录、会话成员、群成员等出口继续用 SafeUser，不暴露他人的偏好设置。
+      allOf:
+        - $ref: '#/components/schemas/SafeUser'
+        - type: object
+          properties:
+            topic:
+              type: string
+              maxLength: 20
+              description: 用户自选主题色标识（值域由前端定义，如 default/dark/blue），换设备登录后同步；存量数据兜底为 default
+              example: dark
+            default_burn_ttl_seconds:
+              type: integer
+              nullable: true
+              minimum: 1
+              maximum: 2592000
+              description: |-
+                默认焚毁时长偏好（秒）：用户在设置页选好"以后发消息默认焚毁多久"后同步到服务端，
+                换设备 / 重启浏览器登录即恢复，无需重新选择。
+                正整数 = 默认焚毁时长（600 = 10 分钟、86400 = 1 天）；null = 默认不焚毁（用户选择关闭或从未选择过）。
+                仅用户偏好，服务端只存取不参与焚毁判定；实际生效仍以 POST /messages 的 burn_ttl_seconds 为准。
+              example: 600
 
     Device:
       type: object

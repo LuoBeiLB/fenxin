@@ -125,7 +125,8 @@ export class AuthService {
     });
 
     return {
-      // 登录即返回 topic（主题色）：前端登录后无需再拉一次 profile 即可应用用户主题
+      // 登录即返回 topic / default_burn_ttl_seconds（用户偏好）：前端登录后无需再拉一次 profile
+      // 即可应用主题色与上次选择的默认焚毁时长（重启浏览器 / 换设备都不用重新选）
       user: sanitizeUserWithPrefs(user),
       ...tokens,
       device,
@@ -190,7 +191,14 @@ export class AuthService {
 
   async updateProfile(
     userId: string,
-    updates: { display_name?: string; signature?: string; avatar_url?: string; topic?: string },
+    updates: {
+      display_name?: string;
+      signature?: string;
+      avatar_url?: string;
+      topic?: string;
+      /** 默认焚毁时长偏好（秒）：正整数 = 设置；null = 清除（默认不焚毁）；undefined = 不修改 */
+      default_burn_ttl_seconds?: number | null;
+    },
   ) {
     const userRepo = this.dataSource.getRepository(AppUser);
     const updateData: Partial<AppUser> = {};
@@ -198,6 +206,10 @@ export class AuthService {
     if (updates.signature !== undefined) updateData.signature = updates.signature;
     if (updates.avatar_url !== undefined) updateData.avatar_url = updates.avatar_url;
     if (updates.topic !== undefined) updateData.topic = updates.topic;
+    // 三态：undefined = 不修改（键都不进 updateData）；null = 显式清除偏好；正整数 = 设置时长
+    if (updates.default_burn_ttl_seconds !== undefined) {
+      updateData.default_burn_ttl_seconds = updates.default_burn_ttl_seconds;
+    }
 
     await userRepo.update(userId, updateData);
     const updated = await userRepo.findOne({ where: { id: userId } });
