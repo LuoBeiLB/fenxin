@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: 焚信 BurnMsg API
-  version: 2.4.0
+  version: 2.5.0
   description: |-
     焚信（BurnMsg）是一款企业内部加密即时通讯（IM）应用，支持云聊天与秘密聊天、阅后即焚消息。本文件为其后端（NestJS + TypeORM + MySQL）的标准 OpenAPI 3.0.3 接口文档。
 
@@ -25,6 +25,22 @@ info:
     - 请求中的时间字段使用 ISO8601 字符串；响应中的时间为服务端 datetime。
     - 所有业务 ID 均为 UUID v4 字符串。
     - 角色：user / admin。标注「仅管理员」的接口仅 admin 可调用，普通用户返回 403。
+
+    【v2.5.0 变更说明（管理端 + 在线状态，2026-10 版）】
+    - 新增管理端模块（11 个接口，全部仅 admin）：
+      消息管理（GET /admin/messages、GET /admin/messages/{id}、POST /admin/messages/{id}/destroy）、
+      焚毁记录（GET /admin/destroy-records，含待真删队列）、
+      已读统计（GET /admin/read-stats/conversations/{id}、GET /admin/read-stats/messages/{id}）、
+      焚毁概览（GET /admin/stats/burn-overview）、
+      在线监控（GET /admin/presence/overview、GET /admin/presence/devices、POST /admin/devices/{deviceId}/offline）、
+      保留策略（GET /admin/settings/retention，只读）。
+    - **在线状态改为真实可判定**：新增 `POST /auth/devices/{deviceId}/heartbeat`；
+      `devices` 新增 `socket_count` / `online_at` / `offline_at`；
+      `is_online` 由 WS 连接数与心跳共同维护，并由每分钟清扫任务兜底（超过 `ONLINE_TTL_SECONDS` 置离线）。
+    - 管理端手动焚毁只做阶段①标记，不物理删除（保证只有 DestroyService.purge 一条删除路径）。
+    - 管理端内容最小暴露：已焚毁/已撤回/加密一律占位，其余消息只返回 80 字摘录。
+    - `GET /stats/overview` 新增 `online_users` / `today_destroyed` / `pending_purge`；
+      `online_devices` 修正为真实在线数（此前登录即 true 且永不置 false，指标失真）。
 
     【v2.4.0 变更说明（焚毁机制 V6.0，2026-10 版）】
     - **焚毁改为两阶段销毁**：
@@ -3977,6 +3993,407 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /admin/messages:
+    get:
+      tags: [管理端-消息与焚毁]
+      summary: 管理员：消息检索（含焚毁消息）
+      description: |-
+        【用途】管理后台消息管理页：按会话/发送者/类型/焚毁状态/时间/关键词检索消息。
+
+        【业务规则与注意事项】
+        - 仅 admin 可调用，普通用户 403。
+        - **内容最小暴露**：已焚毁返回 `[已焚毁]`、已撤回返回 `[已撤回]`、
+          加密消息返回 `[加密消息]`；其余消息只返回 `content_snippet`（前 80 字）。
+        - `burn_only=true` 只看焚毁消息（`burn_ttl_seconds` 非空）。
+        - 按创建时间倒序分页。
+      parameters:
+        - { name: conversation_id, in: query, schema: { type: string, format: uuid }, description: 限定会话 }
+        - { name: sender_id, in: query, schema: { type: string, format: uuid }, description: 限定发送者 }
+        - { name: type, in: query, schema: { type: string, enum: [text, image, voice, video, file] } }
+        - { name: burn_only, in: query, schema: { type: string, enum: ['true', 'false'] }, description: 只看焚毁消息 }
+        - { name: is_destroyed, in: query, schema: { type: string, enum: ['true', 'false'] }, description: 按焚毁状态过滤 }
+        - { name: keyword, in: query, schema: { type: string }, description: 内容关键词（LIKE） }
+        - { name: start_time, in: query, schema: { type: string, format: date-time } }
+        - { name: end_time, in: query, schema: { type: string, format: date-time } }
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: pageSize, in: query, schema: { type: integer, default: 20, maximum: 100 } }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: ok }
+                  data:
+                    type: object
+                    properties:
+                      total: { type: integer }
+                      page: { type: integer }
+                      pageSize: { type: integer }
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/AdminMessageView' }
+        '401': { description: 未认证, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '403': { description: 非管理员, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /admin/messages/{id}:
+    get:
+      tags: [管理端-消息与焚毁]
+      summary: 管理员：消息详情（含逐人回执与墓碑）
+      description: 返回消息视图 + 逐人回执明细 + 已确认真删人数 + 墓碑（若已真删）。
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid }, description: 消息 ID }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: ok }
+                  data:
+                    type: object
+                    properties:
+                      message: { $ref: '#/components/schemas/AdminMessageView' }
+                      receipts:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            user_id: { type: string, format: uuid }
+                            display_name: { type: string, nullable: true }
+                            is_sender: { type: boolean }
+                            is_read: { type: boolean }
+                            read_at: { type: string, format: date-time, nullable: true }
+                            revealed_at: { type: string, format: date-time, nullable: true }
+                            burn_at: { type: string, format: date-time, nullable: true }
+                      acked_count: { type: integer }
+                      tombstone:
+                        type: object
+                        nullable: true
+                        description: 已真删时为墓碑元数据，否则 null
+        '404': { description: 消息不存在, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '403': { description: 非管理员, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /admin/messages/{id}/destroy:
+    post:
+      tags: [管理端-消息与焚毁]
+      summary: 管理员：手动焚毁（只标记，不物理删除）
+      description: |-
+        【重要】只执行阶段①标记：`is_destroyed=1` + `destroy_reason=manual` + `destroyed_at=now`，
+        并广播 WS `message:destroyed`。**不会物理删除任何数据**。
+
+        真删除仍由前端确认（`destroy-ack`）或 `ACK_FALLBACK_DAYS` 超期兜底执行，
+        保证系统只有 `DestroyService.purge()` 一条物理删除路径（可审计）。
+
+        幂等：已焚毁的消息再调用返回 `already=true`。
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '201':
+          description: 已标记焚毁
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: 已标记焚毁 }
+                  data:
+                    type: object
+                    properties:
+                      success: { type: boolean }
+                      already: { type: boolean, description: true=此前已焚毁，本次未做改动 }
+                      message_id: { type: string, format: uuid }
+                      destroyed_at: { type: string, format: date-time, nullable: true }
+        '404': { description: 消息不存在, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '403': { description: 非管理员, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /admin/destroy-records:
+    get:
+      tags: [管理端-消息与焚毁]
+      summary: 管理员：焚毁记录（两阶段统一视图 + 待真删队列）
+      description: |-
+        【用途】管理后台焚毁记录页，也是排查「消息明明已焚毁，为什么库里/磁盘还有」的关键视图。
+
+        - `stage=pending_purge`：已标记焚毁、等待客户端确认（或超期兜底）真删的消息。
+          带 `acked_count` / `members_need` / `will_purge_at`（= destroyed_at + ACK_FALLBACK_DAYS）。
+        - `stage=purged`：已真删除的消息（来源 `message_tombstones`，不含任何内容）。
+        - `stage=all`（默认）：两者合并，按焚毁时间倒序。
+
+        注意：两个来源各取最近 500 条后在内存合并分页，超大表建议按时间范围查询。
+      parameters:
+        - { name: stage, in: query, schema: { type: string, enum: [pending_purge, purged, all], default: all } }
+        - { name: reason, in: query, schema: { type: string, enum: [fallback_expired, all_read, owner_dissolve, admin_dissolve, manual] } }
+        - { name: conversation_id, in: query, schema: { type: string, format: uuid } }
+        - { name: start_time, in: query, schema: { type: string, format: date-time } }
+        - { name: end_time, in: query, schema: { type: string, format: date-time } }
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: pageSize, in: query, schema: { type: integer, default: 20, maximum: 100 } }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: ok }
+                  data:
+                    type: object
+                    properties:
+                      total: { type: integer }
+                      page: { type: integer }
+                      pageSize: { type: integer }
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/AdminDestroyRecord' }
+        '403': { description: 非管理员, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /admin/read-stats/conversations/{id}:
+    get:
+      tags: [管理端-消息与焚毁]
+      summary: 管理员：会话已读统计（逐成员已读/未读数）
+      description: 返回会话消息总数（排除已焚毁）+ 每个成员的已读/未读条数、已读率、已读水位。
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid }, description: 会话 ID }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: ok }
+                  data:
+                    type: object
+                    properties:
+                      conversation_id: { type: string, format: uuid }
+                      conversation_type: { type: string, enum: [private, group, channel] }
+                      message_total: { type: integer }
+                      members:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            user_id: { type: string, format: uuid }
+                            display_name: { type: string, nullable: true }
+                            phone: { type: string, nullable: true }
+                            role: { type: string, enum: [owner, member] }
+                            joined_at: { type: string, format: date-time }
+                            last_read_message_id: { type: string, format: uuid, nullable: true }
+                            read_count: { type: integer }
+                            unread_count: { type: integer }
+                            read_rate: { type: number, nullable: true, example: 0.85 }
+        '404': { description: 会话不存在, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '403': { description: 非管理员, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /admin/read-stats/messages/{id}:
+    get:
+      tags: [管理端-消息与焚毁]
+      summary: 管理员：单条消息已读明细
+      description: 返回该消息非发送方的已点开/已读人数与逐人明细（发送方也会出现在 readers 里，用 is_sender 区分）。
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: ok }
+                  data:
+                    type: object
+                    properties:
+                      message_id: { type: string, format: uuid }
+                      is_destroyed: { type: boolean }
+                      total: { type: integer, description: 非发送方人数（n-1） }
+                      revealed: { type: integer }
+                      read: { type: integer }
+                      readers:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            user_id: { type: string, format: uuid }
+                            display_name: { type: string, nullable: true }
+                            is_sender: { type: boolean }
+                            is_read: { type: boolean }
+                            read_at: { type: string, format: date-time, nullable: true }
+                            revealed_at: { type: string, format: date-time, nullable: true }
+                            burn_at: { type: string, format: date-time, nullable: true }
+        '404': { description: 消息不存在, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '403': { description: 非管理员, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /admin/stats/burn-overview:
+    get:
+      tags: [管理端-消息与焚毁]
+      summary: 管理员：焚毁概览（数据总览页用）
+      description: 今日焚毁数 / 焚毁原因分布 / 平均存活时长 / 生效中的焚毁消息 / 待真删积压 / 已真删总数。
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: ok }
+                  data:
+                    type: object
+                    properties:
+                      today_destroyed: { type: integer }
+                      destroy_reason_today:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            reason: { type: string }
+                            count: { type: integer }
+                      avg_alive_seconds_today: { type: integer, nullable: true }
+                      active_burn_messages: { type: integer }
+                      pending_purge: { type: integer }
+                      purged_total: { type: integer }
+        '403': { description: 非管理员, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /admin/presence/overview:
+    get:
+      tags: [管理端-在线监控]
+      summary: 管理员：在线概览
+      description: |-
+        在线用户数（至少一台设备在线）、在线设备数、设备总数、按类型分布、在线判定 TTL。
+
+        `stale_online_devices` 是自检指标：超过 TTL 但仍标着在线的设备数，正常应为 0；
+        大于 0 说明 PresenceScheduler 没跑（在线态会失真）。
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: ok }
+                  data:
+                    type: object
+                    properties:
+                      online_users: { type: integer }
+                      online_devices: { type: integer }
+                      total_devices: { type: integer }
+                      online_by_type:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            device_type: { type: string }
+                            count: { type: integer }
+                      online_ttl_seconds: { type: integer, example: 150 }
+                      stale_online_devices: { type: integer }
+        '403': { description: 非管理员, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /admin/presence/devices:
+    get:
+      tags: [管理端-在线监控]
+      summary: 管理员：在线设备列表
+      description: |-
+        设备维度列表（含所属用户、在线状态、`socket_count` 连接数、上下线时间、最后活跃时间）。
+        在线优先排序，其次按最后活跃时间倒序。
+      parameters:
+        - { name: online_only, in: query, schema: { type: string, enum: ['true', 'false'] } }
+        - { name: device_type, in: query, schema: { type: string } }
+        - { name: keyword, in: query, schema: { type: string }, description: 手机号/昵称搜索 }
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: pageSize, in: query, schema: { type: integer, default: 20, maximum: 100 } }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: ok }
+                  data:
+                    type: object
+                    properties:
+                      total: { type: integer }
+                      page: { type: integer }
+                      pageSize: { type: integer }
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/AdminDeviceView' }
+        '403': { description: 非管理员, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /admin/devices/{deviceId}/offline:
+    post:
+      tags: [管理端-在线监控]
+      summary: 管理员：强制下线设备
+      description: |-
+        删除设备记录 → 该设备 token 立即失效（JWT 守卫每请求校验设备存在性）+
+        广播 WS `device:removed` + 写审计日志。
+      parameters:
+        - { name: deviceId, in: path, required: true, schema: { type: string, format: uuid }, description: 设备记录主键（devices.id，不是设备指纹） }
+      responses:
+        '201':
+          description: 已强制下线
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: 已强制下线 }
+                  data:
+                    type: object
+                    properties:
+                      success: { type: boolean }
+                      device_id: { type: string, format: uuid }
+                      user_id: { type: string, format: uuid }
+        '404': { description: 设备不存在, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '403': { description: 非管理员, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /admin/settings/retention:
+    get:
+      tags: [管理端-系统设置]
+      summary: 管理员：数据保留策略（只读）
+      description: |-
+        展示当前生效的保留策略。**故意不提供 PUT**：这些值决定"消息能被真删得多快"，
+        运行期改动会让同一批数据的生命周期不可预测。修改请改环境变量并重启。
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: ok }
+                  data:
+                    type: object
+                    properties:
+                      ack_fallback_days: { type: integer, example: 7 }
+                      purge_ack_threshold: { type: integer, example: 1 }
+                      burn_fallback_hours: { type: integer, example: 24 }
+                      online_ttl_seconds: { type: integer, example: 150 }
+                      editable: { type: boolean, example: false }
+                      note: { type: string }
+        '403': { description: 非管理员, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
   /groups/admin/all:
     get:
       tags: [群组]
@@ -5592,6 +6009,88 @@ components:
           format: date-time
           description: 操作时间
           example: '2026-09-04T08:30:00.000Z'
+
+    AdminMessageView:
+      type: object
+      description: |-
+        管理端消息视图（不同于客户端 Message）：
+        内容做了最小暴露处理 —— 已焚毁/已撤回/加密一律占位，其余只给 80 字摘录。
+      properties:
+        id: { type: string, format: uuid }
+        conversation_id: { type: string, format: uuid }
+        conversation_name: { type: string, nullable: true }
+        conversation_type: { type: string, nullable: true, enum: [private, group, channel] }
+        sender_id: { type: string, format: uuid }
+        sender_name: { type: string, nullable: true }
+        sender_phone: { type: string, nullable: true }
+        type: { type: string, enum: [text, image, voice, video, file] }
+        content_snippet:
+          type: string
+          nullable: true
+          description: 内容摘录（≤80 字）；已焚毁为「[已焚毁]」、已撤回为「[已撤回]」、加密为「[加密消息]」
+          example: 会议纪要已发，请查收
+        file_name: { type: string, nullable: true, description: 已焚毁时为 null }
+        has_attachment: { type: boolean }
+        is_burn: { type: boolean, description: burn_ttl_seconds 非空 }
+        burn_ttl_seconds: { type: integer, nullable: true }
+        is_destroyed: { type: boolean }
+        destroyed_at: { type: string, format: date-time, nullable: true }
+        destroy_reason:
+          type: string
+          nullable: true
+          enum: [fallback_expired, all_read, owner_dissolve, admin_dissolve, manual]
+        destroy_at: { type: string, format: date-time, nullable: true }
+        is_encrypted: { type: boolean }
+        is_recalled: { type: boolean }
+        created_at: { type: string, format: date-time }
+
+    AdminDestroyRecord:
+      type: object
+      description: |-
+        焚毁记录（两阶段统一视图）。
+        stage=pending_purge 时带 acked_count / members_need / will_purge_at；
+        stage=purged 时后三者为 null（已真删，数据只剩墓碑）。
+      properties:
+        stage: { type: string, enum: [pending_purge, purged] }
+        message_id: { type: string, format: uuid }
+        conversation_id: { type: string, format: uuid }
+        conversation_name: { type: string, nullable: true }
+        conversation_type: { type: string, nullable: true, enum: [private, group, channel] }
+        sender_id: { type: string, format: uuid }
+        sender_name: { type: string, nullable: true }
+        type: { type: string, enum: [text, image, voice, video, file] }
+        created_at: { type: string, format: date-time }
+        destroyed_at: { type: string, format: date-time, nullable: true }
+        destroy_reason:
+          type: string
+          nullable: true
+          enum: [fallback_expired, all_read, owner_dissolve, admin_dissolve, manual]
+        alive_seconds: { type: integer, nullable: true, description: 消息存活时长（秒）= destroyed_at - created_at }
+        acked_count: { type: integer, nullable: true, description: 已确认真删的人数（仅 pending_purge） }
+        members_need: { type: integer, nullable: true, description: 需要确认的人数（群聊 n-1，私聊 1） }
+        will_purge_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: 超期强制真删时间 = destroyed_at + ACK_FALLBACK_DAYS（ack_fallback_days=0 时为 null）
+
+    AdminDeviceView:
+      type: object
+      description: 管理端设备视图（含真实在线态）
+      properties:
+        id: { type: string, format: uuid, description: 设备记录主键（devices.id） }
+        user_id: { type: string, format: uuid }
+        display_name: { type: string, nullable: true }
+        phone: { type: string, nullable: true }
+        device_name: { type: string }
+        device_type: { type: string }
+        device_fingerprint: { type: string, description: 设备指纹（devices.device_id） }
+        is_online: { type: boolean, description: 由 WS 连接数 + 心跳共同维护 }
+        socket_count: { type: integer, description: 当前活跃 WS 连接数（多标签页 >1） }
+        online_at: { type: string, format: date-time, nullable: true }
+        offline_at: { type: string, format: date-time, nullable: true }
+        last_active_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
 
     Feedback:
       type: object

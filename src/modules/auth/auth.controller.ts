@@ -73,4 +73,16 @@ export class AuthController {
     await this.authService.removeDevice(user.userId, deviceId);
     return null;
   }
+
+  /**
+   * 设备心跳（V6.0）：客户端每 45~60 秒调一次，维护真实在线态。
+   * 管理端"在线设备/在线用户"指标依赖它；不调则超过 ONLINE_TTL_SECONDS（默认 150s）后被判定离线。
+   */
+  @ApiBearerAuth()
+  @Post('devices/:deviceId/heartbeat')
+  @Throttle({ default: { limit: 60, ttl: 60_000 } })
+  @ResponseMessage('ok')
+  heartbeat(@CurrentUser() user: AuthPayload, @Param('deviceId') deviceId: string) {
+    return this.authService.heartbeat(user.userId, deviceId);
+  }
 }

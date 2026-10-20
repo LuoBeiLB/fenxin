@@ -5,6 +5,50 @@
 
 ---
 
+## 0. 实现状态（2026-10-20 已完成）
+
+| 页面/能力 | 接口 | 状态 |
+|---|---|---|
+| 消息管理 | `GET /admin/messages`、`GET /admin/messages/{id}`、`POST /admin/messages/{id}/destroy` | ✅ |
+| 焚毁记录 + 待真删队列 | `GET /admin/destroy-records?stage=pending_purge\|purged\|all` | ✅ |
+| 已读统计（会话） | `GET /admin/read-stats/conversations/{id}` | ✅ |
+| 已读统计（消息） | `GET /admin/read-stats/messages/{id}` | ✅ |
+| 焚毁概览 | `GET /admin/stats/burn-overview` | ✅ |
+| 在线监控 | `GET /admin/presence/overview`、`GET /admin/presence/devices` | ✅ |
+| 强制下线 | `POST /admin/devices/{deviceId}/offline` | ✅ |
+| 保留策略 | `GET /admin/settings/retention`（只读） | ✅ |
+| 数据总览指标修正 | `GET /stats/overview` 新增 `online_users` / `today_destroyed` / `pending_purge` | ✅ |
+
+**实现位置**：`src/modules/admin/`（1 个模块 + 3 个 controller + 1 个 service + 1 份 DTO）。
+
+**与本文档原设计的差异**
+
+1. **`PUT /admin/settings/retention` 未实现**（只保留 GET）。
+   原因：这些值直接决定"消息能被真删得多快"，运行期改动会让同一批数据一半用旧值、
+   一半用新值，生命周期不可预测。改为 env-only，管理台只展示生效值 + 修改方式。
+2. **`GET /admin/destroy-records` 分页在内存合并**（两个来源各取最近 500 条）。
+   数据量小时最简可靠；量级变大后可改为 `UNION ALL` 在数据库侧分页。
+3. **管理端手动焚毁只做阶段①标记**，绝不物理删除 —— 保证系统只有
+   `DestroyService.purge()` 一条删除路径（可审计）。
+4. **在线状态的真相来源变了**：`devices.is_online` 现在由 WS 连接数 + 心跳共同维护
+   （之前只在登录时置 true、从不置 false），并有每分钟清扫任务兜底。
+
+**实测结果（本地真实调用）**
+
+```
+13/13 通过：
+heartbeat ✅  presence/overview（在线用户=1 设备=1 过期=0）✅  presence/devices ✅
+admin/messages（已焚毁内容=[已焚毁]）✅  admin/messages/:id ✅
+destroy-records（stages=pending_purge，acked=0/1，will_purge_at 有值）✅
+read-stats/conversations ✅  read-stats/messages ✅  stats/burn-overview ✅
+settings/retention ✅  stats/overview（online_users/today_destroyed 有值）✅
+手动焚毁幂等（already=true）✅
+
+权限：普通用户访问 5 个管理端接口全部 403 ✅
+```
+
+---
+
 ## 1. 现有管理端能力盘点（已核实）
 
 | 模块 | 接口 | 状态 |

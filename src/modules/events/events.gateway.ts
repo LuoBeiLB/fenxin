@@ -77,6 +77,15 @@ export class EventsGateway implements OnGatewayConnection, OnGatewayDisconnect {
       client.data.userId = payload.userId;
       client.data.deviceId = payload.deviceId;
       await client.join(userRoom(payload.userId));
+
+      // V6.0 在线状态：连接数 +1，并刷新最后活跃时间（同一设备多标签页会累加）
+      const deviceRepo = this.dataSource.getRepository(Device);
+      await deviceRepo.increment({ id: payload.deviceId }, 'socket_count', 1);
+      await deviceRepo.update(
+        { id: payload.deviceId },
+        { is_online: true, online_at: new Date(), last_active_at: new Date() },
+      );
+
       this.logger.log(`WS connected user=${payload.userId} sid=${client.id}`);
     } catch (err: any) {
       this.logger.warn(`WS handshake rejected: ${err?.message || 'invalid token'}`);
@@ -86,7 +95,25 @@ export class EventsGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   handleDisconnect(client: Socket): void {
     const userId = client.data?.userId;
+    const deviceId = client.data?.deviceId;
     this.logger.log(`WS disconnected user=${userId ?? 'unknown'} sid=${client.id}`);
+    // 连接数 -1（GREATEST 防并发下减成负数）；是否置离线交给 PresenceScheduler 按心跳兜底判定，
+    // 这样"关掉一个标签页但还有另一个"不会被误判为离线。
+    if (deviceId) {
+      this.dataSource
+        .getRepository(Device)
+        .createQueryBuilder()
+        .update()
+        .set({
+          socket_count: () => 'GREATEST(socket_count - 1, 0)',
+          last_active_at: new Date(),
+        })
+        .where('id = :deviceId', { deviceId })
+        .execute()
+        .catch((err: any) =>
+          this.logger.warn(`WS disconnect update failed: ${err?.message || err}`),
+        );
+    }
   }
 
   /**

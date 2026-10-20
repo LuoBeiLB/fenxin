@@ -30,6 +30,7 @@ import { StatsModule } from './modules/stats/stats.module';
 import { AnnouncementModule } from './modules/announcement/announcement.module';
 import { FeedbackModule } from './modules/feedback/feedback.module';
 import { AppVersionModule } from './modules/app-version/app-version.module';
+import { AdminModule } from './modules/admin/admin.module';
 
 @Module({
   imports: [
@@ -131,6 +132,7 @@ import { AppVersionModule } from './modules/app-version/app-version.module';
     AnnouncementModule,
     FeedbackModule,
     AppVersionModule,
+    AdminModule,
   ],
   controllers: [AppController],
   providers: [

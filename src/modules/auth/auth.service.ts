@@ -232,4 +232,37 @@ export class AuthService {
     this.events.emitToUsers(WS_EVENTS.DEVICE_REMOVED, [userId], { device_id: deviceId });
     await this.audit.log({ userId, action: 'remove_device', targetId: deviceId });
   }
+
+  /**
+   * 设备心跳（V6.0）：客户端每 45~60 秒调一次，用于维护真实在线态。
+   *
+   * 为什么不能只靠 WS：移动端切后台/弱网会静默断连且不触发 disconnect，
+   * 也可能走 HTTP 轮询而不连 WS；心跳是"人还在用"的最可靠信号。
+   *
+   * 返回 server_time + online_ttl，方便客户端校准本地时钟与判断自己的心跳节奏。
+   */
+  async heartbeat(userId: string, deviceRecordId: string) {
+    const repo = this.dataSource.getRepository(Device);
+    const device = await repo.findOne({ where: { id: deviceRecordId, user_id: userId } });
+    if (!device) throw new NotFoundException('设备已下线，请重新登录');
+
+    const now = new Date();
+    await repo.update(deviceRecordId, {
+      last_active_at: now,
+      is_online: true,
+      // 首次上线时记录 online_at；已在线则保持不变（不重置在线时长统计）
+      online_at: device.online_at ?? now,
+      offline_at: null,
+    });
+    return {
+      server_time: now.toISOString(),
+      online_ttl: this.onlineTtlSeconds(),
+    };
+  }
+
+  /** 在线判定 TTL（秒）：与 PresenceScheduler 保持一致 */
+  private onlineTtlSeconds(): number {
+    const n = parseInt(process.env.ONLINE_TTL_SECONDS || '150', 10);
+    return Number.isFinite(n) && n > 0 ? n : 150;
+  }
 }

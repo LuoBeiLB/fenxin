@@ -38,6 +38,9 @@ export class StatsService {
       totalConversations,
       totalGroups,
       onlineDevices,
+      onlineUsersRow,
+      todayDestroyed,
+      pendingPurge,
     ] = await Promise.all([
       userRepo.createQueryBuilder('u').where('u.deleted_at IS NULL').getCount(),
       userRepo
@@ -54,7 +57,21 @@ export class StatsService {
         .where("c.type = 'group'")
         .andWhere('c.dissolved_at IS NULL')
         .getCount(),
+      // V6.0：is_online 现在由 WS 连接数 + 心跳共同维护（之前只置 true 从不置 false，指标必然失真）
       deviceRepo.createQueryBuilder('d').where('d.is_online = :o', { o: true }).getCount(),
+      deviceRepo
+        .createQueryBuilder('d')
+        .select('COUNT(DISTINCT d.user_id)', 'cnt')
+        .where('d.is_online = 1')
+        .getRawOne(),
+      // 今日焚毁（阶段①标记数）
+      msgRepo
+        .createQueryBuilder('m')
+        .where('m.is_destroyed = 1')
+        .andWhere('m.destroyed_at >= :todayStart', { todayStart })
+        .getCount(),
+      // 待真删积压（已标记未确认）
+      msgRepo.createQueryBuilder('m').where('m.is_destroyed = 1').getCount(),
     ]);
 
     // 今日活跃：今日登录（device.last_active_at）∪ 今日发言（messages.sender_id），原生 SQL 一次去重统计
@@ -96,6 +113,11 @@ export class StatsService {
       total_conversations: totalConversations,
       total_groups: totalGroups,
       online_devices: onlineDevices,
+      // V6.0：在线用户 = 至少一台设备在线的人数（与 /admin/presence/overview 口径一致）
+      online_users: Number(onlineUsersRow?.cnt ?? 0),
+      // V6.0 焚毁指标：今日已焚毁（阶段①标记）+ 待真删积压（阶段②未确认）
+      today_destroyed: todayDestroyed,
+      pending_purge: pendingPurge,
       storage: {
         upload_bytes: upload.bytes,
         upload_files: upload.files,

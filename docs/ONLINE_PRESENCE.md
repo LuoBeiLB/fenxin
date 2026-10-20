@@ -5,6 +5,34 @@
 
 ---
 
+## 0. 实现状态（2026-10-20）
+
+| 能力 | 实现 | 状态 |
+|---|---|---|
+| 设备表补字段 | `1767900000000-AddDevicePresence`：`socket_count` / `online_at` / `offline_at` + `idx_devices_online` | ✅ |
+| WS 连接数维护 | `events.gateway`：连接 `+1` 并置在线，断开 `GREATEST(-1,0)` | ✅ |
+| 心跳接口 | `POST /auth/devices/:deviceId/heartbeat`（60 次/分钟限流） | ✅ |
+| 离线兜底清扫 | `PresenceScheduler`（`@Cron` 每分钟）：`socket_count<=0` 且心跳过期 → 置离线 | ✅ |
+| 管理端在线监控 | `GET /admin/presence/overview`、`GET /admin/presence/devices` | ✅ |
+| 强制下线 | `POST /admin/devices/:deviceId/offline`（管理端，带审计） | ✅ |
+| 数据总览修正 | `GET /stats/overview` 的 `online_devices` 现为真实在线数，另加 `online_users` | ✅ |
+| 存量脏数据 | 迁移里把 `is_online=1` 全部置 0，由真实连接/心跳重建 | ✅ |
+
+**尚未实现（本专项剩下的部分）**
+
+| 项 | 说明 |
+|---|---|
+| 登录冲突 `session:conflict` WS 事件 | 策略已定 `notify`（允许多端 + 弹窗提醒），事件与前端弹窗未做 |
+| `allow / single` 策略开关 | `SESSION_POLICY` env 未引入；当前行为等价于 `allow`（不拦截、不提醒） |
+| 前端心跳循环 | 前端尚未调 heartbeat；**不调的话设备会在 150s 后被判定离线**，管理端在线数会偏低 |
+| `device:online` / `device:offline` 事件 | 未广播（管理端靠轮询 overview 即可，前端暂不需要） |
+
+> ⚠️ 上线顺序提醒：后端心跳接口与清扫任务一旦生效，**旧版前端（不调 heartbeat）
+> 会表现为"一直离线"**。若要平滑，可先把 `ONLINE_TTL_SECONDS` 调大（如 600）
+> 等前端发版后再调回 150；或前端发版与后端同时上线。
+
+---
+
 ## 1. 现状审计（全部已核实）
 
 | # | 现状 | 证据 | 后果 |
