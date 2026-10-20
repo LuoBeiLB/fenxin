@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: 焚信 BurnMsg API
-  version: 2.5.0
+  version: 2.6.0
   description: |-
     焚信（BurnMsg）是一款企业内部加密即时通讯（IM）应用，支持云聊天与秘密聊天、阅后即焚消息。本文件为其后端（NestJS + TypeORM + MySQL）的标准 OpenAPI 3.0.3 接口文档。
 
@@ -25,6 +25,16 @@ info:
     - 请求中的时间字段使用 ISO8601 字符串；响应中的时间为服务端 datetime。
     - 所有业务 ID 均为 UUID v4 字符串。
     - 角色：user / admin。标注「仅管理员」的接口仅 admin 可调用，普通用户返回 403。
+
+    【v2.6.0 变更说明（用户端在线状态查询，2026-10 版）】
+    - 新增用户端在线状态接口（普通用户可用，非 admin）：
+      `GET /presence/online`（全部在线用户分页列表）、
+      `GET /presence/users?ids=...`（批量查指定用户在线态，≤200）、
+      `GET /presence/me`（本人多设备在线态）。
+    - 只返回 `is_online` / `online_devices` / `last_active_at`，
+      **不暴露**设备名、IP、设备指纹（这些仍只在管理端可见）。
+    - 回答"前端看全站在线用户调哪个接口"：`GET /presence/online`
+      （管理端另有 `GET /admin/presence/devices?online_only=true`，含设备细节）。
 
     【v2.5.0 变更说明（管理端 + 在线状态，2026-10 版）】
     - 新增管理端模块（11 个接口，全部仅 admin）：
@@ -103,6 +113,14 @@ tags:
     description: E2E 端到端加密的 X25519 身份公钥通道：上传/更新本人公钥、查询单个或批量查询共同会话成员公钥（TOFU 前端比对用）。
   - name: 文件上传
     description: 消息附件上传（multipart），返回的 url 在发消息时填入 file_url；v5.9.0 起支持 OSS 外置存储（未启用自动回退本地）。
+  - name: 在线状态
+    description: 用户端在线状态查询（V6.0）：全部在线用户、批量查指定用户在线态、本人多设备在线态。数据来自 `devices.is_online`（WS 连接数 + 心跳维护）。不暴露设备名/IP/指纹等设备细节（那些只在管理端可见）。
+  - name: 管理端-消息与焚毁
+    description: 仅 admin：消息检索/详情/手动焚毁、焚毁记录（含待真删队列）、已读统计、焚毁概览。
+  - name: 管理端-在线监控
+    description: 仅 admin：在线用户/设备概览、在线设备列表、强制下线设备。
+  - name: 管理端-系统设置
+    description: 仅 admin：数据保留策略（只读，由环境变量控制）。
 
 paths:
   /health:
@@ -571,6 +589,152 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '404':
           description: 设备不存在或已下线（设备记录被删除）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /presence/online:
+    get:
+      tags: [在线状态]
+      summary: 全部在线用户列表（V6.0，用户端）
+      description: |-
+        【用途】查看当前所有在线用户（分页）。前端「通讯录 / 在线」页、群成员在线绿点等场景使用。
+
+        【调用时机】用户打开"在线"列表页、下拉刷新时；建议 30~60s 轮询一次，
+        或收到 WS `device:online` / `device:offline` 时刷新。
+
+        【业务规则与注意事项】
+        - 需要登录（普通用户即可，非 admin 专用）。
+        - 在线判定：`devices.is_online = 1`（WS 连接数 + 心跳维护，服务端每分钟兜底清扫）。
+        - 只返回通讯录白名单字段（id/phone/display_name/avatar_url/signature/department 等），
+          **不返回** device_name / IP / 设备指纹 / password_hash / role。
+        - `online_devices` 是该用户在线的设备数（>0 即在线），可用来区分"手机+电脑都在线"。
+        - 按最后活跃时间倒序。
+      parameters:
+        - { name: keyword, in: query, schema: { type: string }, description: 按手机号/昵称过滤 }
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: pageSize, in: query, schema: { type: integer, default: 50, maximum: 100 } }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: ok }
+                  data:
+                    type: object
+                    properties:
+                      total: { type: integer, example: 12 }
+                      page: { type: integer, example: 1 }
+                      pageSize: { type: integer, example: 50 }
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/OnlineUserView' }
+        '401':
+          description: 未携带或无效/过期 token；账号已停用或设备已下线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /presence/users:
+    get:
+      tags: [在线状态]
+      summary: 批量查询指定用户的在线状态（V6.0，用户端）
+      description: |-
+        【用途】一次性查多个用户的在线状态，用于渲染会话成员列表绿点、@提及候选状态、
+        消息发送者头像在线标记等。避免前端为 N 个人各发一次请求。
+
+        【调用时机】打开群成员列表 / 渲染消息列表时批量拉取。
+
+        【业务规则与注意事项】
+        - `ids` 为逗号分隔的用户 ID，最多 **200** 个（超出返回 400）；重复 ID 自动去重。
+        - 没有设备记录的用户（从未登录）按离线返回。
+        - 只返回 `user_id` / `is_online` / `online_devices` / `last_active_at`，不含任何设备细节。
+      parameters:
+        - name: ids
+          in: query
+          required: true
+          schema: { type: string }
+          description: 用户 ID 列表，逗号分隔（≤200 个）
+          example: 5e6f7a8b-9c0d-41e2-83f4-a5b6c7d8e9f0,7c9e6679-7425-40de-944b-e07fc1f90ae7
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: ok }
+                  data:
+                    type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            user_id: { type: string, format: uuid }
+                            is_online: { type: boolean }
+                            online_devices: { type: integer, example: 2 }
+                            last_active_at: { type: string, format: date-time, nullable: true }
+        '400':
+          description: ids 为空或超过 200 个
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: 未携带或无效/过期 token
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /presence/me:
+    get:
+      tags: [在线状态]
+      summary: 本人多设备在线状态（V6.0，用户端）
+      description: |-
+        【用途】查看自己所有设备的在线状态与连接数，标记出"当前设备"。
+        前端可用于「设备管理」页，或启动时判断自己是否需要补心跳。
+
+        【业务规则与注意事项】
+        - 只返回本人的设备，不涉及他人。
+        - `socket_count` 是该设备的活跃 WS 连接数（同一浏览器多标签页会 >1）。
+        - 不返回设备指纹与 IP（管理端才有）。
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: ok }
+                  data:
+                    type: object
+                    properties:
+                      is_online: { type: boolean, description: 是否存在任一在线设备 }
+                      current_device_id: { type: string, format: uuid }
+                      devices:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            id: { type: string, format: uuid }
+                            device_name: { type: string }
+                            device_type: { type: string }
+                            is_online: { type: boolean }
+                            socket_count: { type: integer }
+                            online_at: { type: string, format: date-time, nullable: true }
+                            last_active_at: { type: string, format: date-time, nullable: true }
+                            is_current: { type: boolean }
+        '401':
+          description: 未携带或无效/过期 token
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -6124,6 +6288,30 @@ components:
           format: date-time
           nullable: true
           description: 超期强制真删时间 = destroyed_at + ACK_FALLBACK_DAYS（ack_fallback_days=0 时为 null）
+
+    OnlineUserView:
+      type: object
+      description: |-
+        用户端在线用户视图（V6.0）：通讯录白名单字段 + 在线信息。
+        刻意不包含 device_name / IP / 设备指纹 / role / password_hash。
+      properties:
+        id: { type: string, format: uuid }
+        phone: { type: string }
+        display_name: { type: string, nullable: true }
+        avatar_url: { type: string, nullable: true }
+        signature: { type: string, nullable: true }
+        department: { type: string, nullable: true }
+        is_online: { type: boolean, example: true }
+        online_devices:
+          type: integer
+          description: 该用户当前在线设备数（>0 即在线；可区分手机+电脑同时在线）
+          example: 2
+        last_active_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: 该用户所有设备中最近一次活跃时间
+          example: '2026-10-20T09:34:00.000Z'
 
     AdminDeviceView:
       type: object

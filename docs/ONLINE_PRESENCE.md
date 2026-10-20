@@ -132,6 +132,29 @@ resp 追加字段：
 }
 ```
 
+**「前端要看全站在线用户」调哪个接口**（V6.0 已实现）：
+
+```
+GET /presence/online?page=1&pageSize=50&keyword=   # ✅ 用户端：全部在线用户（分页）
+GET /presence/users?ids=uuid1,uuid2                # 批量查指定用户在线态（≤200，用于成员列表绿点）
+GET /presence/me                                   # 本人多设备在线态（含 is_current）
+```
+
+三者都只返回 `is_online` / `online_devices` / `last_active_at`，
+**不暴露**设备名 / IP / 设备指纹 —— 那些只在管理端可见：
+
+```
+GET /admin/presence/devices?online_only=true      # 管理端：设备维度（含设备名/连接数）
+GET /admin/presence/overview                      # 管理端：聚合数量
+```
+
+> 为什么用户端可以直接看"谁在线"：本系统通讯录是**全员可见的组织架构**
+> （`GET /contacts` 返回全员列表，没有好友关系表），因此在线状态不构成信息升级；
+> 但仍刻意剥掉设备细节，避免暴露"用什么手机/电脑、在哪个 IP"。
+>
+> 注意：`listOnlineUsers` 在 `getRawMany()` 下必须写 `AS <字段名>`，
+> 否则 TypeORM 会把 `u.phone` 落成列名 `u_phone`，映射出来全是 null（实测踩过，已修）。
+
 ### 5.3 强制下线（已有，增强）
 
 ```
