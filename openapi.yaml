@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: 焚信 BurnMsg API
-  version: 2.3.0
+  version: 2.4.0
   description: |-
     焚信（BurnMsg）是一款企业内部加密即时通讯（IM）应用，支持云聊天与秘密聊天、阅后即焚消息。本文件为其后端（NestJS + TypeORM + MySQL）的标准 OpenAPI 3.0.3 接口文档。
 
@@ -25,6 +25,23 @@ info:
     - 请求中的时间字段使用 ISO8601 字符串；响应中的时间为服务端 datetime。
     - 所有业务 ID 均为 UUID v4 字符串。
     - 角色：user / admin。标注「仅管理员」的接口仅 admin 可调用，普通用户返回 403。
+
+    【v2.4.0 变更说明（焚毁机制 V6.0，2026-10 版）】
+    - **焚毁改为两阶段销毁**：
+      阶段① 服务端每分钟把到期消息标记 `is_destroyed=true`（软删，**不删除数据**），并广播 WS `message:destroyed`；
+      阶段② 前端进入会话时 `GET /messages/{conversationId}/pending-destroy` 取待确认列表，
+              再 `POST /messages/{conversationId}/destroy-ack` 确认，后端校验后才物理删除（行 + 回执 + 附件）。
+      未确认的消息在 `ACK_FALLBACK_DAYS`（默认 7 天）后由服务端强制真删除。
+    - **`destroy_at` 语义修正**：= 发送时刻 + max(`BURN_FALLBACK_TTL_HOURS`, `burn_ttl_seconds`)；
+      首次点开时延长到 ≥ 本人 `burn_at`。修复「7 天档消息 24 小时就被删」。
+    - **`remain_seconds` 口径修正**：= `min(burn_at, destroy_at) - now`，保证显示天数 = 实际存活天数。
+    - 新增接口（3 个）：`GET /messages/{conversationId}/pending-destroy`、`POST /messages/{conversationId}/destroy-ack`、`GET /messages/{id}/readers`。
+    - `POST /messages/{id}/read` 支持请求体 `up_to_message_id`（只标记到某条）。
+    - `GET /conversations` 返回 `unread_count`（真实未读数，排除已焚毁）。
+    - Message 新字段：`destroyed_at`、`destroy_reason`、`is_burned`；`is_destroyed` 改为真正的软删标记。
+    - 移除字段：`MessageReceipt.is_delivered`、`ConversationMember.muted`、`Conversation.ai_enabled`。
+    - `POST /messages` 的 `destroy_at` 标记为 deprecated（仅兼容旧客户端），新客户端只传 `burn_ttl_seconds`。
+    - 已焚毁消息不可编辑/撤回/查询回执（404）。
 
     【v2.3.0 变更说明（对齐 v5.9.3 源码，2026-09 版）】
     - 新增模块（29 个接口）：系统公告 announcements（6 个）、App 版本管理 app-versions（5 个）、审计日志 audit-logs（1 个）、个人频道 channels（8 个）、意见反馈 feedback（4 个）、加密密钥 keys（3 个）、统计概览 stats（1 个）、群组管理扩展（GET /groups/admin/all、DELETE /groups/admin/{id}、POST /groups/{id}/transfer 共 3 个）。
@@ -1995,6 +2012,9 @@ paths:
         【业务规则与注意事项】
         - 排序：按 last_message_at 倒序，无消息的会话排最后。
         - 私聊会话（type=private）额外附带 other_user 字段（对方的 SafeUser），用于展示会话名与头像。
+        - **V6.0 新增** `unread_count`：该会话中我未读（`message_receipts.is_read=0`）且未焚毁的消息数；
+          一次聚合查询得出，前端应以此为准（换设备/重装不再丢失未读数）。
+        - 已解散的群/频道不返回。
         - 未加入任何会话时返回空数组。
       responses:
         '200':
@@ -2356,10 +2376,6 @@ paths:
                         enum: [public, private]
                         description: 频道可见性：public 公开 / private 私密
                         example: public
-                      ai_enabled:
-                        type: boolean
-                        description: AI 成员开关（P2 预留）
-                        example: false
                       created_at:
                         type: string
                         format: date-time
@@ -2913,9 +2929,10 @@ paths:
         - 仅会话成员可向该会话发消息，非成员返回 403（修复了旧版越权发消息漏洞）。
         - type=text 时 content 必填（400 文本消息 content 不能为空）；type 为 image/voice/video/file 时 file_url 必填（400 xxx 消息 file_url 不能为空）。
         - 阅后即焚：传 destroy_at（ISO8601 绝对时间，如 5 分钟后的时间点），到期由服务端定时任务（每分钟扫描一批，每批最多 500 条）自动销毁——删除该消息全部回执、清空 content 与 file_url、置 is_destroyed=true；消息列表接口另有「到期即不返回」的过滤兜底（双保险）。源码未限定销毁时长的离散枚举，由客户端自行计算目标时间传入。
-        - 发送成功后：会话 last_message_at 更新为当前时间（影响会话列表排序）；为除发送者外的每位成员各创建一条消息回执（is_delivered=false, is_read=false）。
+        - 发送成功后：会话 last_message_at 更新为当前时间（影响会话列表排序）；为**全体成员（含发送方）**各创建一条消息回执（is_read 仅发送方为 true）。
         - reply_to_id 传入被回复消息的 Message.id 实现引用回复。
-        - 点开才焚（v5.9.3）：传 burn_ttl_seconds（秒数）而非 destroy_at——焚毁消息对全员（含发送方）先显示马赛克占位，接收方调 POST /messages/{id}/reveal 才下发内容并开始各自倒计时；音视频消息可同时传 media_duration_seconds 保证播完才焚。
+        - 焚毁（V6.0）：传 burn_ttl_seconds（秒数，1~2592000）。服务端落库 destroy_at = 发送时刻 + max(BURN_FALLBACK_TTL_HOURS, burn_ttl_seconds)，首次点开时还会延长到 ≥ 本人 burn_at。焚毁消息对全员（含发送方）先显示马赛克占位，调 POST /messages/{id}/reveal 才下发内容并开始各自倒计时；音视频消息可同时传 media_duration_seconds 保证播完才焚。
+        - 旧客户端兼容：只传 destroy_at（ISO8601）也可，后端会反算成 burn_ttl_seconds；两者都传时以 burn_ttl_seconds 为准。
         - E2E 端到端加密：同时传 sender_ephemeral_pubkey / cipher_nonce / cipher_text 三字段（接收方用 GET /keys/{userId} 拿发送方身份公钥做 ECDH 解密）；加密消息 content 仅为占位提示。
       requestBody:
         required: true
@@ -2972,11 +2989,26 @@ paths:
                 destroy_at:
                   type: string
                   format: date-time
-                  description: 定时销毁时间（ISO8601 绝对时间）：不传 burn_ttl_seconds 时为主焚毁机制，到期后服务端定时任务自动销毁该消息；传了 burn_ttl_seconds 时本字段为兜底强制焚毁时间（服务端按 created_at + 兜底小时数生成，可不传）；都不传则永久保留
+                  deprecated: true
+                  maxLength: 40
+                  description: |-
+                    【已废弃，仅兼容旧客户端】绝对销毁时间（ISO8601）。
+                    2026-09-09 之前的 App 版本用它表达"多久后焚毁"；这些老包在新后端上会被
+                    ValidationPipe 的 whitelist 静默丢弃，导致焚毁消息变成永久消息。
+                    V6.0 起后端保留该字段做兼容：优先使用 burn_ttl_seconds，
+                    缺失时由 destroy_at 反算 ttl（clamp 到 1 秒 ~ 30 天）。
+                    新客户端请只传 burn_ttl_seconds。
                   example: '2026-08-26T12:05:00.000Z'
                 burn_ttl_seconds:
                   type: number
-                  description: 点开才焚（阅后即焚 v2）：点开查看后多少秒焚毁（如 5）。不传 = 普通消息。焚毁消息对全员（含发送方）先显示马赛克占位，调 POST /messages/{id}/reveal 才下发内容并开始各自倒计时（与 destroy_at 定时销毁是两套机制，二选一）
+                  minimum: 1
+                  maximum: 2592000
+                  description: |-
+                    消息持续时长（秒，V6.0）：点开查看后多少秒焚毁（如 5）；不传 = 普通消息。
+                    焚毁消息对全员（含发送方）先显示马赛克占位，调 POST /messages/{id}/reveal 才下发内容，
+                    并从点开时刻开始各自倒计时。上限 30 天。
+                    服务端落库的 destroy_at = 发送时刻 + max(BURN_FALLBACK_TTL_HOURS, 本值)，
+                    首次点开时还会延长到 ≥ 本人 burn_at。
                   example: 5
                 mentions:
                   type: array
@@ -3405,16 +3437,19 @@ paths:
   /messages/{id}/read:
     post:
       tags: [消息]
-      summary: 将会话标记为已读（单条 UPDATE，同步本人全部回执）
+      summary: 将会话标记为已读（支持只标记到某条，V6.0）
       description: |-
-        【用途】把指定会话标记为已读。
+        【用途】把指定会话标记为已读；可选只标记到某条消息为止。
 
-        【调用时机】用户打开某个聊天会话、浏览到最新消息时。
+        【调用时机】用户打开某个聊天会话、浏览到最新消息时（前端可传当前可见的最后一条，避免把后面没看过的也标已读）。
 
         【业务规则与注意事项】
         - 注意：路径参数 id 为「会话 ID」（与旧版 API 保持一致），不是消息 ID。
         - 仅会话成员可操作，非成员返回 403。
-        - 服务端用一条 UPDATE（含子查询）把本人在该会话下全部未读回执置为 is_read=true、read_at=当前时间；并把本人成员记录的 last_read_message_id 更新为该会话最新一条消息。
+        - 不传 body / 不传 `up_to_message_id`：整会话全部未读回执置为已读（兼容旧客户端）。
+        - 传 `up_to_message_id`：只标记 created_at ≤ 该条 的未读回执；`last_read_message_id` 也按该上界更新。
+        - 真正把消息从「未读」翻成「已读」时才广播 WS `receipt:read`。
+        - 已焚毁（is_destroyed=1）的消息不计入未读（会话列表的 unread_count 也会排除）。
       parameters:
         - name: id
           in: path
@@ -3422,6 +3457,18 @@ paths:
           schema: { type: string, format: uuid }
           description: 会话 ID（UUID；注意此处不是消息 ID）
           example: 1b2c3d4e-5f6a-47b8-89c0-d1e2f3a4b5c6
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                up_to_message_id:
+                  type: string
+                  format: uuid
+                  description: 只把该条（含）之前的消息标记已读；不传 = 整会话全部标记
+                  example: 5e6f7a8b-9c0d-41e2-83f4-a5b6c7d8e9f0
       responses:
         '200':
           description: 标记成功（message 为「已读标记成功」，data 为 null）
@@ -3722,6 +3769,210 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '404':
           description: 消息不存在
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /messages/{conversationId}/pending-destroy:
+    get:
+      tags: [消息]
+      summary: 待确认真删除列表（V6.0 两阶段销毁·阶段②）
+      description: |-
+        【用途】前端进入会话时调用：取回本会话内「已焚毁、但我还没确认过」的消息列表，
+        随后调 `POST /messages/{conversationId}/destroy-ack` 确认。服务端收到确认且满足策略后
+        才真正物理删除（消息行 + 回执 + 附件）。
+
+        【调用时机】打开聊天页、从后台回到前台、收到 WS `message:destroyed` 之后。
+
+        【业务规则与注意事项】
+        - 仅会话成员可调用（否则 403）。
+        - 返回项**不含任何消息内容**，只有 id / 焚毁原因 / 焚毁时间 / 是否有附件。
+        - 本接口本身不删除任何数据；不确认也不会报错，但会在 `ACK_FALLBACK_DAYS`（默认 7 天）
+          后被服务端强制真删除。
+        - 单次最多返回 500 条（按 destroyed_at 升序）。
+      parameters:
+        - name: conversationId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+          description: 会话 ID（UUID）
+          example: 1b2c3d4e-5f6a-47b8-89c0-d1e2f3a4b5c6
+      responses:
+        '200':
+          description: 成功，data 为待确认列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: ok }
+                  data:
+                    type: object
+                    properties:
+                      conversation_id: { type: string, format: uuid }
+                      total: { type: integer, example: 1 }
+                      pending:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            message_id: { type: string, format: uuid }
+                            destroy_reason:
+                              type: string
+                              enum: [fallback_expired, all_read, owner_dissolve, admin_dissolve, manual]
+                            destroyed_at: { type: string, format: date-time }
+                            has_attachment: { type: boolean, description: 是否带附件（真删除时会一并清理本地/OSS 文件） }
+        '401':
+          description: 未携带或无效/过期 token；账号已停用或设备已下线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: 非会话成员（Access denied to this conversation）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /messages/{conversationId}/destroy-ack:
+    post:
+      tags: [消息]
+      summary: 确认真删除（V6.0 两阶段销毁·阶段②）
+      description: |-
+        【用途】前端确认这些已焚毁的消息"我这边处理完了，可以真删除"。
+        后端校验通过且满足策略后，立即物理删除（消息行 + 回执 + 附件），
+        并写入 `message_tombstones` 轻量墓碑，供所有端继续渲染「此消息已焚毁」占位。
+
+        【调用时机】紧接 `GET /messages/{conversationId}/pending-destroy` 之后（可静默自动调用）。
+
+        【业务规则与注意事项】
+        - 仅会话成员可调用（403）；请求里属于本会话但**未焚毁**的消息 → 400。
+        - 已不存在（已被真删）的消息会被跳过，接口幂等。
+        - 真删除策略：
+          私聊 = 任一确认即删；
+          群聊 = 确认人数 ≥ `PURGE_ACK_THRESHOLD`（默认 1）；该值为 0 时要求所有非发送方（n-1）都确认。
+        - 响应里的 `purged_ids` 是本次真正被物理删除的消息；`acked` 是本次写入的确认条数。
+        - 即使不调用，服务端也会在 `ACK_FALLBACK_DAYS`（默认 7 天）后强制真删除。
+      parameters:
+        - name: conversationId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+          description: 会话 ID（UUID）
+          example: 1b2c3d4e-5f6a-47b8-89c0-d1e2f3a4b5c6
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message_ids]
+              properties:
+                message_ids:
+                  type: array
+                  minItems: 1
+                  maxItems: 500
+                  items: { type: string, format: uuid }
+                  description: 要确认真删除的消息 ID 列表（必须是本会话内、已焚毁的消息）
+                  example: ['5e6f7a8b-9c0d-41e2-83f4-a5b6c7d8e9f0']
+      responses:
+        '201':
+          description: 成功（message 为「已确认销毁」），data 为确认与真删结果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: 已确认销毁 }
+                  data:
+                    type: object
+                    properties:
+                      acked: { type: integer, example: 1, description: 本次写入的确认条数 }
+                      purged: { type: integer, example: 1, description: 因满足策略而真正物理删除的条数 }
+                      purged_ids:
+                        type: array
+                        items: { type: string, format: uuid }
+                        description: 本次被真删除的消息 ID
+        '400':
+          description: 参数校验失败；或包含未焚毁的消息（只能确认已焚毁的）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: 未携带或无效/过期 token；账号已停用或设备已下线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: 非会话成员（Access denied to this conversation）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /messages/{id}/readers:
+    get:
+      tags: [消息]
+      summary: 消息已读/焚毁进度（V6.0，群聊「3/4 已读」用）
+      description: |-
+        【用途】查看一条消息的已读与焚毁进度：非发送方人数、已点开人数、已到期人数，以及逐人明细。
+        供群聊气泡下方显示「3/4 已读」、以及管理端已读统计使用。
+
+        【调用时机】群聊中展示自己消息的已读进度；点开「阅读详情」时。
+
+        【业务规则与注意事项】
+        - 仅会话成员可查看（403）；消息不存在或已焚毁 → 404。
+        - `total` / `revealed` / `burned` 只统计**非发送方**（n-1），与焚毁规则一致。
+        - `readers` 明细包含发送方本人，便于前端区分"我"。
+        - 与 `GET /messages/{id}/receipt` 的区别：后者返回原始回执行，本接口额外给出聚合进度。
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+          description: 消息 ID（UUID）
+          example: 5e6f7a8b-9c0d-41e2-83f4-a5b6c7d8e9f0
+      responses:
+        '200':
+          description: 成功，data 为进度聚合 + 逐人明细
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: ok }
+                  data:
+                    type: object
+                    properties:
+                      message_id: { type: string, format: uuid }
+                      total: { type: integer, example: 4, description: 非发送方人数（n-1） }
+                      revealed: { type: integer, example: 3, description: 已点开人数 }
+                      burned: { type: integer, example: 2, description: 已到期（焚毁）人数 }
+                      readers:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            user_id: { type: string, format: uuid }
+                            display_name: { type: string, example: 张三 }
+                            is_sender: { type: boolean }
+                            is_read: { type: boolean }
+                            read_at: { type: string, format: date-time, nullable: true }
+                            revealed_at: { type: string, format: date-time, nullable: true }
+                            burn_at: { type: string, format: date-time, nullable: true }
+        '401':
+          description: 未携带或无效/过期 token；账号已停用或设备已下线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: 非会话成员（Access denied to this conversation）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: 消息不存在或已焚毁
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -4767,11 +5018,31 @@ components:
     Message:
       type: object
       description: |-
-        消息对象。销毁语义（v5.9.3 两套并存）：
-        - 定时销毁（destroy_at）：到期由服务端定时任务销毁——清空 content/file_url 并置 is_destroyed=true；
-        - 点开才焚（burn_ttl_seconds 非空）：焚毁消息对所有人（含发送方）先返回马赛克占位（is_blurred=true，内容字段全部置 null），
-          调 POST /messages/{id}/reveal 后才下发完整内容并开始该用户各自倒计时；到期后该条消息对该用户不再返回。
-        消息列表/搜索接口中的焚毁消息附带视图字段 is_blurred / burn_at / remain_seconds（已点开未到期时）。
+        消息对象。焚毁语义（V6.0 两阶段销毁）：
+
+        **阶段① 标记（服务端每分钟自动）**
+        - `burn_ttl_seconds` 非空 = 焚毁消息；NULL = 普通消息（永不自动焚毁）。
+        - 触发条件（任一）：
+          1. 兜底到期：`destroy_at <= now`；
+          2. 阅读完成：**私聊** = 唯一非发送方已点开且其 `burn_at` 已到期；
+             **群聊** = 所有非发送方（n-1）都已点开且各自 `burn_at` 都已到期。
+        - 命中后服务端只置 `is_destroyed=true` + `destroyed_at` + `destroy_reason`，
+          **不删除数据**，并广播 WS `message:destroyed`。此后列表/搜索/reveal 均不可见。
+
+        **阶段② 真删除（前端确认驱动）**
+        - 前端进入会话时 `GET /messages/{conversationId}/pending-destroy` 取待确认列表，
+          再 `POST /messages/{conversationId}/destroy-ack` 确认；
+        - 后端校验后物理删除「消息行 + 回执 + 附件」，并在 `message_tombstones` 留一条
+          **不含任何内容**的墓碑，供前端继续渲染「此消息已焚毁」占位；
+        - 兜底：超过 `ACK_FALLBACK_DAYS`（默认 7 天）仍未确认则强制真删除。
+
+        **点开才焚**
+        - 焚毁消息对所有人（含发送方）先返回马赛克占位（`is_blurred=true`，内容字段全部 null）；
+        - 调 `POST /messages/{id}/reveal` 后才下发完整内容，并从该时刻开始该用户自己的倒计时；
+        - `remain_seconds = min(burn_at, destroy_at) - now`，保证「显示的天数 = 实际存活天数」。
+
+        **墓碑字段**：已焚毁的消息在列表中返回 `is_destroyed=true`、`is_burned=true`、
+        `content/file_url/...` 全部为 null，另带 `destroyed_at` / `destroy_reason`。
       properties:
         id:
           type: string
@@ -4829,18 +5100,46 @@ components:
           example: false
         is_destroyed:
           type: boolean
-          description: 阅后即焚是否已销毁（销毁后 content/file_url 已清空）
+          description: |-
+            是否已焚毁（V6.0 软删标记）。0/false = 正常；true = 已焚毁：
+            列表/搜索/reveal 均不可见，但消息行与附件仍在，等待前端确认（或超期兜底）后真删除。
+            真删除后该消息不再出现在本字段对应的行里，而是由独立墓碑表提供占位。
           example: false
+        destroyed_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: 实际标记焚毁的时刻（V6.0）；未焚毁为 null
+          example: null
+        destroy_reason:
+          type: string
+          nullable: true
+          enum: [fallback_expired, all_read, owner_dissolve, admin_dissolve, manual]
+          description: |-
+            焚毁原因（V6.0）：
+            fallback_expired=兜底到期；all_read=阅读完成（私聊对方已看完 / 群聊 n-1 全看完）；
+            owner_dissolve=群主或频道主解散；admin_dissolve=管理员强制解散；manual=手动销毁
+          example: null
         destroy_at:
           type: string
           format: date-time
           nullable: true
-          description: 销毁时间。普通阅后即焚消息：到期由定时任务自动销毁；点开才焚消息（burn_ttl_seconds 非空）：本字段为兜底强制焚毁时间（发送时 = created_at + 兜底小时数，防止一直不点开导致消息永久留存）；非焚毁消息为 null
+          description: |-
+            绝对销毁上限（V6.0 语义变更）：
+            - 发送时 = created_at + max(BURN_FALLBACK_TTL_HOURS, burn_ttl_seconds)
+              —— 兜底时长不得短于用户选择的持续时间；
+            - 首次点开时 = max(当前值, 本人 burn_at)
+              —— 保证「晚点开」的人也能拿满自己的 TTL。
+            普通消息为 null。
           example: null
         burn_ttl_seconds:
           type: integer
           nullable: true
-          description: 点开才焚 TTL（秒）：点开查看后多少秒焚毁（如 5）；null = 非焚毁消息。焚毁消息对全员（含发送方）先显示马赛克占位，调 POST /messages/{id}/reveal 才下发内容并开始各成员各自的倒计时（互不影响）；destroy_at 在此模式下仅作兜底强制焚毁时间
+          description: |-
+            消息持续时长（秒，用户选择）：点开后多少秒焚毁；null = 非焚毁消息。
+            焚毁消息对全员（含发送方）先显示马赛克占位，调 POST /messages/{id}/reveal 才下发内容，
+            并从点开时刻开始该用户自己的倒计时（各成员互不影响）。
+            上限 30 天；旧客户端若只传 destroy_at 会被后端反算成本字段（兼容）。
           example: null
         file_original_url:
           type: string
@@ -4880,6 +5179,10 @@ components:
           type: boolean
           description: 焚毁视图标记（运行时字段，仅焚毁消息出现）：true = 未点开的马赛克占位（内容字段已置 null）；false = 已点开，下发完整内容
           example: true
+        is_burned:
+          type: boolean
+          description: 已焚毁标记（V6.0 运行时字段）：true = 该消息已焚毁，本条是墓碑占位（content/file_url 等全部为 null）
+          example: false
         burn_at:
           type: string
           format: date-time
@@ -4889,7 +5192,9 @@ components:
         remain_seconds:
           type: integer
           nullable: true
-          description: 该用户焚毁倒计时剩余秒数（运行时字段，已点开后返回，前端据此跑本地倒计时）
+          description: |-
+            该用户焚毁倒计时剩余秒数（运行时字段，已点开后返回，前端据此跑本地倒计时）。
+            V6.0 起 = min(burn_at, destroy_at) - now，保证不会「显示还有 7 天、实际 24 小时就删」。
           example: 5
         media_burn_pending:
           type: boolean
@@ -4956,14 +5261,17 @@ components:
           enum: [public, private]
           description: 频道可见性（仅 type=channel 有意义）：public 进频道广场可自主订阅 / private 不进广场（P1 支持邀请链接订阅）
           example: public
-        ai_enabled:
-          type: boolean
-          description: AI 成员开关（P2 预留）：开启后频道主可与 AI 对话，订阅者可围观
-          example: false
         member_count:
           type: integer
           description: 成员数
           example: 12
+        unread_count:
+          type: integer
+          nullable: true
+          description: |-
+            V6.0 新增（仅 GET /conversations 返回）：该会话中我未读且未焚毁的消息数。
+            前端应以此为准（换设备/重装不再丢失未读数）；其他接口返回的会话对象不含该字段。
+          example: 3
         last_message_at:
           type: string
           format: date-time
@@ -5019,13 +5327,9 @@ components:
           example: 7c9e6679-7425-40de-944b-e07fc1f90ae7
         role:
           type: string
-          enum: [owner, admin, member]
-          description: 群内角色：owner 群主（创建者，可设置管理员）/ admin 群管理员（可改群资料、增删成员）/ member 普通成员
+          enum: [owner, member]
+          description: 会话内角色：owner 群主/频道主（可管理成员、解散）、member 普通成员（V5.5 起取消群内 admin 角色）
           example: member
-        muted:
-          type: boolean
-          description: 是否免打扰
-          example: false
         last_read_message_id:
           type: string
           format: uuid
@@ -5074,10 +5378,6 @@ components:
           format: uuid
           description: 接收者用户 ID
           example: 7c9e6679-7425-40de-944b-e07fc1f90ae7
-        is_delivered:
-          type: boolean
-          description: 是否已送达
-          example: false
         is_read:
           type: boolean
           description: 是否已读
