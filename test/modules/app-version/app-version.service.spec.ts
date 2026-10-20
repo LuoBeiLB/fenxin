@@ -39,6 +39,9 @@ describe('AppVersionService', () => {
 
   beforeEach(() => {
     jest.restoreAllMocks();
+    // jest.mock('fs') 是自动 mock：restoreAllMocks 不会清调用记录，
+    // 必须显式 clear，否则 unlinkSync 的调用次数会跨用例累积（导致"保留文件"用例误判为已调用）
+    jest.clearAllMocks();
 
     versionRepo = makeAppVersionRepo();
     const userRepo = {

@@ -2,6 +2,9 @@ import * as fs from 'fs';
 import { BadRequestException } from '@nestjs/common';
 import { UploadController } from './upload.controller';
 
+// fs 整模块 mock（必须先于其它 import 生效，jest 会自动提升）
+jest.mock('fs');
+
 /**
  * UploadController 单元测试（v5.9.0 OSS 外置存储改造）
  * mock OssService / sharp / fs，不碰磁盘与网络。
@@ -16,7 +19,9 @@ jest.mock('sharp', () => {
   const chain: any = {};
   chain.resize = jest.fn(() => chain);
   chain.webp = jest.fn(() => chain);
-  chain.toFile = mockSharpToFile;
+  // 注意：jest.mock 的工厂函数会被提升到 `const mockSharpToFile` 之前执行，
+  // 这里必须用「惰性引用」，否则抛 ReferenceError: Cannot access before initialization
+  chain.toFile = (...args: any[]) => mockSharpToFile(...args);
   return jest.fn(() => chain);
 });
 
@@ -46,18 +51,21 @@ function makeOss(enabled: boolean) {
 }
 
 describe('UploadController（v5.9.0 OSS 改造）', () => {
-  let unlinkSpy: jest.SpyInstance;
-  let mkdirSpy: jest.SpyInstance;
+  // 注意：TS5 下 `import * as fs` 会把模块导出包成 non-configurable getter，
+  // jest.spyOn(fs, 'unlinkSync') 会抛 "Cannot redefine property"。
+  // 解法是整模块 mock（同 app-version.service.spec.ts 的写法），直接操作 jest.fn。
+  const fsMock = fs as unknown as { unlinkSync: jest.Mock; mkdirSync: jest.Mock };
+  let unlinkSpy: jest.Mock;
+  let mkdirSpy: jest.Mock;
 
   beforeEach(() => {
-    unlinkSpy = jest.spyOn(fs, 'unlinkSync').mockImplementation(() => undefined as any);
-    mkdirSpy = jest.spyOn(fs, 'mkdirSync').mockImplementation(() => undefined as any);
+    unlinkSpy = fsMock.unlinkSync.mockReset().mockImplementation(() => undefined);
+    mkdirSpy = fsMock.mkdirSync.mockReset().mockImplementation(() => undefined);
     mockSharpToFile.mockReset().mockResolvedValue(undefined);
   });
 
   afterEach(() => {
-    unlinkSpy.mockRestore();
-    mkdirSpy.mockRestore();
+    jest.clearAllMocks();
   });
 
   it('OSS 启用：原图 + 缩略图推 OSS，返回签名 URL，并删除本地两份副本', async () => {

@@ -105,9 +105,8 @@ describe('AuthService topic（用户主题色）', () => {
   });
 
   it('PUT profile 传 topic：落库并返回新 topic', async () => {
-    userRepo.findOne
-      .mockResolvedValueOnce({ ...baseUser }) // update 后回查
-      .mockResolvedValueOnce({ ...baseUser, topic: 'blue' });
+    // updateProfile 只在 update 之后回查一次 findOne，所以这里只需准备「回查结果」
+    userRepo.findOne.mockResolvedValueOnce({ ...baseUser, topic: 'blue' });
     userRepo.update.mockResolvedValue({ affected: 1 });
 
     const updated = await service.updateProfile('u-1', { topic: 'blue' });
