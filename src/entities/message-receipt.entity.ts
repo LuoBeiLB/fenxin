@@ -15,9 +15,6 @@ export class MessageReceipt {
   user_id: string;
 
   @Column({ default: false })
-  is_delivered: boolean;
-
-  @Column({ default: false })
   is_read: boolean;
 
   @Column({ type: 'datetime', nullable: true })

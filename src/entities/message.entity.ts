@@ -3,6 +3,10 @@ import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn, UpdateDateCol
 export type MessageType = 'text' | 'image' | 'voice' | 'video' | 'file';
 
 @Entity('messages')
+// 焚毁调度扫描索引：规则 A/B 都是 is_destroyed=0 + 时间条件
+@Index('idx_messages_burn_scan', ['is_destroyed', 'destroy_at'])
+// 真删除（purge）扫描索引：is_destroyed=1 + destroyed_at 窗口
+@Index('idx_messages_purge', ['is_destroyed', 'destroyed_at'])
 export class Message {
   @PrimaryGeneratedColumn('uuid')
   id: string;
@@ -59,19 +63,36 @@ export class Message {
   @Column({ default: false })
   is_recalled: boolean;
 
+  /**
+   * 是否已焚毁（V6.0 软删除标记）。
+   * 0 = 正常；1 = 已焚毁 —— 列表 / 搜索 / reveal 全部不可见，但**行与附件仍在**，
+   * 等待前端确认（或 ACK_FALLBACK_DAYS 超期）后由 DestroyService.purge() 真删除。
+   */
   @Column({ default: false })
   is_destroyed: boolean;
 
+  /** 实际标记焚毁的时刻（软删时间，真删除任务依据） */
+  @Column({ type: 'datetime', nullable: true })
+  destroyed_at: Date | null;
+
+  /** 焚毁原因：fallback_expired / all_read / owner_dissolve / admin_dissolve / manual */
+  @Column({ length: 20, nullable: true })
+  destroy_reason: string | null;
+
+  /**
+   * 绝对销毁上限（V6.0 语义变更）：
+   * - 发送时 = created_at + max(BURN_FALLBACK_TTL_HOURS, burn_ttl_seconds)
+   *   —— 兜底时长不得短于用户选择的持续时间，否则"还没等到消息持续时间结束就被删"
+   * - 首次点开时 = max(当前值, burn_at)
+   *   —— 保证"晚点开"的人也能拿满自己的 ttl
+   */
   @Index('idx_messages_destroy_at')
   @Column({ type: 'datetime', nullable: true })
   destroy_at: Date | null;
 
   /**
-   * 点开才焚（阅后即焚 v2）：点开查看后多少秒焚毁（NULL = 非焚毁消息）。
-   * 焚毁消息对所有人（含发送方）都是马赛克占位，调 reveal 接口才下发内容；
-   * 各成员各自点开、各自倒计时（message_receipts.burn_at），互不影响。
-   * destroy_at 在本模式下语义为「兜底强制焚毁时间」（发送时 = created_at + BURN_FALLBACK_TTL_HOURS），
-   * 防止有人一直不点开导致消息永久留存。
+   * 消息持续时长（秒，用户选择；NULL = 非焚毁消息）。
+   * 点开后才开始计时：message_receipts.burn_at = revealed_at + burn_ttl_seconds。
    */
   @Column({ type: 'int', nullable: true })
   burn_ttl_seconds: number | null;

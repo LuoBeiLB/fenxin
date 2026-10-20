@@ -10,6 +10,7 @@ import { MessageReceipt } from '../../entities/message-receipt.entity';
 import { Conversation } from '../../entities/conversation.entity';
 import { ConversationMember } from '../../entities/conversation-member.entity';
 import { AppUser } from '../../entities/app-user.entity';
+import { MessageTombstone } from '../../entities/message-tombstone.entity';
 import { EventsGateway } from '../events/events.gateway';
 import { OssService } from '../upload/oss.service';
 import { WS_EVENTS } from '../events/events.types';
@@ -19,6 +20,9 @@ function burnFallbackTtlMs(): number {
   const hours = parseInt(process.env.BURN_FALLBACK_TTL_HOURS || '24', 10);
   return (Number.isFinite(hours) && hours > 0 ? hours : 24) * 3600 * 1000;
 }
+
+/** 消息持续时长上限（秒）：与用户偏好字段一致（30 天），防把毫秒当秒填 */
+const MAX_BURN_TTL_SECONDS = 30 * 24 * 3600;
 
 /**
  * 音视频焚毁消息的消费窗口（秒）：max(用户设的 burn_ttl_seconds, 窗口值)。
@@ -99,6 +103,41 @@ export class MessageService {
     return membership;
   }
 
+  /**
+   * 归一化焚毁时长（V6.0）：
+   * - 优先 `burn_ttl_seconds`（新协议，秒）
+   * - 旧客户端只传 `destroy_at`（ISO8601）→ 反算 ttl，避免"旧 APK 发的焚毁消息变成永久消息"
+   * - 结果 clamp 到 [1, MAX_BURN_TTL_SECONDS]；无法解析 → null（视为非焚毁消息）
+   */
+  private normalizeBurnTtl(ttlSeconds?: number, destroyAtIso?: string): number | null {
+    if (ttlSeconds != null && Number.isFinite(Number(ttlSeconds)) && Number(ttlSeconds) > 0) {
+      return Math.min(Math.ceil(Number(ttlSeconds)), MAX_BURN_TTL_SECONDS);
+    }
+    if (destroyAtIso) {
+      const ms = new Date(destroyAtIso).getTime() - Date.now();
+      if (Number.isFinite(ms) && ms > 0) {
+        return Math.min(Math.max(1, Math.ceil(ms / 1000)), MAX_BURN_TTL_SECONDS);
+      }
+    }
+    return null;
+  }
+
+  /**
+   * 有效剩余秒数（V6.0）：`min(burn_at, destroy_at) - now`。
+   * - 正常情况下 `reveal` 已把 destroy_at 推到 ≥ burn_at，取谁都一样
+   * - 但对存量数据（destroy_at 曾被截断成 24h）取 min 才不会"显示比实际活得久"
+   */
+  private effectiveRemainSeconds(
+    burnAt: Date | string | null,
+    destroyAt: Date | string | null,
+    nowMs: number,
+  ): number {
+    if (!burnAt) return 0;
+    let deadline = new Date(burnAt).getTime();
+    if (destroyAt) deadline = Math.min(deadline, new Date(destroyAt).getTime());
+    return Math.max(0, Math.ceil((deadline - nowMs) / 1000));
+  }
+
   /** 会话全体成员的用户 ID 列表（用于 WebSocket 定向推送） */
   private async getMemberUserIds(conversationId: string): Promise<string[]> {
     const members = await this.dataSource.getRepository(ConversationMember).find({
@@ -121,6 +160,8 @@ export class MessageService {
     fileOriginalUrl?: string;
     replyToId?: string;
     burnTtlSeconds?: number;
+    /** 【旧客户端兼容】绝对销毁时间（ISO8601）；仅在 burnTtlSeconds 缺失时用于反算 ttl */
+    destroyAt?: string;
     senderEphemeralPubkey?: string;
     cipherNonce?: string;
     cipherText?: string;
@@ -165,6 +206,12 @@ export class MessageService {
       throw new BadRequestException(`${params.type} 消息 file_url 不能为空`);
     }
 
+    // ===== 焚毁参数归一化（V6.0）=====
+    // 优先级：burn_ttl_seconds（新协议）> destroy_at（旧客户端兼容，反算 ttl）
+    // destroy_at 落库值 = now + max(兜底时长, ttl)，保证"兜底不会早于用户设定的持续时间"。
+    const burnTtl = this.normalizeBurnTtl(params.burnTtlSeconds, params.destroyAt);
+    const fallbackMs = burnFallbackTtlMs();
+
     const savedMsg = await msgRepo.save(
       msgRepo.create({
         conversation_id: params.conversationId,
@@ -179,10 +226,10 @@ export class MessageService {
         media_duration: params.mediaDurationSeconds ?? null,
         file_original_url: params.fileOriginalUrl ?? null,
         reply_to_id: params.replyToId ?? null,
-        // 点开才焚 v2：burn_ttl_seconds 非空 = 焚毁消息；
-        // destroy_at 语义为兜底强制焚毁时间（env BURN_FALLBACK_TTL_HOURS，默认 24h），防止有人一直不点开导致消息永久留存
-        burn_ttl_seconds: params.burnTtlSeconds ?? null,
-        destroy_at: params.burnTtlSeconds ? new Date(Date.now() + burnFallbackTtlMs()) : null,
+        // 焚毁消息：burn_ttl_seconds 非空；
+        // destroy_at = 绝对销毁上限 = now + max(兜底, ttl)（首次点开时还会按 burn_at 延长）
+        burn_ttl_seconds: burnTtl,
+        destroy_at: burnTtl ? new Date(Date.now() + Math.max(fallbackMs, burnTtl * 1000)) : null,
         // E2E 加密字段（明文消息全为 null / false）
         is_encrypted: isEncrypted,
         cipher_nonce: isEncrypted ? params.cipherNonce! : null,
@@ -202,7 +249,6 @@ export class MessageService {
         receiptRepo.create({
           message_id: savedMsg.id,
           user_id: m.user_id,
-          is_delivered: false,
           is_read: m.user_id === params.senderId,
           read_at: m.user_id === params.senderId ? now : null,
         }),
@@ -282,7 +328,8 @@ export class MessageService {
         ...m,
         is_blurred: false,
         burn_at: r.burn_at,
-        remain_seconds: Math.max(0, Math.ceil((new Date(r.burn_at!).getTime() - now) / 1000)),
+        // V6.0：取 min(burn_at, destroy_at)，避免"显示还有 7 天、实际 24 小时就删"
+        remain_seconds: this.effectiveRemainSeconds(r.burn_at, m.destroy_at, now),
       });
     }
     return result;
@@ -313,7 +360,120 @@ export class MessageService {
 
     const messages = await qb.getMany();
     // 点开才焚：按当前用户 receipt 状态过滤/马赛克化
-    return this.applyBurnView(messages.reverse(), params.userId);
+    const view = await this.applyBurnView(messages.reverse(), params.userId);
+    // V6.0：把「已焚毁」的消息以墓碑形式补回聊天流（跨设备一致的"此消息已焚毁"占位）
+    return this.attachTombstones(params.conversationId, view, { before: params.before, limit });
+  }
+
+  /**
+   * 墓碑合并（V6.0）：把当前页时间范围内「已焚毁」的消息补成墓碑。
+   *
+   * 数据来源两处：
+   *  ① `messages.is_destroyed=1`（已标记、尚未真删）—— 行还在
+   *  ② `message_tombstones`（已真删）—— 行没了，只剩元数据
+   * 墓碑不含任何内容字段，只用于渲染占位。
+   *
+   * 时间范围策略：
+   *  - 当前页有消息：取 [最早, 最晚] 区间，保证墓碑插在正确位置、不破坏分页
+   *  - 当前页为空（例如会话里唯一一条已被真删）：取最近 `limit` 条墓碑；
+   *    翻历史（before）时取 before 之前的
+   */
+  private async attachTombstones(
+    conversationId: string,
+    list: unknown[],
+    opts: { before?: string; limit: number },
+  ): Promise<unknown[]> {
+    let from: Date | undefined;
+    let to: Date | undefined;
+    if (list.length > 0) {
+      const times = list
+        .map((m: any) => new Date(m.created_at).getTime())
+        .filter((t) => Number.isFinite(t));
+      if (times.length > 0) {
+        from = new Date(Math.min(...times));
+        to = new Date(Math.max(...times));
+      }
+    } else if (opts.before) {
+      to = new Date(opts.before);
+    }
+
+    const tombstoneRepo = this.dataSource.getRepository(MessageTombstone);
+    const tombQb = tombstoneRepo
+      .createQueryBuilder('t')
+      .where('t.conversation_id = :conversationId', { conversationId })
+      .orderBy('t.created_at', 'DESC')
+      .take(opts.limit);
+    const markedQb = this.dataSource
+      .getRepository(Message)
+      .createQueryBuilder('m')
+      .select([
+        'm.id',
+        'm.conversation_id',
+        'm.sender_id',
+        'm.type',
+        'm.created_at',
+        'm.destroyed_at',
+        'm.destroy_reason',
+      ])
+      .where('m.conversation_id = :conversationId', { conversationId })
+      .andWhere('m.is_destroyed = :destroyed', { destroyed: true })
+      .orderBy('m.created_at', 'DESC')
+      .take(opts.limit);
+
+    if (from && to) {
+      tombQb.andWhere('t.created_at BETWEEN :from AND :to', { from, to });
+      markedQb.andWhere('m.created_at BETWEEN :from AND :to', { from, to });
+    } else if (to) {
+      tombQb.andWhere('t.created_at < :to', { to });
+      markedQb.andWhere('m.created_at < :to', { to });
+    }
+
+    const [purged, marked] = await Promise.all([tombQb.getMany(), markedQb.getMany()]);
+    if (purged.length === 0 && marked.length === 0) return list;
+
+    const seen = new Set(list.map((m: any) => String(m.id)));
+    const extra: unknown[] = [];
+    const push = (id: string, conversation_id: string, sender_id: string, type: string,
+                  created_at: Date, destroyed_at: Date | null, destroy_reason: string | null) => {
+      if (seen.has(String(id))) return;
+      seen.add(String(id));
+      extra.push({
+        id,
+        conversation_id,
+        sender_id,
+        type,
+        created_at,
+        destroyed_at,
+        destroy_reason,
+        is_destroyed: true,
+        is_burned: true,
+        is_blurred: false,
+        is_recalled: false,
+        is_edited: false,
+        is_encrypted: false,
+        content: null,
+        file_url: null,
+        file_name: null,
+        file_size: null,
+        file_original_url: null,
+        cipher_nonce: null,
+        cipher_text: null,
+        sender_ephemeral_pubkey: null,
+        reply_to_id: null,
+        mentions: [],
+      });
+    };
+
+    for (const t of purged) {
+      push(t.id, t.conversation_id, t.sender_id, t.type, t.created_at, t.destroyed_at, t.destroy_reason);
+    }
+    for (const m of marked) {
+      push(m.id, m.conversation_id, m.sender_id, m.type, m.created_at, m.destroyed_at, m.destroy_reason);
+    }
+
+    return [...list, ...extra].sort(
+      (a: any, b: any) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime(),
+    );
   }
 
   /**
@@ -348,7 +508,6 @@ export class MessageService {
         receiptRepo.create({
           message_id: messageId,
           user_id: userId,
-          is_delivered: true,
           is_read: false,
         }),
       );
@@ -379,6 +538,14 @@ export class MessageService {
       receipt.revealed_at = now;
       receipt.burn_at = burnAt;
 
+      // V6.0：把消息的绝对销毁上限推到不早于本人这份的到期时刻。
+      // 否则会出现"7 天档消息在第 24 小时（destroy_at）被兜底删掉，而用户手里还有 6 天"。
+      const curDestroyMs = msg.destroy_at ? new Date(msg.destroy_at).getTime() : 0;
+      if (burnAt.getTime() > curDestroyMs) {
+        await msgRepo.update(msg.id, { destroy_at: burnAt });
+        msg.destroy_at = burnAt;
+      }
+
       // 广播已读回执：发送方实时看到「对方已点开」
       const memberIds = await this.getMemberUserIds(msg.conversation_id);
       this.events.emitToUsers(WS_EVENTS.RECEIPT_READ, memberIds, {
@@ -393,10 +560,8 @@ export class MessageService {
       ...msg,
       is_blurred: false,
       burn_at: receipt.burn_at,
-      remain_seconds: Math.max(
-        0,
-        Math.ceil((new Date(receipt.burn_at!).getTime() - now.getTime()) / 1000),
-      ),
+      // V6.0：剩余时间取 min(burn_at, destroy_at)，保证「显示的天数 = 实际存活天数」
+      remain_seconds: this.effectiveRemainSeconds(receipt.burn_at, msg.destroy_at, now.getTime()),
       // v5.8.9 播完才焚（仅音视频焚毁消息）：media_burn_pending=true 提示前端
       // 播放完成/放弃时调 POST /messages/:id/consume 提前焚毁（对齐前端契约字段名）；
       // consume_deadline = 消费窗口截止（ISO8601），到点未 consume 由调度器兜底焚毁。
@@ -492,7 +657,7 @@ export class MessageService {
   async editMessage(messageId: string, userId: string, newContent: string): Promise<Message> {
     const msgRepo = this.dataSource.getRepository(Message);
     const message = await msgRepo.findOne({ where: { id: messageId } });
-    if (!message) throw new NotFoundException('消息不存在');
+    if (!message || message.is_destroyed) throw new NotFoundException('消息不存在');
     if (message.sender_id !== userId) throw new ForbiddenException('You can only edit your own messages');
     if (message.is_recalled) throw new BadRequestException('Cannot edit a recalled message');
     // 焚毁消息禁止编辑：内容只在点开时下发，编辑会破坏「点开才焚」计时语义
@@ -518,7 +683,7 @@ export class MessageService {
   async recallMessage(messageId: string, userId: string): Promise<void> {
     const msgRepo = this.dataSource.getRepository(Message);
     const message = await msgRepo.findOne({ where: { id: messageId } });
-    if (!message) throw new NotFoundException('消息不存在');
+    if (!message || message.is_destroyed) throw new NotFoundException('消息不存在');
     if (message.sender_id !== userId) throw new ForbiddenException('You can only recall your own messages');
 
     const hoursSinceCreated = (Date.now() - new Date(message.created_at).getTime()) / (1000 * 60 * 60);
@@ -536,10 +701,30 @@ export class MessageService {
   }
 
   /** 标记已读：单条 UPDATE + 子查询，不再先查全量消息 ID */
-  async markAsRead(conversationId: string, userId: string): Promise<void> {
+  /**
+   * 标记已读（V6.0 支持上界）：
+   * - 传 `upToMessageId`：只把该条（含）之前、且尚未读的消息标记已读
+   *   —— 避免"刚进会话就把后面没看过的也标成已读"
+   * - 不传：整会话全部标记（兼容旧客户端）
+   */
+  async markAsRead(
+    conversationId: string,
+    userId: string,
+    upToMessageId?: string,
+  ): Promise<void> {
     await this.assertMember(conversationId, userId);
 
-    const result = await this.dataSource
+    // 上界消息的 created_at（用于只标记到该条）
+    let upToCreatedAt: Date | null = null;
+    if (upToMessageId) {
+      const upTo = await this.dataSource.getRepository(Message).findOne({
+        where: { id: upToMessageId, conversation_id: conversationId },
+        select: ['id', 'created_at'],
+      });
+      if (upTo) upToCreatedAt = upTo.created_at;
+    }
+
+    const qb = this.dataSource
       .getRepository(MessageReceipt)
       .createQueryBuilder()
       .update()
@@ -548,13 +733,26 @@ export class MessageService {
       .andWhere('is_read = :isRead', { isRead: false })
       .andWhere('message_id IN (SELECT id FROM messages WHERE conversation_id = :conversationId)', {
         conversationId,
-      })
-      .execute();
+      });
+    if (upToCreatedAt) {
+      qb.andWhere(
+        'message_id IN (SELECT id FROM messages WHERE conversation_id = :conversationId AND created_at <= :upToCreatedAt)',
+        { conversationId, upToCreatedAt },
+      );
+    }
+    const result = await qb.execute();
 
-    const lastMsg = await this.dataSource.getRepository(Message).findOne({
-      where: { conversation_id: conversationId },
-      order: { created_at: 'DESC' },
-    });
+    // 已读水位线：取「本次标记范围内」的最后一条消息（而不是会话最后一条，
+    // 否则上界生效时会把水位线错误推进到未读消息上）
+    const lastMsgQb = this.dataSource
+      .getRepository(Message)
+      .createQueryBuilder('m')
+      .where('m.conversation_id = :conversationId', { conversationId })
+      .orderBy('m.created_at', 'DESC');
+    if (upToCreatedAt) {
+      lastMsgQb.andWhere('m.created_at <= :upToCreatedAt', { upToCreatedAt });
+    }
+    const lastMsg = await lastMsgQb.getOne();
 
     if (lastMsg) {
       await this.dataSource.getRepository(ConversationMember).update(
@@ -576,11 +774,53 @@ export class MessageService {
     }
   }
 
-  /** 消息回执：仅会话成员可见（修复旧版任意用户可查漏洞） */
+  /**
+   * 群聊已读进度（V6.0）：非发送方人数 / 已点开 / 已到期 + 逐人明细。
+   * 供前端气泡下方显示「3/4 已读」，也用于管理端已读统计。
+   */
+  async getReadProgress(messageId: string, userId: string) {
+    const msgRepo = this.dataSource.getRepository(Message);
+    const message = await msgRepo.findOne({ where: { id: messageId } });
+    if (!message || message.is_destroyed) throw new NotFoundException('消息不存在');
+    await this.assertMember(message.conversation_id, userId);
+
+    const receipts = await this.dataSource.getRepository(MessageReceipt).find({
+      where: { message_id: messageId },
+    });
+    const userRepo = this.dataSource.getRepository(AppUser);
+    const now = Date.now();
+
+    const readers = await Promise.all(
+      receipts.map(async (r) => {
+        const u = await userRepo.findOne({ where: { id: r.user_id }, select: ['id', 'display_name'] });
+        return {
+          user_id: r.user_id,
+          display_name: u?.display_name || 'Unknown',
+          is_sender: r.user_id === message.sender_id,
+          is_read: r.is_read,
+          read_at: r.read_at,
+          revealed_at: r.revealed_at,
+          burn_at: r.burn_at,
+        };
+      }),
+    );
+
+    // 焚毁进度只统计「非发送方」（n-1），与焚毁规则保持一致
+    const others = readers.filter((r) => !r.is_sender);
+    return {
+      message_id: messageId,
+      total: others.length,
+      revealed: others.filter((r) => !!r.revealed_at).length,
+      burned: others.filter((r) => r.burn_at && new Date(r.burn_at).getTime() <= now).length,
+      readers,
+    };
+  }
+
+  /** 消息回执：仅会话成员可见（修复旧版任意用户可查漏洞）；已焚毁消息不再提供回执 */
   async getMessageReceipts(messageId: string, userId: string) {
     const msgRepo = this.dataSource.getRepository(Message);
     const message = await msgRepo.findOne({ where: { id: messageId } });
-    if (!message) throw new NotFoundException('消息不存在');
+    if (!message || message.is_destroyed) throw new NotFoundException('消息不存在');
 
     await this.assertMember(message.conversation_id, userId);
 
@@ -595,33 +835,6 @@ export class MessageService {
         return { ...receipt, user_display_name: user?.display_name || 'Unknown' };
       }),
     );
-  }
-
-  /** 销毁单条消息：删回执 + 断开引用 + 整行删除 + 删磁盘附件（与 BurnScheduler 语义一致） */
-  async destroyMessage(messageId: string): Promise<void> {
-    const msg = await this.dataSource.getRepository(Message).findOne({ where: { id: messageId } });
-    if (!msg) return;
-    await this.dataSource.transaction(async (em) => {
-      await em.getRepository(MessageReceipt).delete({ message_id: messageId });
-      await em.getRepository(Message).update({ reply_to_id: messageId }, { reply_to_id: null });
-      await em.getRepository(Message).delete({ id: messageId });
-    });
-    // v5.8.7：压缩版 + 原图（如有）一并删除，避免原图成为焚毁残留
-    const urls = [msg.file_url, msg.file_original_url].filter(Boolean);
-    if (urls.length) {
-      const fs = require('fs');
-      const path = require('path');
-      const uploadDir = path.resolve(process.cwd(), process.env.UPLOAD_DIR || './uploads');
-      for (const u of urls) {
-        try {
-          fs.unlinkSync(path.join(uploadDir, path.basename(u)));
-        } catch {
-          // 文件可能已不存在，不影响销毁
-        }
-        // v5.9.0 OSS 外置：完整 http(s) URL 的附件（OSS 签名地址）同步删 OSS 对象，避免焚毁残留
-        if (/^https?:/.test(u)) await this.oss.deleteByUrl(u);
-      }
-    }
   }
 
   /**

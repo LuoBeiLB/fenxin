@@ -189,7 +189,6 @@ export class ChannelService {
       avatar_url: conv.avatar_url,
       member_count: conv.member_count,
       visibility: conv.visibility,
-      ai_enabled: conv.ai_enabled,
       created_at: conv.created_at,
       last_message_at: conv.last_message_at,
       is_owner: conv.owner_id === userId,

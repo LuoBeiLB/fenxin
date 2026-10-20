@@ -46,6 +46,8 @@ describe('MessageService 音视频播完才焚（v5.8.9）', () => {
       findOne: jest.fn(async () => (opts.msg === undefined ? baseMsg : opts.msg)),
       create: jest.fn((d: any) => d),
       save: jest.fn(async (m: any) => m),
+      // V6.0：首次 reveal 会把 destroy_at 推到 ≥ burn_at（保证显示的天数=实际存活天数）
+      update: jest.fn(async () => ({ affected: 1 })),
     };
     receiptUpdate = jest.fn(async () => ({ affected: 1 }));
     const receiptRepo = {

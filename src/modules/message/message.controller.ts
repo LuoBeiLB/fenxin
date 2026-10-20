@@ -1,16 +1,28 @@
 import { Body, Controller, DefaultValuePipe, Get, Param, ParseIntPipe, Patch, Post, Put, Query } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { MessageService } from './message.service';
+import { DestroyService } from './destroy.service';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { ResponseMessage } from '../../common/decorators/response-message.decorator';
 import { AuthPayload } from '../../common/guards/jwt-auth.guard';
-import { SendMessageDto, EditMessageDto, SearchMessagesDto, UpdateOriginalFileDto, RevealMessageDto } from './dto';
+import {
+  SendMessageDto,
+  EditMessageDto,
+  SearchMessagesDto,
+  UpdateOriginalFileDto,
+  RevealMessageDto,
+  MarkReadDto,
+  DestroyAckDto,
+} from './dto';
 
 @ApiTags('消息管理')
 @ApiBearerAuth()
 @Controller('messages')
 export class MessageController {
-  constructor(private readonly messageService: MessageService) {}
+  constructor(
+    private readonly messageService: MessageService,
+    private readonly destroyService: DestroyService,
+  ) {}
 
   @Post()
   @ResponseMessage('发送成功')
@@ -26,6 +38,8 @@ export class MessageController {
       mediaDurationSeconds: dto.media_duration_seconds,
       replyToId: dto.reply_to_id,
       burnTtlSeconds: dto.burn_ttl_seconds,
+      // 旧客户端兼容（V6.0）：只在 burn_ttl_seconds 缺失时用于反算 ttl
+      destroyAt: dto.destroy_at,
       senderEphemeralPubkey: dto.sender_ephemeral_pubkey,
       cipherNonce: dto.cipher_nonce,
       cipherText: dto.cipher_text,
@@ -52,6 +66,39 @@ export class MessageController {
       pageSize: dto.pageSize,
       after: dto.after,
       before: dto.before,
+    });
+  }
+
+  /**
+   * 待确认真删除列表（V6.0 两阶段销毁·阶段②）。
+   * 前端进入会话时调用：返回本会话内「已焚毁」且「我还没确认过」的消息元数据（不含内容），
+   * 前端拿到后调 POST /messages/:conversationId/destroy-ack 确认。
+   */
+  @Get(':conversationId/pending-destroy')
+  pendingDestroy(
+    @CurrentUser() user: AuthPayload,
+    @Param('conversationId') conversationId: string,
+  ) {
+    return this.destroyService.listPending(conversationId, user.userId);
+  }
+
+  /**
+   * 确认真删除（V6.0 两阶段销毁·阶段②）：告知后端这些已焚毁消息可以物理删除了。
+   * 后端校验「会话成员 + 确实已焚毁」后，满足策略立即真删（行 + 回执 + 附件），
+   * 并写入 message_tombstones 供前端继续渲染"已焚毁"占位。
+   */
+  @Post(':conversationId/destroy-ack')
+  @ResponseMessage('已确认销毁')
+  destroyAck(
+    @CurrentUser() user: AuthPayload,
+    @Param('conversationId') conversationId: string,
+    @Body() dto: DestroyAckDto,
+  ) {
+    return this.destroyService.ack({
+      conversationId,
+      userId: user.userId,
+      deviceId: user.deviceId,
+      messageIds: dto.message_ids,
     });
   }
 
@@ -142,12 +189,25 @@ export class MessageController {
     return this.messageService.consumeMessage(id, user.userId);
   }
 
-  /** :id 为会话 ID（与旧版 API 保持一致） */
+  /** :id 为会话 ID（与旧版 API 保持一致）；body 可带 up_to_message_id 只标记到某条（V6.0） */
   @Post(':id/read')
   @ResponseMessage('已读标记成功')
-  async markRead(@CurrentUser() user: AuthPayload, @Param('id') conversationId: string) {
-    await this.messageService.markAsRead(conversationId, user.userId);
+  async markRead(
+    @CurrentUser() user: AuthPayload,
+    @Param('id') conversationId: string,
+    @Body() dto?: MarkReadDto,
+  ) {
+    await this.messageService.markAsRead(conversationId, user.userId, dto?.up_to_message_id);
     return null;
+  }
+
+  /**
+   * 群聊已读进度（V6.0）：返回非发送方人数、已点开/已到期人数与逐人明细，
+   * 供气泡下方显示「3/4 已读」。
+   */
+  @Get(':id/readers')
+  readers(@CurrentUser() user: AuthPayload, @Param('id') id: string) {
+    return this.messageService.getReadProgress(id, user.userId);
   }
 
   @Get(':id/receipt')

@@ -1,102 +1,149 @@
-import * as fs from 'fs';
 import { BurnScheduler } from './burn.scheduler';
+import { ConversationMember } from '../../entities/conversation-member.entity';
 import { Message } from '../../entities/message.entity';
-import { MessageReceipt } from '../../entities/message-receipt.entity';
 
 /**
- * BurnScheduler 单元测试（聚焦 v5.9.0 OSS 外置改动点）
- * mock DataSource / OssService / fs，不接 DB 不碰磁盘。
- * 覆盖：到期消息销毁时 OSS 附件同步删云端、本地附件只删磁盘、
- *       空附件跳过、无到期消息不进事务。
+ * BurnScheduler（V6.0 两阶段销毁·阶段①）单测。
+ *
+ * 核心断言：
+ *  - 只"标记"（UPDATE is_destroyed=1 + destroyed_at + destroy_reason），**绝不 DELETE**
+ *  - R1（兜底到期）/ R2（阅读完成 n-1）两条规则各查一次
+ *  - 标记后按会话广播 WS message:destroyed
+ *  - 幂等：只选 is_destroyed=0 的行
+ *  - 阶段②（真删）交给 DestroyService，调度器只做每小时兜底调用
  */
 
-const mockGetMany = jest.fn();
+type Row = { id: string; conversation_id: string };
 
-function makeQb() {
-  const qb: any = {};
-  qb.select = jest.fn(() => qb);
-  qb.where = jest.fn(() => qb);
-  qb.andWhere = jest.fn(() => qb);
-  qb.take = jest.fn(() => qb);
-  qb.getMany = mockGetMany;
-  return qb;
-}
+function makeScheduler(batches: Row[][]) {
+  let call = 0;
+  const getMany = jest.fn(async () => batches[call++] ?? []);
 
-function makeScheduler(messages: Array<Partial<Message>>) {
-  const qb = makeQb();
-  mockGetMany
-    .mockReset()
-    .mockResolvedValueOnce(messages) // A. 兜底到期（destroy_at）
-    .mockResolvedValueOnce([]); // B. 全员看完（burn_at）
-  const msgQbRepo = { createQueryBuilder: jest.fn(() => qb) };
-  const emMsgRepo = { update: jest.fn(), delete: jest.fn() };
-  const emReceiptRepo = { delete: jest.fn() };
-  const dataSource: any = {
-    getRepository: (entity: any) => (entity === Message ? msgQbRepo : emReceiptRepo),
-    transaction: jest.fn(async (fn: any) =>
-      fn({
-        getRepository: (e: any) => (e === MessageReceipt ? emReceiptRepo : emMsgRepo),
-      }),
-    ),
+  const selectQb: any = {
+    select: jest.fn(() => selectQb),
+    where: jest.fn(() => selectQb),
+    orderBy: jest.fn(() => selectQb),
+    take: jest.fn(() => selectQb),
+    getMany,
   };
-  const oss = {
-    enabled: true,
-    put: jest.fn(),
-    signedUrl: jest.fn(),
-    extractKey: jest.fn(),
-    deleteByUrl: jest.fn(),
-  } as any;
-  const scheduler = new BurnScheduler(dataSource, oss);
-  return { scheduler, oss, dataSource, emMsgRepo, emReceiptRepo };
+  const updateQb: any = {
+    update: jest.fn(() => updateQb),
+    set: jest.fn(() => updateQb),
+    whereInIds: jest.fn(() => updateQb),
+    andWhere: jest.fn(() => updateQb),
+    execute: jest.fn(async () => ({ affected: 1 })),
+  };
+
+  const msgRepo = {
+    createQueryBuilder: jest.fn((alias?: string) => (alias ? selectQb : updateQb)),
+  };
+  const memberRepo = {
+    find: jest.fn(async () => [{ user_id: 'u1' }, { user_id: 'u2' }]),
+  };
+  const dataSource: any = {
+    getRepository: (entity: any) => {
+      if (entity === ConversationMember) return memberRepo;
+      if (entity === Message) return msgRepo;
+      return {};
+    },
+  };
+  const events: any = { emitToUsers: jest.fn() };
+  const destroyService: any = {
+    purgeConfirmedOrExpired: jest.fn(async () => ({ acked: 0, expired: 0 })),
+  };
+
+  const scheduler = new BurnScheduler(dataSource, events, destroyService);
+  return { scheduler, events, destroyService, msgRepo, selectQb, updateQb, getMany, memberRepo };
 }
 
-describe('BurnScheduler（v5.9.0 OSS 外置）', () => {
-  let unlinkSpy: jest.SpyInstance;
-
-  beforeEach(() => {
-    unlinkSpy = jest.spyOn(fs, 'unlinkSync').mockImplementation(() => undefined as any);
+describe('BurnScheduler · 阶段①标记（V6.0）', () => {
+  it('没有到期的消息 → 不 UPDATE、不广播', async () => {
+    const { scheduler, updateQb, events } = makeScheduler([[], []]);
+    await scheduler.markDestroyed();
+    expect(updateQb.execute).not.toHaveBeenCalled();
+    expect(events.emitToUsers).not.toHaveBeenCalled();
   });
 
-  afterEach(() => {
-    unlinkSpy.mockRestore();
-  });
-
-  it('无到期消息 → 不进事务、不删任何文件', async () => {
-    const { scheduler, oss, dataSource } = makeScheduler([]);
-    await scheduler.destroyExpiredMessages();
-    expect(dataSource.transaction).not.toHaveBeenCalled();
-    expect(oss.deleteByUrl).not.toHaveBeenCalled();
-    expect(unlinkSpy).not.toHaveBeenCalled();
-  });
-
-  it('OSS 签名 URL 附件 → 焚毁时同步删除云端对象（不留焚毁残留）', async () => {
-    const ossUrl = 'https://fenxin-files.oss-cn-hangzhou.aliyuncs.com/uploads/a.png?sig=1';
-    const { scheduler, oss } = makeScheduler([{ id: 'm1', file_url: ossUrl }]);
-    await scheduler.destroyExpiredMessages();
-    expect(oss.deleteByUrl).toHaveBeenCalledWith(ossUrl);
-  });
-
-  it('本地 /uploads/ 路径（历史消息）→ 只删本地磁盘文件，不调 OSS', async () => {
-    const { scheduler, oss } = makeScheduler([{ id: 'm1', file_url: '/uploads/a.png' }]);
-    await scheduler.destroyExpiredMessages();
-    expect(oss.deleteByUrl).not.toHaveBeenCalled();
-    expect(unlinkSpy).toHaveBeenCalled();
-  });
-
-  it('file_url 为空 → 跳过附件清理', async () => {
-    const { scheduler, oss } = makeScheduler([{ id: 'm1', file_url: null }]);
-    await scheduler.destroyExpiredMessages();
-    expect(oss.deleteByUrl).not.toHaveBeenCalled();
-    expect(unlinkSpy).not.toHaveBeenCalled();
-  });
-
-  it('销毁流程完整：事务内删回执 + 断开引用 + 整行删除', async () => {
-    const { scheduler, emMsgRepo, emReceiptRepo } = makeScheduler([
-      { id: 'm1', file_url: null },
+  it('R1 兜底到期 → 标记 is_destroyed/destroyed_at/destroy_reason=fallback_expired', async () => {
+    const { scheduler, updateQb, events } = makeScheduler([
+      [{ id: 'm1', conversation_id: 'c1' }],
+      [],
     ]);
-    await scheduler.destroyExpiredMessages();
-    expect(emReceiptRepo.delete).toHaveBeenCalled(); // 删回执
-    expect(emMsgRepo.update).toHaveBeenCalled(); // 断开 reply_to 引用
-    expect(emMsgRepo.delete).toHaveBeenCalled(); // 整行物理删除
+    await scheduler.markDestroyed();
+
+    expect(updateQb.set).toHaveBeenCalledWith(
+      expect.objectContaining({
+        is_destroyed: true,
+        destroy_reason: 'fallback_expired',
+        destroyed_at: expect.any(Date),
+      }),
+    );
+    // 绝不物理删除：调度器不再持有删除逻辑
+    expect((updateQb as any).delete).toBeUndefined();
+
+    expect(events.emitToUsers).toHaveBeenCalledWith(
+      'message:destroyed',
+      ['u1', 'u2'],
+      expect.objectContaining({
+        conversation_id: 'c1',
+        message_ids: ['m1'],
+        reason: 'fallback_expired',
+      }),
+    );
+  });
+
+  it('R2 阅读完成 → reason=all_read，并按会话分组广播', async () => {
+    const { scheduler, updateQb, events } = makeScheduler([
+      [],
+      [
+        { id: 'm1', conversation_id: 'c1' },
+        { id: 'm2', conversation_id: 'c1' },
+        { id: 'm3', conversation_id: 'c2' },
+      ],
+    ]);
+    await scheduler.markDestroyed();
+
+    expect(updateQb.set).toHaveBeenCalledWith(
+      expect.objectContaining({ destroy_reason: 'all_read' }),
+    );
+    const calls = (events.emitToUsers as jest.Mock).mock.calls;
+    const c1 = calls.find((c) => c[2] && c[2].conversation_id === 'c1');
+    const c2 = calls.find((c) => c[2] && c[2].conversation_id === 'c2');
+    expect(c1[2].message_ids).toEqual(['m1', 'm2']);
+    expect(c2[2].message_ids).toEqual(['m3']);
+  });
+
+  it('幂等：两条规则的 WHERE 都限定 is_destroyed = false', async () => {
+    const { scheduler, selectQb } = makeScheduler([[], []]);
+    await scheduler.markDestroyed();
+    const sqls = (selectQb.where as jest.Mock).mock.calls.map((c) => String(c[0]));
+    expect(sqls).toHaveLength(2);
+    for (const sql of sqls) expect(sql).toContain('m.is_destroyed');
+    const params = (selectQb.where as jest.Mock).mock.calls.map((c) => c[1]);
+    for (const p of params) expect(p).toMatchObject({ destroyed: false, now: expect.any(Date) });
+  });
+
+  it('R2 的 SQL 体现 n-1 语义（非发送方 + 已点开 + 已到期）', async () => {
+    const { scheduler, selectQb } = makeScheduler([[], []]);
+    await scheduler.markDestroyed();
+    const r2 = String((selectQb.where as jest.Mock).mock.calls[1][0]);
+    expect(r2).toContain('r.user_id <> m.sender_id');
+    expect(r2).toContain('r.revealed_at IS NULL');
+    expect(r2).toContain('r.burn_at > :now');
+    expect(r2).toContain('m.burn_ttl_seconds IS NOT NULL');
+  });
+});
+
+describe('BurnScheduler · 阶段②兜底（V6.0）', () => {
+  it('purgeSweep → 调用 DestroyService.purgeConfirmedOrExpired', async () => {
+    const { scheduler, destroyService } = makeScheduler([[], []]);
+    await scheduler.purgeSweep();
+    expect(destroyService.purgeConfirmedOrExpired).toHaveBeenCalledTimes(1);
+  });
+
+  it('DestroyService 抛错不影响调度器（只记日志）', async () => {
+    const { scheduler, destroyService } = makeScheduler([[], []]);
+    destroyService.purgeConfirmedOrExpired.mockRejectedValueOnce(new Error('db down'));
+    await expect(scheduler.purgeSweep()).resolves.toBeUndefined();
   });
 });

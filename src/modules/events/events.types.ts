@@ -13,6 +13,8 @@ export const WS_EVENTS = {
   MESSAGE_RECALLED: 'message:recalled',
   /** 音视频焚毁消息被消费（v5.8.9 播完才焚）：前端播放完成/放弃调 consume，对端与本人其他设备实时切「已焚毁」态 */
   MESSAGE_CONSUMED: 'message:consumed',
+  /** 消息被标记焚毁（V6.0 两阶段销毁·阶段①）：全体成员就地切「已焚毁」墓碑，不再依赖 4 秒轮询 */
+  MESSAGE_DESTROYED: 'message:destroyed',
   /** 已读回执（谁读到了哪条消息） */
   RECEIPT_READ: 'receipt:read',
   /** 会话列表刷新信号（新建会话 / last_message_at 变化 / 成员变动） */
@@ -55,6 +57,20 @@ export interface WsMessageConsumedPayload {
   user_id: string;
   /** 消费时间（ISO8601） */
   consumed_at: string;
+}
+
+/**
+ * message:destroyed 的 payload（V6.0 两阶段销毁·阶段①：服务端已标记焚毁）。
+ * 前端收到后应把对应消息就地切成「已焚毁」墓碑，并删除本地倒计时。
+ */
+export interface WsMessageDestroyedPayload {
+  conversation_id: string;
+  /** 本批被标记焚毁的消息 ID 列表（调度器按批处理，通常 1~500 条） */
+  message_ids: string[];
+  /** 焚毁原因：fallback_expired=兜底到期 / all_read=阅读完成 / owner_dissolve / admin_dissolve / manual */
+  reason: 'fallback_expired' | 'all_read' | 'owner_dissolve' | 'admin_dissolve' | 'manual';
+  /** 标记时间（ISO8601） */
+  destroyed_at: string;
 }
 
 /** receipt:read 的 payload */
@@ -158,6 +174,7 @@ export interface WsEventPayloadMap {
   'message:edited': WsMessagePayload;
   'message:recalled': WsMessageRecalledPayload;
   'message:consumed': WsMessageConsumedPayload;
+  'message:destroyed': WsMessageDestroyedPayload;
   'receipt:read': WsReceiptReadPayload;
   'conversation:updated': WsConversationUpdatedPayload;
   'announcement:new': WsAnnouncementNewPayload;

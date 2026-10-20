@@ -19,12 +19,10 @@ export class ConversationMember {
   @Column({ length: 20, default: 'member' })
   role: MemberRole;
 
-  @Column({ default: false })
-  muted: boolean;
-
   @Column({ length: 36, nullable: true })
   last_read_message_id: string | null;
 
+  /** 入群时间（V6.0：此前只写不读，现用于群成员列表与已读统计展示） */
   @CreateDateColumn({ type: 'datetime' })
   joined_at: Date;
 }

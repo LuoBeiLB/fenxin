@@ -1,4 +1,4 @@
-import { IsString, IsUUID, IsIn, IsOptional, IsNumber, IsInt, Min, Max, MaxLength, Length, Matches, IsArray, ArrayMaxSize } from 'class-validator';
+import { IsString, IsUUID, IsIn, IsOptional, IsNumber, IsInt, Min, Max, MaxLength, Length, Matches, IsArray, ArrayMaxSize, ArrayNotEmpty } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 
@@ -60,6 +60,21 @@ export class SendMessageDto {
   @IsOptional()
   @IsNumber()
   burn_ttl_seconds?: number;
+
+  /**
+   * 【已废弃】旧客户端（2026-09-09 之前的构建）发消息时传的是绝对销毁时间。
+   * 当时后端直接落库；V5.6 起改为 burn_ttl_seconds，但 ValidationPipe 的
+   * whitelist:true 会把该字段静默丢弃 → 老 APK 发的"焚毁消息"变成永久消息。
+   * V6.0 起保留此字段做兼容：优先 burn_ttl_seconds，缺失时用 destroy_at 反算 ttl。
+   */
+  @ApiPropertyOptional({
+    deprecated: true,
+    description: '【旧客户端兼容】绝对销毁时间（ISO8601）。新客户端请改用 burn_ttl_seconds',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(40)
+  destroy_at?: string;
 
   @ApiPropertyOptional({ description: 'E2E 加密：发送方临时 X25519 公钥（base64，44 字符）。三个加密字段必须同时提供' })
   @IsOptional()
@@ -159,4 +174,35 @@ export class SearchMessagesDto {
   @IsOptional()
   @IsString()
   before?: string;
+}
+
+/**
+ * POST /messages/:conversationId/read body（V6.0）：支持"只标记到某条为止"。
+ * 不传 = 整会话全部标记已读（兼容旧客户端行为）。
+ */
+export class MarkReadDto {
+  @ApiPropertyOptional({
+    description: '只把该条（含）之前的消息标记已读；不传 = 整会话全部标记',
+  })
+  @IsOptional()
+  @IsUUID()
+  up_to_message_id?: string;
+}
+
+/**
+ * POST /messages/:conversationId/destroy-ack body（V6.0 两阶段销毁·阶段②）：
+ * 前端确认这些已焚毁的消息可以真删除（行 + 附件）。
+ * 后端会校验：① 调用者是会话成员 ② 每条消息确实 is_destroyed=1。
+ */
+export class DestroyAckDto {
+  @ApiProperty({
+    description: '确认可以真删除的消息 ID 列表（必须是本会话内、已焚毁的消息）',
+    type: [String],
+    example: ['3f9a2b8e-1111-4222-8333-444455556666'],
+  })
+  @IsArray()
+  @ArrayNotEmpty({ message: 'message_ids 不能为空' })
+  @ArrayMaxSize(500, { message: '单次最多确认 500 条' })
+  @IsUUID('4', { each: true, message: 'message_ids 内必须是合法 UUID' })
+  message_ids: string[];
 }

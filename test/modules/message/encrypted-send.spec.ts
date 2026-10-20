@@ -83,7 +83,17 @@ describe('MessageService.sendMessage（V4.0 §E2E 加密路径）', () => {
       isReady: () => true,
     };
 
-    svc = new MessageService(dataSource, realtime);
+    // 第 3 参 OssService：v5.9.0 起 MessageService 需要它（本 spec 只测发送校验，用空实现）
+    const oss = {
+      enabled: false,
+      put: jest.fn(),
+      signedUrl: jest.fn(),
+      extractKey: jest.fn(),
+      deleteByUrl: jest.fn(),
+      deleteByKey: jest.fn(),
+    } as any;
+
+    svc = new MessageService(dataSource, realtime, oss);
   };
 
   beforeEach(() => {

@@ -3,6 +3,8 @@ import { DataSource, In } from 'typeorm';
 import { Conversation } from '../../entities/conversation.entity';
 import { ConversationMember } from '../../entities/conversation-member.entity';
 import { AppUser, sanitizeUser } from '../../entities/app-user.entity';
+import { Message } from '../../entities/message.entity';
+import { MessageReceipt } from '../../entities/message-receipt.entity';
 import { EventsGateway } from '../events/events.gateway';
 import { WS_EVENTS } from '../events/events.types';
 
@@ -70,20 +72,37 @@ export class ConversationService {
       .orderBy('c.last_message_at IS NULL', 'ASC')
       .addOrderBy('c.last_message_at', 'DESC')
       .getMany();
+    if (conversations.length === 0) return [];
+
+    // 未读数（V6.0）：一次聚合查询，避免 N+1；排除已焚毁消息
+    const unreadRows = await this.dataSource
+      .getRepository(MessageReceipt)
+      .createQueryBuilder('r')
+      .select('m.conversation_id', 'conversation_id')
+      .addSelect('COUNT(*)', 'cnt')
+      .innerJoin(Message, 'm', 'm.id = r.message_id')
+      .where('r.user_id = :userId', { userId })
+      .andWhere('r.is_read = :isRead', { isRead: false })
+      .andWhere('m.is_destroyed = :destroyed', { destroyed: false })
+      .andWhere('m.conversation_id IN (:...ids)', { ids: conversations.map((c) => c.id) })
+      .groupBy('m.conversation_id')
+      .getRawMany<{ conversation_id: string; cnt: string }>();
+    const unreadMap = new Map(unreadRows.map((r) => [r.conversation_id, Number(r.cnt)]));
 
     return Promise.all(
       conversations.map(async (conv) => {
+        const base = { ...conv, unread_count: unreadMap.get(conv.id) ?? 0 };
         if (conv.type === 'private') {
           const members = await memberRepo.find({ where: { conversation_id: conv.id } });
           const otherUserId = members.map((m) => m.user_id).find((id) => id !== userId);
           if (otherUserId) {
             const otherUser = await userRepo.findOne({ where: { id: otherUserId } });
             if (otherUser) {
-              return { ...conv, other_user: sanitizeUser(otherUser) };
+              return { ...base, other_user: sanitizeUser(otherUser) };
             }
           }
         }
-        return conv;
+        return base;
       }),
     );
   }
