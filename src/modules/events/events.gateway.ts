@@ -10,7 +10,7 @@ import { DataSource } from 'typeorm';
 import { TokenService } from '../auth/token.service';
 import { AppUser } from '../../entities/app-user.entity';
 import { Device } from '../../entities/device.entity';
-import { WsEventPayloadMap, WsServerEvent, WS_EVENTS, userRoom } from './events.types';
+import { WsEventPayloadMap, WsServerEvent, WS_EVENTS, userRoom, deviceRoom } from './events.types';
 
 /**
  * 实时事件网关（socket.io）。
@@ -77,14 +77,23 @@ export class EventsGateway implements OnGatewayConnection, OnGatewayDisconnect {
       client.data.userId = payload.userId;
       client.data.deviceId = payload.deviceId;
       await client.join(userRoom(payload.userId));
+      // 设备房间：供"只推给某一台设备"使用（登录冲突踢人）
+      await client.join(deviceRoom(payload.deviceId));
 
       // V6.0 在线状态：连接数 +1，并刷新最后活跃时间（同一设备多标签页会累加）
       const deviceRepo = this.dataSource.getRepository(Device);
       await deviceRepo.increment({ id: payload.deviceId }, 'socket_count', 1);
+      const now = new Date();
       await deviceRepo.update(
         { id: payload.deviceId },
-        { is_online: true, online_at: new Date(), last_active_at: new Date() },
+        { is_online: true, online_at: now, last_active_at: now },
       );
+
+      // 通知同账号其他设备"这台设备上线了"（设备管理页/在线状态展示用）
+      this.emitToUsers(WS_EVENTS.DEVICE_ONLINE, [payload.userId], {
+        device_id: payload.deviceId,
+        online_at: now.toISOString(),
+      });
 
       this.logger.log(`WS connected user=${payload.userId} sid=${client.id}`);
     } catch (err: any) {
@@ -128,6 +137,23 @@ export class EventsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     try {
       if (!userIds || userIds.length === 0 || !this.server) return;
       this.server.to(userIds.map(userRoom)).emit(event, payload);
+    } catch (err: any) {
+      this.logger.error(`emit ${event} failed: ${err?.message}`);
+    }
+  }
+
+  /**
+   * 只推给指定设备（V6.0）。
+   * 用于登录冲突踢人：必须精准命中被踢设备，不能推给同账号新登录的那台。
+   */
+  emitToDevices<E extends WsServerEvent>(
+    event: E,
+    deviceIds: string[],
+    payload: WsEventPayloadMap[E],
+  ): void {
+    try {
+      if (!deviceIds || deviceIds.length === 0 || !this.server) return;
+      this.server.to(deviceIds.map(deviceRoom)).emit(event, payload);
     } catch (err: any) {
       this.logger.error(`emit ${event} failed: ${err?.message}`);
     }

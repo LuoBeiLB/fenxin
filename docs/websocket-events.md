@@ -51,14 +51,27 @@ token 过期后重连会持续失败，前端应在刷新 token 后先 `disconne
 | `message:new` | `MessageService.sendMessage()` 发送新消息成功后 | `WsMessagePayload` |
 | `message:edited` | `MessageService.editMessage()` 编辑成功后 | `WsMessagePayload` |
 | `message:recalled` | `MessageService.recallMessage()` 撤回成功后 | `WsMessageRecalledPayload` |
+| `message:consumed` | `MessageService.consumeMessage()` 音视频焚毁消息播完/放弃后 | `WsMessageConsumedPayload` |
+| `message:destroyed` | `BurnScheduler.markDestroyed()` 标记焚毁（V6.0 阶段①）/ 管理端手动焚毁 | `WsMessageDestroyedPayload` |
 | `receipt:read` | `MessageService.markAsRead()` 确实把未读翻成已读时 | `WsReceiptReadPayload` |
 | `conversation:updated` | 会话创建 / 新消息更新 `last_message_at` / 群成员变动 / 群资料变更 | `WsConversationUpdatedPayload` |
+| `device:added` | `AuthService.login()` 新建设备记录时（第 2 台起） | `WsDeviceAddedPayload` |
+| `device:removed` | 用户主动下线设备 / 管理端强制下线 / 设备数超限被淘汰 | `WsDeviceRemovedPayload` |
+| `session:conflict` | `AuthService.login()` 按 `SESSION_POLICY` 处理同账号新设备登录（V6.0） | `WsSessionConflictPayload` |
+| `device:online` | `EventsGateway.handleConnection()` WS 握手成功 | `WsDeviceOnlinePayload` |
+| `device:offline` | `PresenceScheduler` 判定设备离线（WS 全断开 + 心跳超时） | `WsDeviceOfflinePayload` |
 | `key:changed` | `KeysService.uploadIdentityKey()` 轮换 identity 公钥时（覆盖更新，首次上传不推） | `WsKeyChangedPayload` |
 | `app:update` | `AppVersionService` 发布新版本 / 恢复发布 / 已发布版本切强更时 | `WsAppUpdatePayload` |
 
 > 注：`key:changed` 与 `app:update` 不带 `conversation_id` —— 它们与单个会话无关。
 > `key:changed` 推送给**轮换者的全部共同会话用户**（谁可能缓存了旧公钥就推给谁）；
 > `app:update` 推送给**全部 active 在线用户**（全员发版通知，客户端按 platform 过滤）。
+>
+> **推给"某台设备"而不是"某个用户"**：`session:conflict`（`single` 模式的
+> `kicked_by_new_login`）与 `device:removed`（设备数超限淘汰）走
+> `device:{deviceId}` 房间（`EventsGateway.emitToDevices`），
+> 避免把"你被踢了"推给刚登录的新设备。其余事件仍走 `user:{userId}` 房间。
+
 
 ## payload 结构
 
@@ -179,6 +192,63 @@ App 自更新（V5.8）事件：管理员发布新版本、恢复发布（publis
 客户端收到后：按 `platform` 过滤 → 与本地 versionCode 做**整数比较**（不要用
 version_name 字符串比较）→ 有新版本则弹更新窗（force=true 时不给「下次再说」）→
 下载 `apk_url` → 唤起系统安装器。完整对接细节（含下载安装插件代码）见 `docs/APP_UPDATE.md`。
+
+### WsMessageDestroyedPayload（message:destroyed，V6.0）
+
+```jsonc
+{
+  "conversation_id": "uuid",
+  "message_ids": ["uuid1", "uuid2"],   // 本批被标记焚毁的消息（调度器按批处理，通常 1~500 条）
+  "reason": "all_read",                // fallback_expired=兜底到期 / all_read=阅读完成 /
+                                       // owner_dissolve / admin_dissolve / manual=管理端手动
+  "destroyed_at": "2026-10-20T06:22:00.000Z"
+}
+```
+
+**只表示"已标记焚毁"（阶段①）**，此时消息行与附件仍在，只是对用户不可见。
+前端收到后应：把对应消息就地切成「已焚毁」墓碑、清掉本地倒计时、不再调 reveal。
+真正的物理删除由前端进会话时 `POST /messages/{conversationId}/destroy-ack` 确认，
+或由服务端 `ACK_FALLBACK_DAYS` 超期兜底执行（删除后列表改由墓碑表提供占位）。
+
+### WsSessionConflictPayload（session:conflict，V6.0）
+
+```jsonc
+{
+  "reason": "new_device_login",   // new_device_login=其他设备登录提醒（不踢人）
+                                  // kicked_by_new_login=本机已被踢（下次请求即 401）
+  "new_device": {                 // reason=new_device_login 时必带；kicked 时也带，便于展示"被谁踢"
+    "id": "uuid",                 // 新设备记录 ID（前端可与本地 deviceId 比对，是自己则忽略）
+    "name": "MacBook Pro",
+    "ip": "1.2.3.4",              // 可能为 null
+    "at": "2026-10-20T07:00:00.000Z"
+  },
+  "at": "2026-10-20T07:00:00.000Z"
+}
+```
+
+由 env `SESSION_POLICY` 决定行为：
+
+| 策略 | 行为 | 收到的事件 |
+| --- | --- | --- |
+| `allow` | 多端并存，不提示 | 无 |
+| `notify`（默认） | 多端并存 + 弹窗提醒 | 其他设备收 `new_device_login`（新设备自己不收） |
+| `single` | 单点登录，踢掉其他设备 | 被踢设备收 `kicked_by_new_login`，随后 REST 401 |
+
+前端处理：`new_device_login` 弹**可关闭**弹窗；`kicked_by_new_login` 弹**阻断式**弹窗 → 清 token → 跳登录页。
+
+### WsDeviceOnlinePayload / WsDeviceOfflinePayload（device:online / device:offline，V6.0）
+
+```jsonc
+// device:online —— WS 握手成功
+{ "device_id": "uuid", "online_at": "2026-10-20T07:00:00.000Z" }
+
+// device:offline —— PresenceScheduler 判定离线（WS 全断开 + 心跳超过 ONLINE_TTL_SECONDS）
+{ "device_id": "uuid", "offline_at": "2026-10-20T07:02:00.000Z" }
+```
+
+用于「设备管理页」与在线状态展示实时刷新。注意 `device_id` 是 `devices.id`（记录主键），
+不是设备指纹 `device_id` 字段（前端侧叫 deviceId/指纹的那个）。
+
 
 ## 服务端注入点一览
 

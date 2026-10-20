@@ -25,6 +25,16 @@ export const WS_EVENTS = {
   DEVICE_ADDED: 'device:added',
   /** 设备被下线通知 */
   DEVICE_REMOVED: 'device:removed',
+  /**
+   * 登录冲突（V6.0，SESSION_POLICY=notify|single）：
+   * 同账号在新设备登录 → 推给该账号其他在线设备。
+   * notify 模式下只提醒、不踢人；single 模式下被踢设备随后 401。
+   */
+  SESSION_CONFLICT: 'session:conflict',
+  /** 设备上线（WS 连上）：{ device_id, online_at } */
+  DEVICE_ONLINE: 'device:online',
+  /** 设备离线（WS 全断开且心跳超时，由 PresenceScheduler 判定）：{ device_id, offline_at } */
+  DEVICE_OFFLINE: 'device:offline',
   /** 身份公钥变更通知（TOFU）：某用户轮换了 identity 公钥，通知其共同会话用户重新比对本地缓存 */
   KEY_CHANGED: 'key:changed',
   /** App 新版本发布（V5.8 自更新）：管理员发布/恢复发布/切换强更时推给全部在线用户，客户端弹更新提示 */
@@ -133,6 +143,44 @@ export interface WsDeviceRemovedPayload {
 }
 
 /**
+ * session:conflict 的 payload（V6.0 登录冲突）。
+ *
+ * 两种原因：
+ *  - `new_device_login`（SESSION_POLICY=notify）：同账号在新设备登录，旧设备收到提醒。
+ *    前端应弹**可关闭**弹窗"账号在另一台设备登录"，不强制退出。
+ *  - `kicked_by_new_login`（SESSION_POLICY=single）：旧设备已被踢，其 devices 行已删除，
+ *    下次 HTTP 请求即 401。前端应弹**阻断式**弹窗并跳登录页。
+ */
+export interface WsSessionConflictPayload {
+  reason: 'new_device_login' | 'kicked_by_new_login';
+  /** 触发本次冲突的新设备信息（前端可按 id 判断是不是自己） */
+  new_device?: {
+    id: string;
+    name: string;
+    /** 登录来源 IP（可能为空） */
+    ip: string | null;
+    /** 登录时间（ISO8601） */
+    at: string;
+  };
+  /** 事件时间（ISO8601） */
+  at: string;
+}
+
+/** device:online 的 payload（WS 连上） */
+export interface WsDeviceOnlinePayload {
+  device_id: string;
+  /** 上线时间（ISO8601） */
+  online_at: string;
+}
+
+/** device:offline 的 payload（WS 全断开 + 心跳超时，由清扫任务判定） */
+export interface WsDeviceOfflinePayload {
+  device_id: string;
+  /** 下线时间（ISO8601） */
+  offline_at: string;
+}
+
+/**
  * key:changed 的 payload（TOFU 支撑）。
  * 只带 user_id + updated_at，不带公钥本体：客户端收到后自行 GET /keys/:userId
  * 与本地钉住的公钥比对，不一致才告警 —— 保证所有公钥都走同一条 TOFU 比对路径。
@@ -168,8 +216,7 @@ export interface WsAppUpdatePayload {
   published_at: string;
 }
 
-/** 事件名 → payload 类型映射，供 emitToUsers 做类型约束 */
-export interface WsEventPayloadMap {
+/** 事件名 → payload 类型映射，供 emitToUsers 做类型约束 */export interface WsEventPayloadMap {
   'message:new': WsMessagePayload;
   'message:edited': WsMessagePayload;
   'message:recalled': WsMessageRecalledPayload;
@@ -180,6 +227,9 @@ export interface WsEventPayloadMap {
   'announcement:new': WsAnnouncementNewPayload;
   'device:added': WsDeviceAddedPayload;
   'device:removed': WsDeviceRemovedPayload;
+  'session:conflict': WsSessionConflictPayload;
+  'device:online': WsDeviceOnlinePayload;
+  'device:offline': WsDeviceOfflinePayload;
   'key:changed': WsKeyChangedPayload;
   'app:update': WsAppUpdatePayload;
 }
@@ -187,4 +237,9 @@ export interface WsEventPayloadMap {
 /** 每个用户专属的房间名：同一用户的所有在线设备（socket）都会加入该房间 */
 export function userRoom(userId: string): string {
   return `user:${userId}`;
+}
+
+/** 单台设备专属房间名：用于"只推给某一台设备"（如登录冲突踢人） */
+export function deviceRoom(deviceId: string): string {
+  return `device:${deviceId}`;
 }

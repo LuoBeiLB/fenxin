@@ -79,6 +79,8 @@ export class AuthService {
       device.device_name = deviceInfo.deviceName;
       device.device_type = deviceInfo.deviceType;
       device.is_online = true;
+      device.online_at = device.online_at ?? new Date();
+      device.offline_at = null;
       device.last_active_at = new Date();
       await deviceRepo.save(device);
     } else {
@@ -89,6 +91,7 @@ export class AuthService {
           device_type: deviceInfo.deviceType,
           device_id: deviceInfo.deviceId ?? crypto.randomUUID(),
           is_online: true,
+          online_at: new Date(),
           last_active_at: new Date(),
         }),
       );
@@ -107,6 +110,11 @@ export class AuthService {
         });
       }
     }
+
+    // V6.0 会话策略（SESSION_POLICY=allow|notify|single）+ 设备数上限
+    // 放在设备落库之后、签发 token 之前：single 模式下先踢旧设备再发 token，
+    // 避免"新设备登录失败导致两边都掉线"。
+    await this.applySessionPolicy(user.id, device, meta.ip);
 
     const payload: AuthPayload = {
       userId: user.id,
@@ -264,5 +272,90 @@ export class AuthService {
   private onlineTtlSeconds(): number {
     const n = parseInt(process.env.ONLINE_TTL_SECONDS || '150', 10);
     return Number.isFinite(n) && n > 0 ? n : 150;
+  }
+
+  /** 会话策略：allow | notify | single（非法值按 notify 处理） */
+  private sessionPolicy(): 'allow' | 'notify' | 'single' {
+    const v = (process.env.SESSION_POLICY || 'notify').toLowerCase();
+    return v === 'allow' || v === 'single' ? v : 'notify';
+  }
+
+  /** 单账号设备数上限：<=0 表示不限制 */
+  private maxDevicesPerUser(): number {
+    const n = parseInt(process.env.MAX_DEVICES_PER_USER || '5', 10);
+    return Number.isFinite(n) ? n : 5;
+  }
+
+  /**
+   * 登录后的会话策略处理（V6.0）。
+   *
+   * - allow  ：允许多端并存，不提示（最宽松）
+   * - notify ：允许多端并存，向**其他在线设备**推 session:conflict（默认，弹窗提醒）
+   * - single ：踢掉该账号其他所有设备（单点登录）
+   *
+   * 另外无论哪种策略都执行 MAX_DEVICES_PER_USER 上限：超出时按最近活跃时间
+   * 淘汰最久未用的设备，避免设备表无限膨胀。
+   */
+  private async applySessionPolicy(userId: string, current: Device, ip?: string): Promise<void> {
+    const deviceRepo = this.dataSource.getRepository(Device);
+    const policy = this.sessionPolicy();
+
+    const others = (
+      await deviceRepo.find({ where: { user_id: userId }, order: { last_active_at: 'DESC' } })
+    ).filter((d) => d.id !== current.id);
+
+    const at = new Date().toISOString();
+    const newDevice = {
+      id: current.id,
+      name: current.device_name,
+      ip: ip ?? null,
+      at,
+    };
+
+    if (policy === 'single' && others.length > 0) {
+      // 单点登录：删记录 → JWT 守卫下次请求即 401；同时精准通知被踢设备
+      for (const d of others) {
+        await deviceRepo.delete({ id: d.id });
+        this.authCache.invalidate(userId, d.id);
+        this.events.emitToDevices(WS_EVENTS.SESSION_CONFLICT, [d.id], {
+          reason: 'kicked_by_new_login',
+          new_device: newDevice,
+          at,
+        });
+      }
+      await this.audit.log({
+        userId,
+        action: 'session_kicked_by_new_login',
+        detail: `policy=single kicked=${others.length}`,
+        ipAddress: ip,
+      });
+      return;
+    }
+
+    if (policy === 'notify' && others.length > 0) {
+      // 多端并存但提醒：只推给其他设备（不推给新登录的这台，减少一次无用弹窗）
+      this.events.emitToDevices(
+        WS_EVENTS.SESSION_CONFLICT,
+        others.map((d) => d.id),
+        { reason: 'new_device_login', new_device: newDevice, at },
+      );
+    }
+
+    // 设备数上限（所有策略都执行）
+    const max = this.maxDevicesPerUser();
+    if (max > 0 && others.length + 1 > max) {
+      const excess = others.slice(max - 1); // others 已按 last_active_at DESC
+      for (const d of excess) {
+        await deviceRepo.delete({ id: d.id });
+        this.authCache.invalidate(userId, d.id);
+        this.events.emitToDevices(WS_EVENTS.DEVICE_REMOVED, [d.id], { device_id: d.id });
+      }
+      await this.audit.log({
+        userId,
+        action: 'device_limit_exceeded',
+        detail: `max=${max} evicted=${excess.length}`,
+        ipAddress: ip,
+      });
+    }
   }
 }

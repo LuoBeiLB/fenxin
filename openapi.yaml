@@ -524,6 +524,57 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /auth/devices/{deviceId}/heartbeat:
+    post:
+      tags: [认证]
+      summary: 设备心跳（V6.0，维护真实在线状态）
+      description: |-
+        【用途】客户端定时上报"我还在用"，用于维护管理端可见的真实在线状态。
+
+        【调用时机】App 在前台时每 45~60 秒调一次；切后台/退出时停止调用。
+        建议同时保留 WS —— WS 掉线时心跳仍在，可避免"弱网静默断连"被误判离线。
+
+        【业务规则与注意事项】
+        - 路径参数 deviceId 为设备记录主键 `Device.id`（不是设备指纹 `device_id`）。
+        - 刷新 `devices.last_active_at` 并置 `is_online=true`（首次上线记录 `online_at`）。
+        - 服务端判定在线：`socket_count > 0` **或** `last_active_at` 在
+          `ONLINE_TTL_SECONDS`（默认 150s）内；两者都失效由每分钟清扫任务置离线。
+        - **不调心跳会被判离线**：旧版前端未接入时，过渡期可把 `ONLINE_TTL_SECONDS` 调大。
+        - 返回 `server_time` 便于客户端校时（本地倒计时以服务端时间为准）。
+        - 限流：每设备 60 次/分钟。
+      parameters:
+        - name: deviceId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+          description: 设备记录主键 Device.id（UUID，非 device_id 设备指纹）
+          example: 3f8a2b1c-9d4e-4c5b-a6f7-1e2d3c4b5a69
+      responses:
+        '201':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: ok }
+                  data:
+                    type: object
+                    properties:
+                      server_time: { type: string, format: date-time }
+                      online_ttl: { type: integer, example: 150, description: 在线判定 TTL（秒） }
+        '401':
+          description: 未携带或无效/过期 token；账号已停用或设备已下线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: 设备不存在或已下线（设备记录被删除）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   /accounts:
     post:
       tags: [账号]

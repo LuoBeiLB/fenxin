@@ -22,14 +22,26 @@
 
 | 项 | 说明 |
 |---|---|
-| 登录冲突 `session:conflict` WS 事件 | 策略已定 `notify`（允许多端 + 弹窗提醒），事件与前端弹窗未做 |
-| `allow / single` 策略开关 | `SESSION_POLICY` env 未引入；当前行为等价于 `allow`（不拦截、不提醒） |
-| 前端心跳循环 | 前端尚未调 heartbeat；**不调的话设备会在 150s 后被判定离线**，管理端在线数会偏低 |
-| `device:online` / `device:offline` 事件 | 未广播（管理端靠轮询 overview 即可，前端暂不需要） |
+| 登录冲突 `session:conflict` | ✅ 已实现（2026-10-20）：`SESSION_POLICY=allow\|notify\|single` + `emitToDevices` 精准推给被踢设备 |
+| `MAX_DEVICES_PER_USER` | ✅ 已实现：超出时按 `last_active_at` 淘汰最久未用 + 写审计 |
+| 设备上下线事件 | ✅ 已实现：`device:online`（WS 连上）/ `device:offline`（清扫任务判定） |
+| 前端心跳循环 | ❌ 前端尚未调 heartbeat；**不调的话设备会在 `ONLINE_TTL_SECONDS` 后被判离线** |
+| 前端冲突弹窗 | ❌ 前端尚未监听 `session:conflict`（后端事件已就绪，见 websocket-events.md） |
 
 > ⚠️ 上线顺序提醒：后端心跳接口与清扫任务一旦生效，**旧版前端（不调 heartbeat）
 > 会表现为"一直离线"**。若要平滑，可先把 `ONLINE_TTL_SECONDS` 调大（如 600）
 > 等前端发版后再调回 150；或前端发版与后端同时上线。
+
+### 实现细节补充
+
+- `single` 模式在**设备落库之后、签发 token 之前**执行踢人：新设备登录失败时
+  不会把旧设备一起弄掉（文档 §10 风险规避）。
+- 登录冲突只推给**其他设备**（`device:{deviceId}` 房间），不推给刚登录的新设备，
+  避免新设备自己弹一次"账号在另一台设备登录"。
+- `MAX_DEVICES_PER_USER` 与 `SESSION_POLICY` 独立：`notify` 模式下也可能因超限被淘汰，
+  被淘汰的设备收到 `device:removed`，并写审计 `device_limit_exceeded`。
+- 设备离线判定优先看 `socket_count`，其次看 `last_active_at`：
+  多标签页关闭其中一个不会误判离线。
 
 ---
 

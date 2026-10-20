@@ -44,7 +44,14 @@ const baseUser = {
 describe('AuthService topic（用户主题色）', () => {
   let service: AuthService;
   let userRepo: { findOne: jest.Mock; update: jest.Mock };
-  let deviceRepo: { findOne: jest.Mock; create: jest.Mock; save: jest.Mock; count: jest.Mock };
+  let deviceRepo: {
+    findOne: jest.Mock;
+    create: jest.Mock;
+    save: jest.Mock;
+    count: jest.Mock;
+    find: jest.Mock;
+    delete: jest.Mock;
+  };
   let tokenService: { issueTokenPair: jest.Mock };
 
   beforeEach(() => {
@@ -56,6 +63,9 @@ describe('AuthService topic（用户主题色）', () => {
       create: jest.fn((x: any) => x),
       save: jest.fn((x: any) => ({ ...x, id: 'd-1' })),
       count: jest.fn().mockResolvedValue(1),
+      // V6.0 会话策略需要：查同账号其他设备 / 踢设备
+      find: jest.fn().mockResolvedValue([]),
+      delete: jest.fn().mockResolvedValue({ affected: 1 }),
     };
     const dataSource = {
       getRepository: jest.fn((entity: any) => (entity === AppUser ? userRepo : deviceRepo)),
@@ -66,7 +76,8 @@ describe('AuthService topic（用户主题色）', () => {
     };
     const audit = { log: jest.fn() };
     const authCache = { invalidate: jest.fn() };
-    const events = { emitToUsers: jest.fn() };
+    // V6.0：会话策略会调 emitToDevices（登录冲突只推给指定设备）
+    const events = { emitToUsers: jest.fn(), emitToDevices: jest.fn() };
 
     mockedArgon2.verify.mockResolvedValue(true);
 

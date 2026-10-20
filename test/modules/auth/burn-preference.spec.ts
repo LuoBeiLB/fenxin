@@ -50,7 +50,14 @@ const baseUser = {
 describe('AuthService 默认焚毁时长偏好（default_burn_ttl_seconds）', () => {
   let service: AuthService;
   let userRepo: { findOne: jest.Mock; update: jest.Mock };
-  let deviceRepo: { findOne: jest.Mock; create: jest.Mock; save: jest.Mock; count: jest.Mock };
+  let deviceRepo: {
+    findOne: jest.Mock;
+    create: jest.Mock;
+    save: jest.Mock;
+    count: jest.Mock;
+    find: jest.Mock;
+    delete: jest.Mock;
+  };
 
   beforeEach(() => {
     jest.restoreAllMocks();
@@ -61,6 +68,9 @@ describe('AuthService 默认焚毁时长偏好（default_burn_ttl_seconds）', (
       create: jest.fn((x: any) => x),
       save: jest.fn((x: any) => ({ ...x, id: 'd-1' })),
       count: jest.fn().mockResolvedValue(1),
+      // V6.0 会话策略需要：查同账号其他设备 / 踢设备
+      find: jest.fn().mockResolvedValue([]),
+      delete: jest.fn().mockResolvedValue({ affected: 1 }),
     };
     const dataSource = {
       getRepository: jest.fn((entity: any) => (entity === AppUser ? userRepo : deviceRepo)),
@@ -77,7 +87,7 @@ describe('AuthService 默认焚毁时长偏好（default_burn_ttl_seconds）', (
       { log: jest.fn() } as unknown as AuditService,
       tokenService as unknown as TokenService,
       { invalidate: jest.fn() } as unknown as AuthCacheService,
-      { emitToUsers: jest.fn() } as unknown as EventsGateway,
+      { emitToUsers: jest.fn(), emitToDevices: jest.fn() } as unknown as EventsGateway,
     );
   });
 
