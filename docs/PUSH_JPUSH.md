@@ -41,6 +41,56 @@ JPUSH_MASTER_SECRET=
 
 **测试可用的一个入口**：`JPUSH_ENDPOINT` 可覆盖推送地址，端到端测试时可指向本地 mock 服务。
 
+### 0.2 「控制台能收到、业务消息收不到」的已知根因（V6.2 已修）
+
+**现象**：极光控制台按 alias 直推，手机能弹；业务发消息却收不到。
+
+**根因：离线判定太慢**
+
+```
+原逻辑：is_online 只在 PresenceScheduler（每分钟一次）里被置 0，
+       且要求 last_active_at 超过 ONLINE_TTL_SECONDS（150s）
+       → App 切后台断 WS 后，最长约 210 秒才被判离线
+       → 这期间消息判定为「对方在线」，完全不推送
+```
+
+**修复**（`events.gateway.ts` 的 `handleDisconnect`）
+
+```
+WS 断开 → socket_count -1 → 若归 0，则【立即】置 is_online=0 并广播 device:offline
+```
+
+保留两道保护：
+
+- `socket_count` 守卫：多标签页 / 多设备下只有**最后一个**连接断开才置离线，不会误判；
+- `PresenceScheduler` 继续兜底，覆盖"断连事件丢失"（进程被杀）的情况。
+
+**验证**：`test/modules/events/events.gateway.spec.ts`（3 例）。
+**前端配合点**：App 切后台要**主动断开 WS**（他们已实现）；否则连接还在、`socket_count > 0`，后端仍视为在线，自然不会推。
+
+### 0.3 派生推送体（排查时逐字段对照）
+
+```jsonc
+{
+  "platform": ["android"],
+  "audience": { "alias": ["<收件人 userId>"] },
+  "notification": {                       // ← 一定是 notification，不是透传 message
+    "android": {
+      "alert": "张三：前 30 字 / 你有一条阅后即焚消息",
+      "title": "会话名（群）或发送者名（私聊）",
+      "channel_id": "messages",           // ← 必须与 APK 渠道一致
+      "small_icon": "ic_stat_notify",     // ← 仅当配置了 JPUSH_SMALL_ICON
+      "extras": {
+        "conversation_id": "<会话 uuid>",  // ← 点通知跳转用，键名固定
+        "message_id": "<消息 uuid>",
+        "type": "text|image|voice|video|file"
+      }
+    }
+  },
+  "options": { "time_to_live": 3600 }
+}
+```
+
 ---
 
 ## 0.1 决策记录（结论先行）
@@ -56,7 +106,6 @@ JPUSH_MASTER_SECRET=
 ---
 
 ## 1. 整体链路
-
 ```
 ① APK 启动 → 极光 SDK 初始化 → 拿到 registration_id
 ② 登录成功 → JPushInterface.setAlias(userId)        ← 极光侧建立「用户 ↔ 设备」映射

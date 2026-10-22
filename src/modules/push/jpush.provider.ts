@@ -47,6 +47,11 @@ export class JpushProvider {
     return process.env.JPUSH_CHANNEL_ID || 'messages';
   }
 
+  /** 小图标名（APK 的 drawable 资源名）；留空则不传，用极光默认 */
+  private get smallIcon(): string {
+    return process.env.JPUSH_SMALL_ICON || '';
+  }
+
   /** 离线消息保留时长（秒）：超时后不再打扰 */
   private get ttlSeconds(): number {
     const n = parseInt(process.env.JPUSH_TTL_SECONDS || '3600', 10);
@@ -70,6 +75,9 @@ export class JpushProvider {
           title: msg.title,
           // 必须与 APK 里创建的 NotificationChannel id 一致，否则 Android 8+ 不显示
           channel_id: this.channelId,
+          // 可选：白色剪影小图标名（APK 的 res/drawable 里存在才有效）。
+          // 不配则用极光默认图标（彩色图标在 Android 8+ 会渲染成方块）。
+          ...(this.smallIcon ? { small_icon: this.smallIcon } : {}),
           extras: { conversation_id: msg.conversationId, ...(msg.extra ?? {}) },
         },
       },

@@ -231,8 +231,27 @@ describe('JpushProvider · 请求构造与容错', () => {
       message_id: 'm-9',
     });
     expect(body.options.time_to_live).toBe(120);
+    // 未配 JPUSH_SMALL_ICON 时不应出现该字段
+    expect(body.notification.android.small_icon).toBeUndefined();
     // Basic Auth 头存在
     expect((init.headers as any).Authorization).toMatch(/^Basic /);
+  });
+
+  it('payload：配置 JPUSH_SMALL_ICON 后带上 small_icon', async () => {
+    withEnv();
+    process.env.JPUSH_SMALL_ICON = 'ic_stat_notify';
+    const fetchMock = jest.fn(async () => ({
+      ok: true,
+      status: 200,
+      text: async () => '{"sendno":"0","msg_id":"1"}',
+    }));
+    globalThis.fetch = fetchMock as any;
+
+    const p = new JpushProvider();
+    await p.pushToUsers(['u-1'], { title: 't', alert: 'a', conversationId: 'c' });
+
+    const body = JSON.parse((fetchMock.mock.calls[0] as any)[1].body);
+    expect(body.notification.android.small_icon).toBe('ic_stat_notify');
   });
 
   it('非 2xx → 返回 false，不抛错', async () => {

@@ -106,23 +106,53 @@ export class EventsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     const userId = client.data?.userId;
     const deviceId = client.data?.deviceId;
     this.logger.log(`WS disconnected user=${userId ?? 'unknown'} sid=${client.id}`);
-    // 连接数 -1（GREATEST 防并发下减成负数）；是否置离线交给 PresenceScheduler 按心跳兜底判定，
-    // 这样"关掉一个标签页但还有另一个"不会被误判为离线。
-    if (deviceId) {
-      this.dataSource
-        .getRepository(Device)
-        .createQueryBuilder()
-        .update()
-        .set({
-          socket_count: () => 'GREATEST(socket_count - 1, 0)',
-          last_active_at: new Date(),
-        })
-        .where('id = :deviceId', { deviceId })
-        .execute()
-        .catch((err: any) =>
-          this.logger.warn(`WS disconnect update failed: ${err?.message || err}`),
-        );
-    }
+    if (!deviceId) return;
+
+    // 连接数 -1（GREATEST 防并发下减成负数）
+    const repo = this.dataSource.getRepository(Device);
+    repo
+      .createQueryBuilder()
+      .update()
+      .set({
+        socket_count: () => 'GREATEST(socket_count - 1, 0)',
+        last_active_at: new Date(),
+      })
+      .where('id = :deviceId', { deviceId })
+      .execute()
+      .catch((err: any) =>
+        this.logger.warn(`WS disconnect update failed: ${err?.message || err}`),
+      );
+
+    // V6.2：连接数归 0 时**立即置离线**，不再等心跳超时。
+    //
+    // 为什么改：离线推送只对 `is_online = 0` 的用户发；而原先离线判定要等
+    // PresenceScheduler 每分钟扫一次、且 last_active_at 超过 ONLINE_TTL_SECONDS(150s)，
+    // 于是"App 切后台断连 → 最多约 210 秒后才判离线"，这期间的消息完全不推，
+    // 表现为「控制台能收到、业务消息收不到」。
+    //
+    // 这里保留 socket_count 的保护：多标签页/多设备下只有最后一个连接断开才置离线，
+    // 不会误判；PresenceScheduler 仍作为兜底（覆盖"断连事件丢失"的情况）。
+    //
+    // 两条 UPDATE 分开执行，避免 MySQL「SET 子句左到右求值」导致的 count 语义歧义。
+    repo
+      .createQueryBuilder()
+      .update()
+      .set({ is_online: false, offline_at: new Date() })
+      .where('id = :deviceId', { deviceId })
+      .andWhere('socket_count = 0')
+      .andWhere('is_online = 1')
+      .execute()
+      .then((result) => {
+        if ((result.affected ?? 0) > 0 && userId) {
+          this.emitToUsers(WS_EVENTS.DEVICE_OFFLINE, [userId], {
+            device_id: deviceId,
+            offline_at: new Date().toISOString(),
+          });
+        }
+      })
+      .catch((err: any) =>
+        this.logger.warn(`WS disconnect offline update failed: ${err?.message || err}`),
+      );
   }
 
   /**

@@ -2,6 +2,7 @@ import {
   BadRequestException,
   ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { DataSource, In } from 'typeorm';
@@ -90,6 +91,8 @@ function buildSnippet(text: string, keyword: string): string {
 
 @Injectable()
 export class MessageService {
+  private readonly logger = new Logger('Message');
+
   constructor(
     private readonly dataSource: DataSource,
     private readonly events: EventsGateway,
@@ -271,9 +274,10 @@ export class MessageService {
 
     // 离线推送（V6.2）：只推当前离线的成员，内容按类型脱敏。
     // 必须异步、不 await —— 极光慢或挂掉都不能拖慢/影响发消息。
+    // catch 里**要落日志**：PushService 内部已兜底，这层是防止将来改动后异常被静默吞掉。
     void this.push
       .notifyNewMessage({ message: savedMsg, memberIds, senderId: params.senderId })
-      .catch(() => undefined);
+      .catch((err: any) => this.logger.warn(`[push] notify skipped: ${err?.message || err}`));
 
     return savedMsg;
   }
