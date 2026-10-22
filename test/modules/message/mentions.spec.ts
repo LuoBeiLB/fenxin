@@ -68,7 +68,9 @@ describe('MessageService.sendMessage（@提及 mentions）', () => {
       deleteByUrl: jest.fn(),
       deleteByKey: jest.fn(),
     } as any;
-    svc = new MessageService(dataSource, realtime, oss);
+    // 第 4 参 PushService（V6.2 离线推送）：本 spec 不测推送，给空实现
+    const push = { notifyNewMessage: jest.fn(async () => undefined) } as any;
+    svc = new MessageService(dataSource, realtime, oss, push);
   };
 
   beforeEach(() => {

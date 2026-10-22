@@ -72,7 +72,9 @@ describe('MessageService 音视频播完才焚（v5.8.9）', () => {
     realtime = { emitToUsers: jest.fn().mockReturnValue(2), isReady: () => true };
     // v5.9.0 OSS 基线：构造函数第三个参数 OssService（焚毁文件清理用，本测试路径不触发，给替身即可）
     const oss: any = { deleteByUrl: jest.fn(async () => true) };
-    svc = new MessageService(dataSource, realtime, oss);
+    // V6.2：第 4 参 PushService（离线推送）；本测试路径不触发，给空实现即可
+    const pushStub: any = { notifyNewMessage: jest.fn(async () => undefined) };
+    svc = new MessageService(dataSource, realtime, oss, pushStub);
   };
 
   beforeAll(() => {

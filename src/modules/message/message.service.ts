@@ -13,6 +13,7 @@ import { AppUser } from '../../entities/app-user.entity';
 import { MessageTombstone } from '../../entities/message-tombstone.entity';
 import { EventsGateway } from '../events/events.gateway';
 import { OssService } from '../upload/oss.service';
+import { PushService } from '../push/push.service';
 import { WS_EVENTS } from '../events/events.types';
 
 /** 兜底强制焚毁时长（毫秒）：env BURN_FALLBACK_TTL_HOURS，默认 24 小时 */
@@ -93,6 +94,7 @@ export class MessageService {
     private readonly dataSource: DataSource,
     private readonly events: EventsGateway,
     private readonly oss: OssService,
+    private readonly push: PushService,
   ) {}
 
   private async assertMember(conversationId: string, userId: string) {
@@ -266,6 +268,12 @@ export class MessageService {
       conversation_id: params.conversationId,
       reason: 'message',
     });
+
+    // 离线推送（V6.2）：只推当前离线的成员，内容按类型脱敏。
+    // 必须异步、不 await —— 极光慢或挂掉都不能拖慢/影响发消息。
+    void this.push
+      .notifyNewMessage({ message: savedMsg, memberIds, senderId: params.senderId })
+      .catch(() => undefined);
 
     return savedMsg;
   }

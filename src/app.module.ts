@@ -33,6 +33,7 @@ import { AppVersionModule } from './modules/app-version/app-version.module';
 import { AdminModule } from './modules/admin/admin.module';
 import { PresenceModule } from './modules/presence/presence.module';
 import { BurnSettingModule } from './modules/burn-setting/burn-setting.module';
+import { PushModule } from './modules/push/push.module';
 
 @Module({
   imports: [
@@ -137,6 +138,7 @@ import { BurnSettingModule } from './modules/burn-setting/burn-setting.module';
     AdminModule,
     PresenceModule,
     BurnSettingModule,
+    PushModule,
   ],
   controllers: [AppController],
   providers: [

@@ -93,7 +93,9 @@ describe('MessageService.sendMessage（V4.0 §E2E 加密路径）', () => {
       deleteByKey: jest.fn(),
     } as any;
 
-    svc = new MessageService(dataSource, realtime, oss);
+    // 第 4 参 PushService（V6.2 离线推送）：本 spec 不测推送，给空实现
+    const push = { notifyNewMessage: jest.fn(async () => undefined) } as any;
+    svc = new MessageService(dataSource, realtime, oss, push);
   };
 
   beforeEach(() => {
