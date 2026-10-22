@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: 焚信 BurnMsg API
-  version: 2.6.0
+  version: 2.7.0
   description: |-
     焚信（BurnMsg）是一款企业内部加密即时通讯（IM）应用，支持云聊天与秘密聊天、阅后即焚消息。本文件为其后端（NestJS + TypeORM + MySQL）的标准 OpenAPI 3.0.3 接口文档。
 
@@ -25,6 +25,19 @@ info:
     - 请求中的时间字段使用 ISO8601 字符串；响应中的时间为服务端 datetime。
     - 所有业务 ID 均为 UUID v4 字符串。
     - 角色：user / admin。标注「仅管理员」的接口仅 admin 可调用，普通用户返回 403。
+
+    【v2.7.0 变更说明（焚毁时长按人设置，2026-10 版）】
+    - **焚毁时长从「每条消息发送时决定」改为「按人 / 按会话设置」**：
+      进会话时 `GET /burn-settings/conversations/{conversationId}` 查出生效时长，
+      修改用 `PUT /burn-settings/users/{targetUserId}`（私聊）或
+      `PUT /burn-settings/conversations/{conversationId}`（群 / 频道）。
+    - **归属规则：发送方生效**。我给某人设的时长只约束**我发出的**消息（对方点开后按该时长焚毁）；
+      对方给我的设置只约束**对方发出的**消息。两个方向互不干扰，因此**不取较短、也不存在谁优先**。
+    - 生效值解析顺序：联系人设置 → 会话设置（群）→ 我的全局默认（`default_burn_ttl_seconds`）→ 不焚毁。
+    - `POST /messages` 的 `burn_ttl_seconds` 变为**可选覆盖**：不传则自动套用上面的设置；
+      显式传了仍以参数为准（保留"这一条临时改"的能力）。
+    - 已发出的消息不受影响：时长在发送时快照进 `messages.burn_ttl_seconds`。
+    - 新增表 `burn_settings`（`owner_id` + `scope_type` + `scope_id` 唯一），只影响后续发送。
 
     【v2.6.0 变更说明（用户端在线状态查询，2026-10 版）】
     - 新增用户端在线状态接口（普通用户可用，非 admin）：
@@ -115,6 +128,12 @@ tags:
     description: 消息附件上传（multipart），返回的 url 在发消息时填入 file_url；v5.9.0 起支持 OSS 外置存储（未启用自动回退本地）。
   - name: 在线状态
     description: 用户端在线状态查询（V6.0）：全部在线用户、批量查指定用户在线态、本人多设备在线态。数据来自 `devices.is_online`（WS 连接数 + 心跳维护）。不暴露设备名/IP/指纹等设备细节（那些只在管理端可见）。
+  - name: 焚毁设置
+    description: |-
+      焚毁时长「按人设置」（V6.1）：进会话时查当前用户对该对象的焚毁时长，或修改它。
+      归属规则是**发送方生效** —— 我给某人设的时长只约束**我发出的**消息（对方点开后按该时长焚毁）；
+      对方给我的设置只约束**对方发出的**消息。两个方向互不干扰，不存在"谁优先 / 取较短"。
+      生效值 = 联系人设置 → 会话设置（群）→ 我的全局默认 → 不焚毁；消息级显式传参仍优先。
   - name: 管理端-消息与焚毁
     description: 仅 admin：消息检索/详情/手动焚毁、焚毁记录（含待真删队列）、已读统计、焚毁概览。
   - name: 管理端-在线监控
@@ -180,12 +199,12 @@ paths:
                   type: string
                   pattern: '^1\d{10}$'
                   description: 手机号（即用户名），1 开头共 11 位数字
-                  example: '13800138000'
+                  example: '13800000000'
                 password:
                   type: string
                   minLength: 1
                   description: 登录密码，不能为空
-                  example: 'Admin@123456'
+                  example: '12345678'
                 device_name:
                   type: string
                   description: 设备名称，展示在已登录设备列表中
@@ -738,6 +757,164 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+
+  /burn-settings/conversations/{conversationId}:
+    get:
+      tags: [焚毁设置]
+      summary: 查询我在该会话的生效焚毁时长（进会话时调用）
+      description: |-
+        【用途】用户点开某个对话框后调用，拿到「我发消息时应用的焚毁时长」，用于在输入框上方显示焚毁标签。
+
+        【业务规则与注意事项】
+        - **归属规则：发送方生效**。返回的是「我给这个对象设的值」，
+          只约束**我发出的**消息；对方给我的设置不影响这里。
+        - 私聊按「我对对方」的设置；群/频道按「我对本会话」的设置。
+        - 都没设则回落我的全局默认（`default_burn_ttl_seconds`），再没有就是不焚毁（`none`）。
+        - 已发出的消息不受影响：时长在发送时已快照进 `messages.burn_ttl_seconds`。
+        - 仅会话成员可查（403）。
+      parameters:
+        - { name: conversationId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: ok }
+                  data: { $ref: '#/components/schemas/BurnSettingResolution' }
+        '403': { description: 非会话成员, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '404': { description: 会话不存在, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    put:
+      tags: [焚毁设置]
+      summary: 设置我在该群/频道的焚毁时长
+      description: |-
+        仅用于群 / 频道（私聊请用 `PUT /burn-settings/users/{targetUserId}`）。
+        私聊调用会返回 400 —— 避免"按会话"和"按人"两套值打架。
+      parameters:
+        - { name: conversationId, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ttl_seconds]
+              properties:
+                ttl_seconds: { type: integer, minimum: 1, maximum: 2592000, example: 1800 }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: 焚毁时长已更新 }
+                  data: { $ref: '#/components/schemas/BurnSettingWriteResult' }
+        '400': { description: 私聊不允许用会话级设置 / 参数越界, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '403': { description: 非会话成员, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '404': { description: 会话不存在, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    delete:
+      tags: [焚毁设置]
+      summary: 清除我在该群/频道的焚毁时长设置
+      parameters:
+        - { name: conversationId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: 已清除（幂等）
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: 焚毁时长设置已清除 }
+                  data: { $ref: '#/components/schemas/BurnSettingWriteResult' }
+
+  /burn-settings/users:
+    get:
+      tags: [焚毁设置]
+      summary: 我的「按人设置」列表
+      description: 设置页用：列出我给哪些人设过焚毁时长（按更新时间倒序）。
+      parameters:
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: pageSize, in: query, schema: { type: integer, default: 50, maximum: 200 } }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: ok }
+                  data:
+                    type: object
+                    properties:
+                      total: { type: integer }
+                      page: { type: integer }
+                      pageSize: { type: integer }
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/BurnSettingListItem' }
+
+  /burn-settings/users/{targetUserId}:
+    put:
+      tags: [焚毁设置]
+      summary: 设置「我对某个用户」的焚毁时长（私聊）
+      description: |-
+        【用途】设定「我发给这个人的消息」点开后多久焚毁。
+
+        【业务规则与注意事项】
+        - **只约束我发出的消息**；对方发给我的消息按对方自己的设置走。
+        - 范围 1 ~ 2592000 秒（30 天）；越界 400。
+        - 不能给自己设置（400）；目标用户不存在或已注销（404）。
+        - 已发出的消息不受影响（时长已在发送时快照）。
+      parameters:
+        - { name: targetUserId, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ttl_seconds]
+              properties:
+                ttl_seconds: { type: integer, minimum: 1, maximum: 2592000, example: 3600 }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: 焚毁时长已更新 }
+                  data: { $ref: '#/components/schemas/BurnSettingWriteResult' }
+        '400': { description: 给自己设置 / 时长越界, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '404': { description: 目标用户不存在, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    delete:
+      tags: [焚毁设置]
+      summary: 清除「我对某个用户」的焚毁时长（回落全局默认）
+      parameters:
+        - { name: targetUserId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: 已清除（幂等）
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: 焚毁时长设置已清除 }
+                  data: { $ref: '#/components/schemas/BurnSettingWriteResult' }
 
   /accounts:
     post:
@@ -6288,6 +6465,65 @@ components:
           format: date-time
           nullable: true
           description: 超期强制真删时间 = destroyed_at + ACK_FALLBACK_DAYS（ack_fallback_days=0 时为 null）
+
+    BurnSettingResolution:
+      type: object
+      description: |-
+        进会话查询的焚毁时长解析结果（V6.1）。
+        归属规则是发送方生效，所以这里只体现「我的设置」，不含对方对我的设置。
+      properties:
+        conversation_id: { type: string, format: uuid }
+        conversation_type: { type: string, enum: [private, group, channel] }
+        counterpart:
+          type: object
+          nullable: true
+          description: 私聊对方；群/频道为 null
+          properties:
+            user_id: { type: string, format: uuid }
+            display_name: { type: string, nullable: true }
+        effective_ttl_seconds:
+          type: integer
+          nullable: true
+          description: 我发消息时应用的时长（秒）；null = 不焚毁
+          example: 3600
+        source:
+          type: string
+          enum: [contact_setting, conversation_setting, global_default, none]
+          description: |-
+            生效来源：contact_setting=我对这个人设过 / conversation_setting=我对这个群设过 /
+            global_default=用我的全局默认 / none=都没设
+        my_setting:
+          type: object
+          nullable: true
+          properties:
+            ttl_seconds: { type: integer }
+            updated_at: { type: string, format: date-time }
+        global_default_seconds:
+          type: integer
+          nullable: true
+          description: 我的全局默认（app_users.default_burn_ttl_seconds）
+
+    BurnSettingListItem:
+      type: object
+      description: 我的「按人设置」列表项
+      properties:
+        target_user_id: { type: string, format: uuid }
+        display_name: { type: string, nullable: true }
+        avatar_url: { type: string, nullable: true }
+        ttl_seconds: { type: integer, example: 3600 }
+        updated_at: { type: string, format: date-time }
+
+    BurnSettingWriteResult:
+      type: object
+      description: 设置/清除后的结果
+      properties:
+        success: { type: boolean, example: true }
+        ttl_seconds:
+          type: integer
+          nullable: true
+          description: 写入后的时长；清除后为 null
+        scope_id: { type: string }
+        scope_type: { type: string, enum: [user, conversation] }
 
     OnlineUserView:
       type: object

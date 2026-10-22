@@ -32,6 +32,7 @@ import { FeedbackModule } from './modules/feedback/feedback.module';
 import { AppVersionModule } from './modules/app-version/app-version.module';
 import { AdminModule } from './modules/admin/admin.module';
 import { PresenceModule } from './modules/presence/presence.module';
+import { BurnSettingModule } from './modules/burn-setting/burn-setting.module';
 
 @Module({
   imports: [
@@ -135,6 +136,7 @@ import { PresenceModule } from './modules/presence/presence.module';
     AppVersionModule,
     AdminModule,
     PresenceModule,
+    BurnSettingModule,
   ],
   controllers: [AppController],
   providers: [

@@ -2,6 +2,7 @@ import { Body, Controller, DefaultValuePipe, Get, Param, ParseIntPipe, Patch, Po
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { MessageService } from './message.service';
 import { DestroyService } from './destroy.service';
+import { BurnSettingService } from '../burn-setting/burn-setting.service';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { ResponseMessage } from '../../common/decorators/response-message.decorator';
 import { AuthPayload } from '../../common/guards/jwt-auth.guard';
@@ -22,11 +23,25 @@ export class MessageController {
   constructor(
     private readonly messageService: MessageService,
     private readonly destroyService: DestroyService,
+    private readonly burnSetting: BurnSettingService,
   ) {}
 
+  /**
+   * 发送消息。
+   * V6.1：焚毁时长改为「按人设置」——请求体不传 burn_ttl_seconds 时，
+   * 由 BurnSettingService 按「联系人设置 → 会话设置 → 全局默认」解析后套用；
+   * 显式传了 burn_ttl_seconds / destroy_at 仍以参数为准（消息级覆盖）。
+   */
   @Post()
   @ResponseMessage('发送成功')
-  send(@CurrentUser() user: AuthPayload, @Body() dto: SendMessageDto) {
+  async send(@CurrentUser() user: AuthPayload, @Body() dto: SendMessageDto) {
+    // 只有「既没传 ttl 也没传旧版 destroy_at」时才走设置解析，
+    // 否则保持旧客户端"这一条临时指定"的语义
+    const resolvedTtl =
+      dto.burn_ttl_seconds == null && dto.destroy_at == null
+        ? await this.burnSetting.resolveTtlForSend(user.userId, dto.conversation_id)
+        : undefined;
+
     return this.messageService.sendMessage({
       conversationId: dto.conversation_id,
       senderId: user.userId,
@@ -37,7 +52,7 @@ export class MessageController {
       fileSize: dto.file_size,
       mediaDurationSeconds: dto.media_duration_seconds,
       replyToId: dto.reply_to_id,
-      burnTtlSeconds: dto.burn_ttl_seconds,
+      burnTtlSeconds: dto.burn_ttl_seconds ?? resolvedTtl ?? undefined,
       // 旧客户端兼容（V6.0）：只在 burn_ttl_seconds 缺失时用于反算 ttl
       destroyAt: dto.destroy_at,
       senderEphemeralPubkey: dto.sender_ephemeral_pubkey,
