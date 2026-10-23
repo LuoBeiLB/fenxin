@@ -68,6 +68,16 @@ WS 断开 → socket_count -1 → 若归 0，则【立即】置 is_online=0 并�
 **验证**：`test/modules/events/events.gateway.spec.ts`（3 例）。
 **前端配合点**：App 切后台要**主动断开 WS**（他们已实现）；否则连接还在、`socket_count > 0`，后端仍视为在线，自然不会推。
 
+**排查第一条（启动日志）**：`PushService.onModuleInit()` 会在启动时打印配置状态，一眼看出进程有没有读到 env：
+
+```
+[Push] 推送已启用：channel=messages small_icon=ic_stat_notify ttl=3600s endpoint=api.jpush.cn
+[Push] 推送未启用（不会发任何推送）：JPUSH_ENABLED!=true / JPUSH_APP_KEY 为空
+```
+
+- 没有这两行 → 运行的进程里**没有推送代码**（旧构建没 rebuild / 没重启）
+- 出现「未启用」→ 进程没读到 env（容器没注入、或 cwd 不对导致 dotenv 找不到 `.env`）
+
 ### 0.3 派生推送体（排查时逐字段对照）
 
 ```jsonc

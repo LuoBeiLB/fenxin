@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { DataSource, SelectQueryBuilder } from 'typeorm';
 import { Device } from '../../entities/device.entity';
 import { Message } from '../../entities/message.entity';
@@ -18,7 +18,7 @@ import { JpushProvider } from './jpush.provider';
  * 焚毁消息一旦把正文放进通知，阅后即焚等于失效。
  */
 @Injectable()
-export class PushService {
+export class PushService implements OnModuleInit {
   private readonly logger = new Logger('Push');
 
   /** 推送正文的文本截断长度 */
@@ -28,6 +28,32 @@ export class PushService {
     private readonly dataSource: DataSource,
     private readonly jpush: JpushProvider,
   ) {}
+
+  /**
+   * 启动时打印推送配置状态。
+   *
+   * 为什么需要：排查「为什么没推」时，第一件事就是确认运行中的进程到底有没有
+   * 读到 `JPUSH_ENABLED` / 密钥。以前只能靠猜（改 .env 不重启、容器没注入 env
+   * 都表现为"静默不推"）。这里启动即见，且**不打印任何密钥值**。
+   */
+  onModuleInit(): void {
+    if (this.jpush.enabled) {
+      this.logger.log(
+        `推送已启用：channel=${process.env.JPUSH_CHANNEL_ID || 'messages'} ` +
+          `small_icon=${process.env.JPUSH_SMALL_ICON || '(未配置)'} ` +
+          `ttl=${process.env.JPUSH_TTL_SECONDS || '3600'}s ` +
+          `endpoint=${process.env.JPUSH_ENDPOINT || 'api.jpush.cn'}`,
+      );
+      return;
+    }
+
+    // 关闭时把「缺哪一项」说清楚，避免误以为代码没跑
+    const missing: string[] = [];
+    if (process.env.JPUSH_ENABLED !== 'true') missing.push('JPUSH_ENABLED!=true');
+    if (!process.env.JPUSH_APP_KEY) missing.push('JPUSH_APP_KEY 为空');
+    if (!process.env.JPUSH_MASTER_SECRET) missing.push('JPUSH_MASTER_SECRET 为空');
+    this.logger.warn(`推送未启用（不会发任何推送）：${missing.join(' / ')}`);
+  }
 
   /**
    * 新消息推送入口（`MessageService.sendMessage` 末尾调用，**不 await**）。
