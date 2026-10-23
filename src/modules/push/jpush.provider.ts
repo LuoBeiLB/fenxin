@@ -59,6 +59,24 @@ export class JpushProvider {
   }
 
   /**
+   * userId → 极光 alias 的清洗规则（**必须与 App 侧逐字一致**）。
+   *
+   * 极光 alias 只允许 `字母 / 数字 / 下划线`，长度 ≤ 40 字节；
+   * 而我们的 userId 是 UUID（形如 `7bb01d5b-bd33-45e7-98d2-bbfe221d4490`，含 4 个连字符），
+   * 直接用会让 App 侧 `setAlias` 失败、服务端 `audience.alias` 匹配不到（极光 1011）。
+   *
+   * 规则：`replace(/[^A-Za-z0-9_]/g, '').slice(0, 40)`
+   *  - UUID 清洗后是 32 位十六进制（去掉 4 个 `-`），不会触发截断；
+   *  - 允许字符均为 ASCII，所以「字符数 == 字节数」，截断长度无需按 UTF-8 计算。
+   *
+   * ⚠️ 前后端改动必须同步：任何一侧单独改（正则或截断长度）都会导致
+   * alias 对不上 → 极光返回 1011「找不到目标用户」。
+   */
+  private static toAlias(userId: string): string {
+    return String(userId).replace(/[^A-Za-z0-9_]/g, '').slice(0, 40);
+  }
+
+  /**
    * 推给一组 userId（极光侧 alias）。
    * **永不抛错**：推送失败只记日志，绝不能影响发消息主流程。
    */
@@ -66,9 +84,22 @@ export class JpushProvider {
     if (!this.enabled) return false;
     if (!userIds || userIds.length === 0) return false;
 
+    // 清洗成极光合法 alias，去重（清洗后理论上仍是一一对应，去重只是防御）
+    const aliases = [
+      ...new Set(
+        userIds
+          .map((id) => JpushProvider.toAlias(id))
+          .filter((a) => a.length > 0),
+      ),
+    ];
+    if (aliases.length === 0) {
+      this.logger.warn('alias 清洗后为空，跳过推送');
+      return false;
+    }
+
     const body = {
       platform: ['android'],
-      audience: { alias: userIds },
+      audience: { alias: aliases },
       notification: {
         android: {
           alert: msg.alert,

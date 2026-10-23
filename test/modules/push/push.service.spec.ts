@@ -213,7 +213,7 @@ describe('JpushProvider · 请求构造与容错', () => {
     globalThis.fetch = fetchMock as any;
 
     const p = new JpushProvider();
-    const ok = await p.pushToUsers(['u-1', 'u-2'], {
+    const ok = await p.pushToUsers(['u_1', 'u_2'], {
       title: '产品评审群',
       alert: '你有一条阅后即焚消息',
       conversationId: 'c-9',
@@ -224,7 +224,7 @@ describe('JpushProvider · 请求构造与容错', () => {
     const [, init] = fetchMock.mock.calls[0] as any;
     const body = JSON.parse(init.body);
     expect(body.platform).toEqual(['android']);
-    expect(body.audience.alias).toEqual(['u-1', 'u-2']);
+    expect(body.audience.alias).toEqual(['u_1', 'u_2']);
     expect(body.notification.android.channel_id).toBe('messages');
     expect(body.notification.android.extras).toMatchObject({
       conversation_id: 'c-9',
@@ -235,6 +235,61 @@ describe('JpushProvider · 请求构造与容错', () => {
     expect(body.notification.android.small_icon).toBeUndefined();
     // Basic Auth 头存在
     expect((init.headers as any).Authorization).toMatch(/^Basic /);
+  });
+
+  it('alias 清洗：UUID 去掉连字符（与 App 侧 setAlias 规则逐字一致）', async () => {
+    withEnv();
+    const fetchMock = jest.fn(async () => ({
+      ok: true,
+      status: 200,
+      text: async () => '{"sendno":"0","msg_id":"1"}',
+    }));
+    globalThis.fetch = fetchMock as any;
+
+    const uuid = '7bb01d5b-bd33-45e7-98d2-bbfe221d4490';
+    const p = new JpushProvider();
+    await p.pushToUsers([uuid], { title: 't', alert: 'a', conversationId: 'c' });
+
+    const body = JSON.parse((fetchMock.mock.calls[0] as any)[1].body);
+    expect(body.audience.alias).toEqual(['7bb01d5bbd3345e798d2bbfe221d4490']);
+    // 32 位十六进制，未触发 40 字节截断
+    expect(body.audience.alias[0]).toHaveLength(32);
+    expect(body.audience.alias[0]).not.toContain('-');
+  });
+
+  it('alias 清洗：超长截断到 40、非法字符剔除、清洗后去重', async () => {
+    withEnv();
+    const fetchMock = jest.fn(async () => ({
+      ok: true,
+      status: 200,
+      text: async () => '{"sendno":"0","msg_id":"1"}',
+    }));
+    globalThis.fetch = fetchMock as any;
+
+    const long = 'a'.repeat(50);
+    const p = new JpushProvider();
+    await p.pushToUsers(
+      [long, 'x-y-z', 'xyz', '含中文', ''],
+      { title: 't', alert: 'a', conversationId: 'c' },
+    );
+
+    const body = JSON.parse((fetchMock.mock.calls[0] as any)[1].body);
+    // 长串截断到 40；'x-y-z' 与 'xyz' 清洗后相同 → 去重；'含中文' 清洗为空被丢弃
+    expect(body.audience.alias).toContain('a'.repeat(40));
+    expect(body.audience.alias.filter((a: string) => a === 'xyz')).toHaveLength(1);
+    expect(body.audience.alias).not.toContain('');
+    expect(body.audience.alias).not.toContain('含中文');
+  });
+
+  it('全部 userId 清洗后为空 → 不发请求', async () => {
+    withEnv();
+    const fetchMock = jest.fn();
+    globalThis.fetch = fetchMock as any;
+    const p = new JpushProvider();
+    await expect(
+      p.pushToUsers(['---', '中文'], { title: 't', alert: 'a', conversationId: 'c' }),
+    ).resolves.toBe(false);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('payload：配置 JPUSH_SMALL_ICON 后带上 small_icon', async () => {

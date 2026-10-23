@@ -78,8 +78,47 @@ WS 断开 → socket_count -1 → 若归 0，则【立即】置 is_online=0 并�
 - 没有这两行 → 运行的进程里**没有推送代码**（旧构建没 rebuild / 没重启）
 - 出现「未启用」→ 进程没读到 env（容器没注入、或 cwd 不对导致 dotenv 找不到 `.env`）
 
-### 0.3 派生推送体（排查时逐字段对照）
+### 0.2.1 ⚠️ alias 必须清洗（UUID 含连字符 → 极光判非法）
 
+**这是「控制台能收到、业务推送 1011 找不到目标用户」的第二个根因。**
+
+极光 alias 只允许 `字母 / 数字 / 下划线`，长度 ≤ 40 字节；而我们的 userId 是 UUID
+（`7bb01d5b-bd33-45e7-98d2-bbfe221d4490`，含 4 个 `-`），直接当 alias 会导致：
+
+- App 侧 `setAlias` 返回错误对象（绑定失败）
+- 服务端 `audience.alias` 匹配不到 → 极光返回 `1011`（找不到目标用户）
+
+**统一规则（前后端必须逐字一致）**
+
+```ts
+const alias = String(userId).replace(/[^A-Za-z0-9_]/g, '').slice(0, 40)
+```
+
+| 输入 | 输出 | 说明 |
+|---|---|---|
+| `7bb01d5b-bd33-45e7-98d2-bbfe221d4490` | `7bb01d5bbd3345e798d2bbfe221d4490` | UUID 去连字符 → 32 位，不会截断 |
+| `abc_def` | `abc_def` | 下划线合法，原样保留 |
+| 50 个 `a` | 40 个 `a` | 超长截断 |
+| `中文` / `---` | `''` | 清洗后为空 → 该用户跳过推送（服务端会记 warn） |
+
+> 允许字符全是 ASCII，所以「字符数 == 字节数」，`slice(0, 40)` 不需要按 UTF-8 算。
+
+**服务端实现**：`jpush.provider.ts` 的 `JpushProvider.toAlias()`，在 `pushToUsers`
+里对每个 userId 清洗、去空、去重后再放进 `audience.alias`。
+
+**验证方式**（清洗后的 alias 能查到设备就说明绑定成功）：
+
+```bash
+curl -s -u "$JPUSH_APP_KEY:$JPUSH_MASTER_SECRET" \
+  "https://device.jpush.cn/v3/aliases/7bb01d5bbd3345e798d2bbfe221d4490"
+# 期望：{"registration_ids":["..."]}
+# 若返回 404 / 空 → App 侧还没用清洗后的 alias 绑过（或绑定了旧值）
+```
+
+**排查口诀**：极光控制台推送目标选「别名」时，也要填**清洗后**的值，
+填带连字符的 UUID 一样收不到。
+
+### 0.3 派生推送体（排查时逐字段对照）
 ```jsonc
 {
   "platform": ["android"],
@@ -108,7 +147,7 @@ WS 断开 → socket_count -1 → 若归 0，则【立即】置 is_online=0 并�
 |---|---|---|
 | 只走极光自有通道够不够 | **不够** | 自有通道依赖 App 进程存活；进程被杀 / Doze 冻结网络后收不到，等价于"应用活着才能收"，与现有 WS 收益重叠 |
 | 是否必须接厂商通道 | **建议接** | 只有厂商通道能在 App 被杀后送达（走系统级推送服务） |
-| 服务端用 alias 还是 registration_id | **alias = userId** | 不需要维护 token 表；一个 alias 可绑多台设备（上限以极光文档为准，约 10 台） |
+| 服务端用 alias 还是 registration_id | **alias = 清洗后的 userId**（见 §0.2.1） | 不需要维护 token 表；一个 alias 可绑多台设备（上限以极光文档为准，约 10 台） |
 | 推送内容能带消息正文吗 | **焚毁/加密消息一律不带** | 通知会显示在锁屏、经过第三方服务器；带正文等于废掉阅后即焚 |
 | 在线用户要不要推 | **不推** | WS 已经实时送达，重复提醒很吵；只对离线用户推 |
 | 是否等控制台审批完再写代码 | **不用** | 服务端用 `JPUSH_ENABLED=false` 开关，代码先就位 |
@@ -118,7 +157,7 @@ WS 断开 → socket_count -1 → 若归 0，则【立即】置 is_online=0 并�
 ## 1. 整体链路
 ```
 ① APK 启动 → 极光 SDK 初始化 → 拿到 registration_id
-② 登录成功 → JPushInterface.setAlias(userId)        ← 极光侧建立「用户 ↔ 设备」映射
+② 登录成功 → JPushInterface.setAlias(清洗后的 userId)   ← 极光侧建立「用户 ↔ 设备」映射（§0.2.1）
 ③ 用户发消息 → 后端判断收件人是否离线（devices.is_online = 0）
 ④ 离线者 → 后端调极光 REST（api.jpush.cn/v3/push），audience.alias = [userId...]
 ⑤ 极光 → 厂商通道（小米/华为/OPPO/vivo/荣耀）或自有通道
@@ -390,7 +429,7 @@ export interface PushPayload {
 
 /**
  * 极光推送（REST 直连，不依赖 SDK）。
- * 用 alias = userId 投递：无需维护 registration_id 表。
+ * 用 alias = 清洗后的 userId 投递（规则见 toAlias()）：无需维护 registration_id 表。
  */
 @Injectable()
 export class JpushProvider {
@@ -704,7 +743,7 @@ curl -s -X POST https://api.jpush.cn/v3/push \
 
 ## 附录 A：alias vs registration_id
 
-| 维度 | alias = userId（本方案） | registration_id |
+| 维度 | alias = 清洗后的 userId（本方案） | registration_id |
 |---|---|---|
 | 服务端存储 | 不需要表 | 需 `push_tokens` 表 |
 | 多设备 | 该用户所有设备都收到 ✅ | 精确到单设备 |
