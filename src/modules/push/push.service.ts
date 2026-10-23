@@ -37,10 +37,13 @@ export class PushService implements OnModuleInit {
    * 都表现为"静默不推"）。这里启动即见，且**不打印任何密钥值**。
    */
   onModuleInit(): void {
+    // 日志正文用**纯 ASCII**：生产日志会经过 docker / pm2 / 面板 / ELK 等下游，
+    // 只要有一个按 GBK(936) 解码，中文就会变成「鎺ㄩ€佸凡鍚敤」这种乱码。
+    // 注释保留中文，日志正文保持英文，任何终端都不会花。
     if (this.jpush.enabled) {
       this.logger.log(
-        `推送已启用：channel=${process.env.JPUSH_CHANNEL_ID || 'messages'} ` +
-          `small_icon=${process.env.JPUSH_SMALL_ICON || '(未配置)'} ` +
+        `push enabled: channel=${process.env.JPUSH_CHANNEL_ID || 'messages'} ` +
+          `small_icon=${process.env.JPUSH_SMALL_ICON || '(unset)'} ` +
           `ttl=${process.env.JPUSH_TTL_SECONDS || '3600'}s ` +
           `endpoint=${process.env.JPUSH_ENDPOINT || 'api.jpush.cn'}`,
       );
@@ -50,9 +53,9 @@ export class PushService implements OnModuleInit {
     // 关闭时把「缺哪一项」说清楚，避免误以为代码没跑
     const missing: string[] = [];
     if (process.env.JPUSH_ENABLED !== 'true') missing.push('JPUSH_ENABLED!=true');
-    if (!process.env.JPUSH_APP_KEY) missing.push('JPUSH_APP_KEY 为空');
-    if (!process.env.JPUSH_MASTER_SECRET) missing.push('JPUSH_MASTER_SECRET 为空');
-    this.logger.warn(`推送未启用（不会发任何推送）：${missing.join(' / ')}`);
+    if (!process.env.JPUSH_APP_KEY) missing.push('JPUSH_APP_KEY empty');
+    if (!process.env.JPUSH_MASTER_SECRET) missing.push('JPUSH_MASTER_SECRET empty');
+    this.logger.warn(`push disabled (no push will be sent): ${missing.join(' / ')}`);
   }
 
   /**
