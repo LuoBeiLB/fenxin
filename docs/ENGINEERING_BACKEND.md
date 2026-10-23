@@ -15,7 +15,7 @@
 | reveal 延长 `destroy_at` | ✅ | 首次点开推到 `≥ burn_at`；`remain_seconds = min(burn_at, destroy_at)` |
 | 调度器阶段①（标记） | ✅ | 只 UPDATE 标记 + 广播 WS `message:destroyed`，**不再删除** |
 | 调度器阶段②（真删） | ✅ | `DestroyService`：确认即删 / `ACK_FALLBACK_DAYS` 超期兜底 |
-| 新接口 | ✅ | `GET /messages/:cid/pending-destroy`、`POST /messages/:cid/destroy-ack`、`GET /messages/:id/readers`、`POST /:cid/read {up_to_message_id}` |
+| 新接口 | ✅ | `GET /messages/:cid/pending-destroy`、`POST /messages/:cid/destroy-ack`、`POST /:cid/read {up_to_message_id}`；`GET /:id/readers` 已于 V6.9 并入 `GET /:id/receipt` |
 | 会话未读数 | ✅ | `GET /conversations` 返回 `unread_count` |
 | 墓碑返回 | ✅ | `listMessages` 合并 `messages.is_destroyed=1` 与 `message_tombstones`；会话无消息时也能返回墓碑 |
 | 旧 `destroyMessage()` | ✅ | 已删除，物理删除统一走 `DestroyService.purge()` |
@@ -26,7 +26,7 @@
 1. **缩略图不清理**：`purge()` 只删 `file_url` + `file_original_url`。缩略图残留按团队决定保留（见 §9）。
 2. **`PURGE_RETENTION_DAYS` 未使用**：真删除的兜底时长改由 `ACK_FALLBACK_DAYS` 控制（语义更贴切：等确认，而不是等保留期）。
 3. **群聊阈值**：`PURGE_ACK_THRESHOLD=1`（任一成员确认即删）；设为 `0` 时要求 n-1 全部确认。
-4. **`getMessageReceipts` 保持原样**：`GET /:id/readers` 走新的聚合方法 `getReadProgress`，两者并存（老客户端可能仍用 receipt）。
+4. **`/readers` 已删除（V6.9）**：其聚合能力并入 `GET /:id/receipt`（每条回执加 `is_sender`，前端自行算「3/4 已读」），同时修掉按人查姓名的 N+1。
 
 ---
 
@@ -44,7 +44,7 @@
 | `src/modules/message/destroy.service.ts` | **新增** | 真删除核心：校验 → 事务删行/回执 → 写墓碑 → 删附件（本地 + OSS） |
 | `src/entities/message-tombstone.entity.ts` | **新增** | 墓碑表实体（真删后前端仍有"已焚毁"占位） |
 | `src/entities/message-destroy-ack.entity.ts` | **新增** | 确认记录实体 |
-| `src/modules/message/message.controller.ts` | 改 | 新增 `GET /messages/:cid/pending-destroy`、`POST /messages/:cid/destroy-ack`、`GET /messages/:id/readers`；`POST /:id/read` 接受 body |
+| `src/modules/message/message.controller.ts` | 改 | 新增 `GET /messages/:cid/pending-destroy`、`POST /messages/:cid/destroy-ack`；`POST /:id/read` 接受 body；`GET /:id/readers` 已并入 `GET /:id/receipt` |
 | `src/modules/conversation/conversation.service.ts` | 改 | 会话列表返回 `unread_count` |
 | `src/modules/events/events.types.ts` | 改 | 新增 `message:destroyed` 事件 |
 | `src/database/migrations/*` | 新增 | 见 §6 |
@@ -157,21 +157,39 @@ WHERE r.is_read = 0 AND m.is_destroyed = 0
 GROUP BY m.conversation_id
 ```
 
-### 3.5 `GET /messages/:id/readers`（新增，群聊已读进度）
+### 3.5 `GET /messages/:id/receipt`（回执明细；**已合并原 `/readers` 能力**）
+
+> V6.9 变更：原 `GET /messages/:id/readers` 与 `/receipt` 返回的是同一份
+> `message_receipts` 数据，功能重复；且前端三处都在用 `/receipt`、`/readers` 零调用，
+> 因此**删除 `/readers`**，把它的能力并入 `/receipt`。
 
 ```jsonc
-{
-  "total": 5,          // 非发送方人数（n-1）
-  "revealed": 3,       // 已点开人数
-  "burned": 2,         // 已到期人数
-  "readers": [
-    { "user_id": "...", "display_name": "张三",
-      "is_read": true, "read_at": "...", "revealed_at": "...", "burn_at": "..." }
-  ]
-}
+// GET /messages/:id/receipt → 仍是数组（前端 asArray 不用改）
+[
+  {
+    "id": "receipt-id",
+    "message_id": "uuid",
+    "user_id": "uuid",
+    "user_display_name": "张三",
+    "is_sender": true,          // ← V6.9 新增：哪条是发送者本人那份
+    "is_read": true,
+    "read_at": "...",
+    "revealed_at": "...",
+    "burn_at": "..."
+  }
+]
 ```
 
-> 与现有 `GET /messages/:id/receipt` 的区别：后者返回原始回执行；本接口额外给出**焚毁进度聚合**，供群聊 UI 显示"3/4 已读"。
+前端聚合「3/4 已读」：
+
+```js
+const others = items.filter(r => !r.is_sender)
+const readCount = others.filter(r => r.is_read).length   // 已读
+const total = others.length                              // 总人数（n-1）
+```
+
+实现要点：**一次 LEFT JOIN 取回姓名**，修掉原先「每个回执查一次 users」的 N+1
+（100 人群聊从 101 次 SQL 降到 2 次）。
 
 ### 3.6 `POST /messages/:conversationId/read`（已读上报）
 
@@ -411,7 +429,7 @@ ALTER TABLE conversations DROP COLUMN ai_enabled;
 | `message.service.spec.ts` | ①7 天档 `destroy_at = created+7d`（不再 24h）②旧客户端 `destroy_at` 反算 ttl ③`reveal` 延长 `destroy_at` ④`remain_seconds = min(burn_at, destroy_at)` ⑤已焚毁消息不可编辑/撤回/查回执 |
 | `burn.scheduler.spec.ts` | ①R1/R2 只标记不删行 ②R2 私聊（1 人到期即标记）③R2 群聊（n-1 全到期才标记，缺 1 人不标记）④幂等（重复执行不重复写 `destroyed_at`）⑤阶段②只处理"已确认 或 超期"⑥`ACK_FALLBACK_DAYS` 边界 |
 | `destroy.service.spec.ts`（新） | ①`purge` 只接受 `is_destroyed=1` ②事务内写墓碑 + 删回执 + 断引用 + 删行 ③附件删除（本地 + OSS）④重复 purge 幂等（墓碑不重复、不报错）⑤未标记消息 purge 直接返回 false |
-| `message.controller.spec.ts` | ①`pending-destroy` 只返回本会话未确认的 ②`destroy-ack` 成员校验 403 ③对未焚毁消息 ack → 400 ④`readers` 聚合字段 |
+| `message.controller.spec.ts` | ①`pending-destroy` 只返回本会话未确认的 ②`destroy-ack` 成员校验 403 ③对未焚毁消息 ack → 400 ④`receipt` 带 `is_sender` 且只发一次 JOIN 查询 |
 | `conversation.service.spec.ts` | 会话列表 `unread_count` 聚合正确（排除已焚毁） |
 
 > 注：现有 `test/modules/message/{encrypted-send,mentions}.spec.ts` 仍传 2 参构造 `MessageService`，本次改动前需先修（`OssService` 已是第 3 参）。

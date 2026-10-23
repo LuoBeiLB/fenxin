@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: 焚信 BurnMsg API
-  version: 2.7.0
+  version: 2.8.0
   description: |-
     焚信（BurnMsg）是一款企业内部加密即时通讯（IM）应用，支持云聊天与秘密聊天、阅后即焚消息。本文件为其后端（NestJS + TypeORM + MySQL）的标准 OpenAPI 3.0.3 接口文档。
 
@@ -25,6 +25,18 @@ info:
     - 请求中的时间字段使用 ISO8601 字符串；响应中的时间为服务端 datetime。
     - 所有业务 ID 均为 UUID v4 字符串。
     - 角色：user / admin。标注「仅管理员」的接口仅 admin 可调用，普通用户返回 403。
+
+    【v2.8.0 变更说明（回执接口合并，2026-10 版）】
+    - **移除 `GET /messages/{id}/readers`**：它的「已读进度」能力已并入 `GET /messages/{id}/receipt`。
+      删除原因：两个接口返回同一份 `message_receipts` 数据，功能重复；且前端全部在用 `/receipt`，
+      `/readers` 零调用。
+    - **`GET /messages/{id}/receipt` 增强**：
+      - 每条回执新增 `is_sender`（哪条是发送者本人那份）；
+      - 前端聚合方式：`const others = items.filter(r => !r.is_sender);`
+        `已读数 = others.filter(r => r.is_read).length`，`总数 = others.length`；
+      - 性能：一次 LEFT JOIN 取回姓名，修掉原先「每个回执查一次 users」的 N+1
+        （100 人群聊从 101 次 SQL 降到 2 次）；
+      - 返回结构仍是**数组**，老前端的 `asArray(resp)` 无需改动。
 
     【v2.7.0 变更说明（焚毁时长按人设置，2026-10 版）】
     - **焚毁时长从「每条消息发送时决定」改为「按人 / 按会话设置」**：
@@ -74,7 +86,7 @@ info:
     - **`destroy_at` 语义修正**：= 发送时刻 + max(`BURN_FALLBACK_TTL_HOURS`, `burn_ttl_seconds`)；
       首次点开时延长到 ≥ 本人 `burn_at`。修复「7 天档消息 24 小时就被删」。
     - **`remain_seconds` 口径修正**：= `min(burn_at, destroy_at) - now`，保证显示天数 = 实际存活天数。
-    - 新增接口（3 个）：`GET /messages/{conversationId}/pending-destroy`、`POST /messages/{conversationId}/destroy-ack`、`GET /messages/{id}/readers`。
+    - 新增接口（3 个）：`GET /messages/{conversationId}/pending-destroy`、`POST /messages/{conversationId}/destroy-ack`、`GET /messages/{id}/readers`（v2.8.0 已移除，能力并入 `/receipt`）。
     - `POST /messages/{id}/read` 支持请求体 `up_to_message_id`（只标记到某条）。
     - `GET /conversations` 返回 `unread_count`（真实未读数，排除已焚毁）。
     - Message 新字段：`destroyed_at`、`destroy_reason`、`is_burned`；`is_destroyed` 改为真正的软删标记。
@@ -4134,16 +4146,22 @@ paths:
   /messages/{id}/receipt:
     get:
       tags: [消息]
-      summary: 消息回执列表（送达/已读明细，含用户姓名）
+      summary: 消息回执列表（逐人已读/已点开明细，含用户姓名与 is_sender）
       description: |-
-        【用途】查看一条消息的逐人回执明细（是否送达、是否已读、已读时间）。
+        【用途】查看一条消息的逐人回执明细（是否已读、已读时间、是否点开焚毁消息、焚毁截止时间）。
 
-        【调用时机】群聊中点击自己消息的「已读/未读」详情时。
+        【调用时机】群聊中点击自己消息的「已读/未读」详情；或展示「3/4 已读」。
 
         【业务规则与注意事项】
         - 仅该消息所在会话的成员可查看，非成员返回 403（修复了旧版任意用户可查漏洞）。
-        - 消息不存在返回 404。
-        - 回执在消息发送时为除发送者外的每位成员各创建一条；每条附 user_display_name 便于直接展示。
+        - 消息不存在或已焚毁返回 404。
+        - 回执在消息发送时为**全体成员（含发送者）**各创建一条；每条附 `user_display_name`。
+        - **V6.9**：每条新增 `is_sender`（是否为发送者本人那份）；
+          原 `GET /messages/{id}/readers` 的「已读进度」能力已并入本接口，**该路径已删除**。
+          前端聚合方式：
+          `const others = items.filter(r => !r.is_sender);`
+          `已读数 = others.filter(r => r.is_read).length`，`总数 = others.length`。
+        - 性能：一次 LEFT JOIN 取回姓名（不再是每个回执查一次 users）。
       parameters:
         - name: id
           in: path
@@ -4314,73 +4332,6 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '403':
           description: 非会话成员（Access denied to this conversation）
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-
-  /messages/{id}/readers:
-    get:
-      tags: [消息]
-      summary: 消息已读/焚毁进度（V6.0，群聊「3/4 已读」用）
-      description: |-
-        【用途】查看一条消息的已读与焚毁进度：非发送方人数、已点开人数、已到期人数，以及逐人明细。
-        供群聊气泡下方显示「3/4 已读」、以及管理端已读统计使用。
-
-        【调用时机】群聊中展示自己消息的已读进度；点开「阅读详情」时。
-
-        【业务规则与注意事项】
-        - 仅会话成员可查看（403）；消息不存在或已焚毁 → 404。
-        - `total` / `revealed` / `burned` 只统计**非发送方**（n-1），与焚毁规则一致。
-        - `readers` 明细包含发送方本人，便于前端区分"我"。
-        - 与 `GET /messages/{id}/receipt` 的区别：后者返回原始回执行，本接口额外给出聚合进度。
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema: { type: string, format: uuid }
-          description: 消息 ID（UUID）
-          example: 5e6f7a8b-9c0d-41e2-83f4-a5b6c7d8e9f0
-      responses:
-        '200':
-          description: 成功，data 为进度聚合 + 逐人明细
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  code: { type: integer, example: 0 }
-                  message: { type: string, example: ok }
-                  data:
-                    type: object
-                    properties:
-                      message_id: { type: string, format: uuid }
-                      total: { type: integer, example: 4, description: 非发送方人数（n-1） }
-                      revealed: { type: integer, example: 3, description: 已点开人数 }
-                      burned: { type: integer, example: 2, description: 已到期（焚毁）人数 }
-                      readers:
-                        type: array
-                        items:
-                          type: object
-                          properties:
-                            user_id: { type: string, format: uuid }
-                            display_name: { type: string, example: 张三 }
-                            is_sender: { type: boolean }
-                            is_read: { type: boolean }
-                            read_at: { type: string, format: date-time, nullable: true }
-                            revealed_at: { type: string, format: date-time, nullable: true }
-                            burn_at: { type: string, format: date-time, nullable: true }
-        '401':
-          description: 未携带或无效/过期 token；账号已停用或设备已下线
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-        '403':
-          description: 非会话成员（Access denied to this conversation）
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-        '404':
-          description: 消息不存在或已焚毁
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -6170,7 +6121,7 @@ components:
 
     MessageReceipt:
       type: object
-      description: 消息回执（发送时为除发送者外的每位成员各创建一条）
+      description: 消息回执（发送时为全体成员各创建一条，含发送者本人那份）
       properties:
         id:
           type: string
@@ -6185,8 +6136,16 @@ components:
         user_id:
           type: string
           format: uuid
-          description: 接收者用户 ID
+          description: 该回执所属用户 ID
           example: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+        user_display_name:
+          type: string
+          description: 该用户昵称（一次 JOIN 取回，便于直接展示）
+          example: 张三
+        is_sender:
+          type: boolean
+          description: 是否为发送者本人那份（V6.9 新增；前端用它过滤出"其他人"再算已读进度）
+          example: false
         is_read:
           type: boolean
           description: 是否已读
@@ -6214,10 +6173,6 @@ components:
           format: date-time
           description: 回执创建时间（即消息发送时间）
           example: '2026-08-26T08:00:00.000Z'
-        user_display_name:
-          type: string
-          description: 接收者显示名（用户不存在时为 Unknown）
-          example: 李四
 
     BatchResult:
       type: object

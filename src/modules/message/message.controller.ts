@@ -235,14 +235,10 @@ export class MessageController {
   }
 
   /**
-   * 群聊已读进度（V6.0）：返回非发送方人数、已点开/已到期人数与逐人明细，
-   * 供气泡下方显示「3/4 已读」。
+   * 消息回执列表（含每人 is_read / read_at / revealed_at / burn_at 与 is_sender）。
+   * V6.9：原 `GET /messages/:id/readers` 的聚合能力已并入本接口并从路由中删除 ——
+   * 前端按 `items.filter(r => !r.is_sender && r.is_read).length` 即可算出「3/4 已读」。
    */
-  @Get(':id/readers')
-  readers(@CurrentUser() user: AuthPayload, @Param('id') id: string) {
-    return this.messageService.getReadProgress(id, user.userId);
-  }
-
   @Get(':id/receipt')
   receipts(@CurrentUser() user: AuthPayload, @Param('id') id: string) {
     return this.messageService.getMessageReceipts(id, user.userId);

@@ -928,48 +928,15 @@ export class MessageService {
   }
 
   /**
-   * 群聊已读进度（V6.0）：非发送方人数 / 已点开 / 已到期 + 逐人明细。
-   * 供前端气泡下方显示「3/4 已读」，也用于管理端已读统计。
+   * 消息回执：仅会话成员可见（修复旧版任意用户可查漏洞）；已焚毁消息不再提供回执。
+   *
+   * V6.9 合并：原 `GET /messages/:id/readers` 的「已读进度」能力已并入这里，该接口已删除。
+   * - 每条回执额外带 `is_sender`，前端据此区分"我"与"对方"，
+   *   并自行聚合出「3/4 已读」（`items.filter(r => !r.is_sender && r.is_read).length`）。
+   * - 一次 LEFT JOIN 取回姓名，修掉原先「每个回执查一次 users」的 N+1
+   *   （100 人群聊从 101 次 SQL 降到 2 次）。
+   * - 返回结构保持**数组**（不加外层包装），老前端的 `asArray(resp)` 无需改动。
    */
-  async getReadProgress(messageId: string, userId: string) {
-    const msgRepo = this.dataSource.getRepository(Message);
-    const message = await msgRepo.findOne({ where: { id: messageId } });
-    if (!message || message.is_destroyed) throw new NotFoundException('消息不存在');
-    await this.assertMember(message.conversation_id, userId);
-
-    const receipts = await this.dataSource.getRepository(MessageReceipt).find({
-      where: { message_id: messageId },
-    });
-    const userRepo = this.dataSource.getRepository(AppUser);
-    const now = Date.now();
-
-    const readers = await Promise.all(
-      receipts.map(async (r) => {
-        const u = await userRepo.findOne({ where: { id: r.user_id }, select: ['id', 'display_name'] });
-        return {
-          user_id: r.user_id,
-          display_name: u?.display_name || 'Unknown',
-          is_sender: r.user_id === message.sender_id,
-          is_read: r.is_read,
-          read_at: r.read_at,
-          revealed_at: r.revealed_at,
-          burn_at: r.burn_at,
-        };
-      }),
-    );
-
-    // 焚毁进度只统计「非发送方」（n-1），与焚毁规则保持一致
-    const others = readers.filter((r) => !r.is_sender);
-    return {
-      message_id: messageId,
-      total: others.length,
-      revealed: others.filter((r) => !!r.revealed_at).length,
-      burned: others.filter((r) => r.burn_at && new Date(r.burn_at).getTime() <= now).length,
-      readers,
-    };
-  }
-
-  /** 消息回执：仅会话成员可见（修复旧版任意用户可查漏洞）；已焚毁消息不再提供回执 */
   async getMessageReceipts(messageId: string, userId: string) {
     const msgRepo = this.dataSource.getRepository(Message);
     const message = await msgRepo.findOne({ where: { id: messageId } });
@@ -977,17 +944,43 @@ export class MessageService {
 
     await this.assertMember(message.conversation_id, userId);
 
-    const receipts = await this.dataSource.getRepository(MessageReceipt).find({
-      where: { message_id: messageId },
-    });
+    const qb = this.dataSource.getRepository(MessageReceipt).createQueryBuilder('r');
+    qb.leftJoin(AppUser, 'u', 'u.id = r.user_id');
+    qb.select([
+      'r.id AS id',
+      'r.message_id AS message_id',
+      'r.user_id AS user_id',
+      'r.is_read AS is_read',
+      'r.read_at AS read_at',
+      'r.revealed_at AS revealed_at',
+      'r.burn_at AS burn_at',
+    ]);
+    qb.addSelect('u.display_name', 'display_name');
+    qb.where('r.message_id = :messageId', { messageId });
+    qb.orderBy('r.user_id', 'ASC');
+    const rows = await qb.getRawMany<{
+      id: string;
+      message_id: string;
+      user_id: string;
+      is_read: number | string;
+      read_at: Date | string | null;
+      revealed_at: Date | string | null;
+      burn_at: Date | string | null;
+      display_name: string | null;
+    }>();
 
-    const userRepo = await this.dataSource.getRepository(AppUser);
-    return Promise.all(
-      receipts.map(async (receipt) => {
-        const user = await userRepo.findOne({ where: { id: receipt.user_id } });
-        return { ...receipt, user_display_name: user?.display_name || 'Unknown' };
-      }),
-    );
+    return rows.map((r) => ({
+      id: r.id,
+      message_id: r.message_id,
+      user_id: r.user_id,
+      user_display_name: r.display_name || 'Unknown',
+      // V6.9 新增：标出哪条是发送者自己（原 /readers 的能力）
+      is_sender: r.user_id === message.sender_id,
+      is_read: !!Number(r.is_read),
+      read_at: r.read_at ?? null,
+      revealed_at: r.revealed_at ?? null,
+      burn_at: r.burn_at ?? null,
+    }));
   }
 
   /**
