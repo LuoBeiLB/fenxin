@@ -177,6 +177,26 @@ export class SearchMessagesDto {
 }
 
 /**
+ * POST /messages/:conversationId/read-messages body（按消息 id 标记已读）。
+ *
+ * 为什么不能复用 `POST /messages/:id/read`：后者的语义是「≤ up_to_message_id 全部置已读」，
+ * 塞 message_ids 进去会被 whitelist 静默丢弃并退化成整会话已读，
+ * 前端已经按「404 则降级到旧接口」实现，所以这里必须是独立端点。
+ */
+export class MarkMessagesReadDto {
+  @ApiProperty({
+    description: '要标记已读的消息 ID（1~200 条；不属于该会话的会被忽略，已读的幂等跳过）',
+    type: [String],
+    example: ['3f9a2b8e-1111-4222-8333-444455556666'],
+  })
+  @IsArray()
+  @ArrayNotEmpty({ message: 'message_ids 不能为空' })
+  @ArrayMaxSize(200, { message: '单次最多标记 200 条' })
+  @IsUUID('4', { each: true, message: 'message_ids 内必须是合法 UUID' })
+  message_ids: string[];
+}
+
+/**
  * POST /messages/:conversationId/read body（V6.0）：支持"只标记到某条为止"。
  * 不传 = 整会话全部标记已读（兼容旧客户端行为）。
  */

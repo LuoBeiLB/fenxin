@@ -13,6 +13,7 @@ import {
   UpdateOriginalFileDto,
   RevealMessageDto,
   MarkReadDto,
+  MarkMessagesReadDto,
   DestroyAckDto,
 } from './dto';
 
@@ -123,12 +124,15 @@ export class MessageController {
     @Param('conversationId') conversationId: string,
     @Query('before') before?: string,
     @Query('limit') limit?: number,
+    @Query('include_destroyed') includeDestroyed?: string,
   ) {
     return this.messageService.listMessages({
       conversationId,
       userId: user.userId,
       before,
       limit: limit ? Number(limit) : undefined,
+      // include_destroyed=1：历史里也返回已焚毁消息（墓碑形式，正文全 null）
+      includeDestroyed: includeDestroyed === '1' || includeDestroyed === 'true',
     });
   }
 
@@ -214,6 +218,20 @@ export class MessageController {
   ) {
     await this.messageService.markAsRead(conversationId, user.userId, dto?.up_to_message_id);
     return null;
+  }
+
+  /**
+   * 按消息 id 标记已读（V6.1，前端可视区域观察上报）。
+   * 与 `POST /:id/read` 的区别：那个是"≤ 某条全部置已读"，这个是"只动我明确列出的这几条"。
+   */
+  @Post(':conversationId/read-messages')
+  @ResponseMessage('已读标记成功')
+  markMessagesRead(
+    @CurrentUser() user: AuthPayload,
+    @Param('conversationId') conversationId: string,
+    @Body() dto: MarkMessagesReadDto,
+  ) {
+    return this.messageService.markMessagesRead(conversationId, user.userId, dto.message_ids);
   }
 
   /**

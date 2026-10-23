@@ -75,6 +75,9 @@ export class ConversationService {
     if (conversations.length === 0) return [];
 
     // 未读数（V6.0）：一次聚合查询，避免 N+1；排除已焚毁消息
+    // V6.1 口径（READ_UNREAD_API.md §4）：
+    //   - 排除已焚毁（is_destroyed=1）与已到期未扫（destroy_at <= now）的消息；
+    //   - 未点开的焚毁消息 / 未查看的加密消息仍算未读（回执 is_read 只有点开后才置 1）
     const unreadRows = await this.dataSource
       .getRepository(MessageReceipt)
       .createQueryBuilder('r')
@@ -84,6 +87,7 @@ export class ConversationService {
       .where('r.user_id = :userId', { userId })
       .andWhere('r.is_read = :isRead', { isRead: false })
       .andWhere('m.is_destroyed = :destroyed', { destroyed: false })
+      .andWhere('(m.destroy_at IS NULL OR m.destroy_at > :now)', { now: new Date() })
       .andWhere('m.conversation_id IN (:...ids)', { ids: conversations.map((c) => c.id) })
       .groupBy('m.conversation_id')
       .getRawMany<{ conversation_id: string; cnt: string }>();

@@ -352,29 +352,100 @@ export class MessageService {
     userId: string;
     before?: string;
     limit?: number;
+    /** true = 历史里也返回已焚毁消息（墓碑形式；正文/附件全 null，占分页位置） */
+    includeDestroyed?: boolean;
   }): Promise<unknown[]> {
     await this.assertMember(params.conversationId, params.userId);
 
     const limit = params.limit || 50;
+    const now = new Date();
     const qb = this.dataSource
       .getRepository(Message)
       .createQueryBuilder('m')
-      .where('m.conversation_id = :conversationId', { conversationId: params.conversationId })
-      .andWhere('m.is_destroyed = :isDestroyed', { isDestroyed: false })
-      // 阅后即焚兜底：到期消息即使定时任务尚未执行也不返回
-      .andWhere('(m.destroy_at IS NULL OR m.destroy_at > :now)', { now: new Date() })
-      .orderBy('m.created_at', 'DESC')
-      .take(limit);
+      .where('m.conversation_id = :conversationId', { conversationId: params.conversationId });
+
+    if (!params.includeDestroyed) {
+      // 默认（向后兼容）：过滤已焚毁 + 兜底到期（定时任务还没跑也不返回）
+      qb.andWhere('m.is_destroyed = :isDestroyed', { isDestroyed: false });
+      qb.andWhere('(m.destroy_at IS NULL OR m.destroy_at > :now)', { now });
+    }
+
+    qb.orderBy('m.created_at', 'DESC').take(limit);
 
     if (params.before) {
       qb.andWhere('m.created_at < :before', { before: new Date(params.before) });
     }
 
     const messages = await qb.getMany();
-    // 点开才焚：按当前用户 receipt 状态过滤/马赛克化
-    const view = await this.applyBurnView(messages.reverse(), params.userId);
-    // V6.0：把「已焚毁」的消息以墓碑形式补回聊天流（跨设备一致的"此消息已焚毁"占位）
-    return this.attachTombstones(params.conversationId, view, { before: params.before, limit });
+
+    // include_destroyed 时把「已焚毁 / 已到期」的行拆出来，直接渲染成墓碑，
+    // 不再走 applyBurnView —— 否则焚毁消息会因为 receipt 到期被整条丢弃
+    let destroyedViews: unknown[] = [];
+    let alive = messages;
+    if (params.includeDestroyed) {
+      const nowMs = now.getTime();
+      destroyedViews = messages
+        .filter((m) => m.is_destroyed || (m.destroy_at != null && new Date(m.destroy_at).getTime() <= nowMs))
+        .map((m) => this.tombstoneOf(m));
+      const destroyedIds = new Set(
+        messages
+          .filter((m) => m.is_destroyed || (m.destroy_at != null && new Date(m.destroy_at).getTime() <= nowMs))
+          .map((m) => m.id),
+      );
+      alive = messages.filter((m) => !destroyedIds.has(m.id));
+    }
+
+    // 点开才焚：按当前用户 receipt 状态过滤/马赛克化（只处理未焚毁的部分）
+    const view = await this.applyBurnView(alive.reverse(), params.userId);
+    const merged = [...view, ...destroyedViews].sort(
+      (a: any, b: any) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime(),
+    );
+
+    // V6.0：把「已真删」的墓碑（message_tombstones）补回聊天流
+    return this.attachTombstones(params.conversationId, merged, {
+      before: params.before,
+      limit,
+    });
+  }
+
+  /**
+   * 已焚毁消息的对外视图（墓碑）：**只保留渲染占位必需的元数据**，
+   * 正文、附件、密文一律置 null —— 焚毁后绝不能再吐出内容。
+   */
+  private tombstoneOf(m: {
+    id: string;
+    conversation_id: string;
+    sender_id: string;
+    type: string;
+    created_at: Date | string;
+    destroyed_at?: Date | string | null;
+    destroy_reason?: string | null;
+  }): Record<string, unknown> {
+    return {
+      id: m.id,
+      conversation_id: m.conversation_id,
+      sender_id: m.sender_id,
+      type: m.type,
+      created_at: m.created_at,
+      destroyed_at: m.destroyed_at ?? null,
+      destroy_reason: m.destroy_reason ?? null,
+      is_destroyed: true,
+      is_burned: true,
+      is_blurred: false,
+      is_recalled: false,
+      is_edited: false,
+      is_encrypted: false,
+      content: null,
+      file_url: null,
+      file_name: null,
+      file_size: null,
+      file_original_url: null,
+      cipher_nonce: null,
+      cipher_text: null,
+      sender_ephemeral_pubkey: null,
+      reply_to_id: null,
+      mentions: [],
+    };
   }
 
   /**
@@ -449,31 +520,7 @@ export class MessageService {
                   created_at: Date, destroyed_at: Date | null, destroy_reason: string | null) => {
       if (seen.has(String(id))) return;
       seen.add(String(id));
-      extra.push({
-        id,
-        conversation_id,
-        sender_id,
-        type,
-        created_at,
-        destroyed_at,
-        destroy_reason,
-        is_destroyed: true,
-        is_burned: true,
-        is_blurred: false,
-        is_recalled: false,
-        is_edited: false,
-        is_encrypted: false,
-        content: null,
-        file_url: null,
-        file_name: null,
-        file_size: null,
-        file_original_url: null,
-        cipher_nonce: null,
-        cipher_text: null,
-        sender_ephemeral_pubkey: null,
-        reply_to_id: null,
-        mentions: [],
-      });
+      extra.push(this.tombstoneOf({ id, conversation_id, sender_id, type, created_at, destroyed_at, destroy_reason }));
     };
 
     for (const t of purged) {
@@ -736,23 +783,30 @@ export class MessageService {
       if (upTo) upToCreatedAt = upTo.created_at;
     }
 
-    const qb = this.dataSource
-      .getRepository(MessageReceipt)
-      .createQueryBuilder()
-      .update()
-      .set({ is_read: true, read_at: new Date() })
-      .where('user_id = :userId', { userId })
-      .andWhere('is_read = :isRead', { isRead: false })
-      .andWhere('message_id IN (SELECT id FROM messages WHERE conversation_id = :conversationId)', {
-        conversationId,
-      });
+    // V6.1 口径（按 READ_UNREAD_API.md §4）：整会话标记时**跳过**两类消息
+    //   ① 未点开的焚毁消息（必须 reveal 后才算已读）
+    //   ② 未查看的加密消息（必须先点开查看；由 /read-messages 单条上报）
+    // 同时跳过已焚毁的消息（已销毁的东西不该产生已读回执）。
+    //
+    // 用 JOIN 形式的 UPDATE，而不是 `message_id IN (SELECT ... FROM message_receipts)`：
+    // 后者会触发 MySQL 1093「不能在子查询里引用正在更新的表」。
+    // `r.revealed_at` 直接取自被更新的同一行，语义更准确也更省一次查询。
+    const params: any[] = [new Date(), userId, conversationId];
+    let sql = `UPDATE message_receipts r
+      JOIN messages m ON m.id = r.message_id
+         SET r.is_read = 1, r.read_at = ?
+       WHERE r.user_id = ?
+         AND r.is_read = 0
+         AND m.conversation_id = ?
+         AND m.is_destroyed = 0
+         AND m.is_encrypted = 0
+         AND (m.burn_ttl_seconds IS NULL OR r.revealed_at IS NOT NULL)`;
     if (upToCreatedAt) {
-      qb.andWhere(
-        'message_id IN (SELECT id FROM messages WHERE conversation_id = :conversationId AND created_at <= :upToCreatedAt)',
-        { conversationId, upToCreatedAt },
-      );
+      sql += ' AND m.created_at <= ?';
+      params.push(upToCreatedAt);
     }
-    const result = await qb.execute();
+    const result = await this.dataSource.query(sql, params);
+    const affected = Number(result?.affectedRows ?? 0);
 
     // 已读水位线：取「本次标记范围内」的最后一条消息（而不是会话最后一条，
     // 否则上界生效时会把水位线错误推进到未读消息上）
@@ -767,15 +821,12 @@ export class MessageService {
     const lastMsg = await lastMsgQb.getOne();
 
     if (lastMsg) {
-      await this.dataSource.getRepository(ConversationMember).update(
-        { conversation_id: conversationId, user_id: userId },
-        { last_read_message_id: lastMsg.id },
-      );
+      await this.advanceLastRead(conversationId, userId, lastMsg.id);
     }
 
     // 实时推送：已读回执（仅当确实把新消息从「未读」翻成「已读」时才广播，
     // 避免用户每次打开聊天页都向会话其他成员发送无效事件）
-    if ((result.affected ?? 0) > 0) {
+    if (affected > 0) {
       const memberIds = await this.getMemberUserIds(conversationId);
       this.events.emitToUsers(WS_EVENTS.RECEIPT_READ, memberIds, {
         conversation_id: conversationId,
@@ -784,6 +835,96 @@ export class MessageService {
         read_at: new Date().toISOString(),
       });
     }
+  }
+
+  /**
+   * 按消息 id 标记已读（V6.1，前端可视区域观察上报）。
+   *
+   * 与 `markAsRead` 的区别：那个是"≤ 某条全部置已读"，这个是"只动我明确列出的这几条"。
+   * 语义（对齐 READ_UNREAD_API.md §2）：
+   *  - 只改**当前用户**在这些消息上的回执；
+   *  - 不属于该会话的 id 静默忽略（不报错）；已读的幂等跳过；
+   *  - 只有真的发生「未读 → 已读」才广播 WS `receipt:read`；
+   *  - 不可逆：任何路径都不会把 is_read 改回 0。
+   */
+  async markMessagesRead(
+    conversationId: string,
+    userId: string,
+    messageIds: string[],
+  ): Promise<{ marked: number; conversation_id: string }> {
+    await this.assertMember(conversationId, userId);
+
+    const conv = await this.dataSource
+      .getRepository(Conversation)
+      .findOne({ where: { id: conversationId }, select: ['id'] });
+    if (!conv) throw new NotFoundException('会话不存在');
+
+    const ids = [...new Set((messageIds || []).filter(Boolean))];
+    if (ids.length === 0) throw new BadRequestException('message_ids 不能为空');
+    if (ids.length > 200) throw new BadRequestException('单次最多标记 200 条');
+
+    const qb = this.dataSource
+      .getRepository(MessageReceipt)
+      .createQueryBuilder()
+      .update()
+      .set({ is_read: true, read_at: new Date() })
+      .where('user_id = :userId', { userId })
+      .andWhere('is_read = :isRead', { isRead: false })
+      .andWhere('message_id IN (:...ids)', { ids })
+      .andWhere(
+        'message_id IN (SELECT id FROM messages WHERE conversation_id = :conversationId AND is_destroyed = 0)',
+        { conversationId },
+      );
+    const result = await qb.execute();
+    const marked = result.affected ?? 0;
+
+    if (marked > 0) {
+      // 水位线推到本次标记里最新的那条（只增不减）
+      const latestQb = this.dataSource
+        .getRepository(Message)
+        .createQueryBuilder('m')
+        .select(['m.id', 'm.created_at'])
+        .where('m.id IN (:...ids)', { ids })
+        .andWhere('m.conversation_id = :conversationId', { conversationId })
+        .orderBy('m.created_at', 'DESC')
+        .limit(1);
+      const latest = await latestQb.getOne();
+      if (latest) await this.advanceLastRead(conversationId, userId, latest.id);
+
+      const memberIds = await this.getMemberUserIds(conversationId);
+      this.events.emitToUsers(WS_EVENTS.RECEIPT_READ, memberIds, {
+        conversation_id: conversationId,
+        user_id: userId,
+        last_read_message_id: latest ? latest.id : null,
+        read_at: new Date().toISOString(),
+      });
+    }
+
+    return { marked, conversation_id: conversationId };
+  }
+
+  /**
+   * 推进「已读水位线」（last_read_message_id），**只增不减**：
+   * 只有当候选消息比当前水位线更新（或当前为空）时才更新。
+   * 用一条带 JOIN 的 UPDATE 完成，避免读-改-写竞态。
+   */
+  private async advanceLastRead(
+    conversationId: string,
+    userId: string,
+    candidateMessageId: string,
+  ): Promise<void> {
+    await this.dataSource.query(
+      `UPDATE conversation_members cm
+         JOIN messages m_new ON m_new.id = ?
+         LEFT JOIN messages m_old ON m_old.id = cm.last_read_message_id
+          SET cm.last_read_message_id = ?
+        WHERE cm.conversation_id = ?
+          AND cm.user_id = ?
+          AND (cm.last_read_message_id IS NULL
+               OR m_old.created_at IS NULL
+               OR m_new.created_at >= m_old.created_at)`,
+      [candidateMessageId, candidateMessageId, conversationId, userId],
+    );
   }
 
   /**
