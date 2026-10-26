@@ -1133,16 +1133,12 @@ export class MessageService {
           'cm.conversation_id = m.conversation_id AND cm.user_id = :uid',
           { uid: params.userId },
         )
-        .leftJoin(AppUser, 'u', 'u.id = m.sender_id')
-        .andWhere('m.is_encrypted = :isEncrypted', { isEncrypted: false })
-        .andWhere('m.is_destroyed = :isDestroyed', { isDestroyed: false })
-        .andWhere('(m.destroy_at IS NULL OR m.destroy_at > :now)', { now: new Date() })
-        .andWhere('m.is_recalled = :isRecalled', { isRecalled: false })
-        .andWhere('m.burn_ttl_seconds IS NULL')
-        .orderBy('m.created_at', 'DESC')
-        .skip((page - 1) * pageSize)
-        .take(pageSize);
+        .leftJoin(AppUser, 'u', 'u.id = m.sender_id');
 
+      // ⚠️ TypeORM 的 where() 会**清空**已有的 wheres（见 SelectQueryBuilder.where）。
+      // 所以匹配条件必须第一个写，后面的过滤全部用 andWhere —— 顺序反过来会把
+      // 「加密/焚毁/撤回/已销毁」这些保护性过滤全部丢掉（曾有 bug：搜索结果里
+      // 出现焚毁消息）。
       if (mode === 'fulltext') {
         qb.where('MATCH(m.content, m.file_name) AGAINST (:kw IN BOOLEAN MODE)', { kw: ftKeyword });
       } else {
@@ -1153,6 +1149,15 @@ export class MessageService {
           likeKw: `%${escaped}%`,
         });
       }
+
+      qb.andWhere('m.is_encrypted = :isEncrypted', { isEncrypted: false })
+        .andWhere('m.is_destroyed = :isDestroyed', { isDestroyed: false })
+        .andWhere('(m.destroy_at IS NULL OR m.destroy_at > :now)', { now: new Date() })
+        .andWhere('m.is_recalled = :isRecalled', { isRecalled: false })
+        .andWhere('m.burn_ttl_seconds IS NULL')
+        .orderBy('m.created_at', 'DESC')
+        .skip((page - 1) * pageSize)
+        .take(pageSize);
 
       if (params.conversationId) {
         qb.andWhere('m.conversation_id = :cid', { cid: params.conversationId });

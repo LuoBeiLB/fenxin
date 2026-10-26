@@ -125,3 +125,33 @@ describe('searchGlobal · FULLTEXT 索引缺失时降级 LIKE', () => {
     expect(params.likeKw).toBe('%100\\%\\_完成%');
   });
 });
+
+describe('searchGlobal · 保护性过滤不能丢（where 会清空 andWhere）', () => {
+  const FILTERS = ['is_encrypted', 'is_destroyed', 'destroy_at', 'is_recalled', 'burn_ttl_seconds'];
+
+  it('FULLTEXT 模式：MATCH 放在 where，其余过滤在 andWhere', async () => {
+    const { service, qbs } = makeService(false);
+    await service.searchGlobal({ userId: 'u-1', keyword: '项目' });
+
+    const whereSql = String((qbs[0].where as jest.Mock).mock.calls[0][0]);
+    expect(whereSql).toContain('MATCH');
+
+    const andSql = (qbs[0].andWhere as jest.Mock).mock.calls.map((c) => String(c[0])).join(' | ');
+    for (const f of FILTERS) expect(andSql).toContain(f);
+
+    // where 只允许调用一次（第二次会把前面的条件清掉）
+    expect((qbs[0].where as jest.Mock).mock.calls).toHaveLength(1);
+  });
+
+  it('LIKE 降级模式：同样保留全部过滤', async () => {
+    const { service, qbs } = makeService(true);
+    await service.searchGlobal({ userId: 'u-1', keyword: '项目' });
+
+    const whereSql = String((qbs[1].where as jest.Mock).mock.calls[0][0]);
+    expect(whereSql).toContain('LIKE');
+
+    const andSql = (qbs[1].andWhere as jest.Mock).mock.calls.map((c) => String(c[0])).join(' | ');
+    for (const f of FILTERS) expect(andSql).toContain(f);
+    expect((qbs[1].where as jest.Mock).mock.calls).toHaveLength(1);
+  });
+});
