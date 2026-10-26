@@ -1115,47 +1115,75 @@ export class MessageService {
       await this.assertMember(params.conversationId, params.userId);
     }
 
-    const qb = this.dataSource
-      .getRepository(Message)
-      .createQueryBuilder('m')
-      .select('m.id', 'id')
-      .addSelect('m.conversation_id', 'conversation_id')
-      .addSelect('m.sender_id', 'sender_id')
-      .addSelect('m.type', 'type')
-      .addSelect('m.content', 'content')
-      .addSelect('m.file_name', 'file_name')
-      .addSelect('m.created_at', 'created_at')
-      .addSelect('u.display_name', 'sender_name')
-      .innerJoin(
-        ConversationMember,
-        'cm',
-        'cm.conversation_id = m.conversation_id AND cm.user_id = :uid',
-        { uid: params.userId },
-      )
-      .leftJoin(AppUser, 'u', 'u.id = m.sender_id')
-      .where('MATCH(m.content, m.file_name) AGAINST (:kw IN BOOLEAN MODE)', { kw: ftKeyword })
-      .andWhere('m.is_encrypted = :isEncrypted', { isEncrypted: false })
-      .andWhere('m.is_destroyed = :isDestroyed', { isDestroyed: false })
-      .andWhere('(m.destroy_at IS NULL OR m.destroy_at > :now)', { now: new Date() })
-      .andWhere('m.is_recalled = :isRecalled', { isRecalled: false })
-      .andWhere('m.burn_ttl_seconds IS NULL')
-      .orderBy('m.created_at', 'DESC')
-      .skip((page - 1) * pageSize)
-      .take(pageSize);
+    const buildQb = (mode: 'fulltext' | 'like') => {
+      const qb = this.dataSource
+        .getRepository(Message)
+        .createQueryBuilder('m')
+        .select('m.id', 'id')
+        .addSelect('m.conversation_id', 'conversation_id')
+        .addSelect('m.sender_id', 'sender_id')
+        .addSelect('m.type', 'type')
+        .addSelect('m.content', 'content')
+        .addSelect('m.file_name', 'file_name')
+        .addSelect('m.created_at', 'created_at')
+        .addSelect('u.display_name', 'sender_name')
+        .innerJoin(
+          ConversationMember,
+          'cm',
+          'cm.conversation_id = m.conversation_id AND cm.user_id = :uid',
+          { uid: params.userId },
+        )
+        .leftJoin(AppUser, 'u', 'u.id = m.sender_id')
+        .andWhere('m.is_encrypted = :isEncrypted', { isEncrypted: false })
+        .andWhere('m.is_destroyed = :isDestroyed', { isDestroyed: false })
+        .andWhere('(m.destroy_at IS NULL OR m.destroy_at > :now)', { now: new Date() })
+        .andWhere('m.is_recalled = :isRecalled', { isRecalled: false })
+        .andWhere('m.burn_ttl_seconds IS NULL')
+        .orderBy('m.created_at', 'DESC')
+        .skip((page - 1) * pageSize)
+        .take(pageSize);
 
-    if (params.conversationId) {
-      qb.andWhere('m.conversation_id = :cid', { cid: params.conversationId });
-    }
-    if (afterDate) {
-      qb.andWhere('m.created_at > :after', { after: afterDate });
-    }
-    if (beforeDate) {
-      qb.andWhere('m.created_at < :before', { before: beforeDate });
-    }
+      if (mode === 'fulltext') {
+        qb.where('MATCH(m.content, m.file_name) AGAINST (:kw IN BOOLEAN MODE)', { kw: ftKeyword });
+      } else {
+        // 降级：索引缺失时用 LIKE 兜底（慢，但不会 500）。
+        // 转义 % _ \ 三个有特殊含义的字符，避免关键词被当成通配符。
+        const escaped = keyword.replace(/[\\%_]/g, (c) => `\\${c}`);
+        qb.where('(m.content LIKE :likeKw OR m.file_name LIKE :likeKw)', {
+          likeKw: `%${escaped}%`,
+        });
+      }
+
+      if (params.conversationId) {
+        qb.andWhere('m.conversation_id = :cid', { cid: params.conversationId });
+      }
+      if (afterDate) {
+        qb.andWhere('m.created_at > :after', { after: afterDate });
+      }
+      if (beforeDate) {
+        qb.andWhere('m.created_at < :before', { before: beforeDate });
+      }
+      return qb;
+    };
 
     // raw 拿列表（带别名列），getCount 单独算总数（COUNT 天然忽略 LIMIT/OFFSET）
-    const rows = await qb.getRawMany();
-    const total = await qb.getCount();
+    let qb = buildQb('fulltext');
+    let rows: any[];
+    let total: number;
+    try {
+      rows = await qb.getRawMany();
+      total = await qb.getCount();
+    } catch (err: any) {
+      // 1191 = ER_CANT_FIND_FULLTEXT_INDEX_MATCHING_THE_COLUMN_LIST
+      // 线上若漏跑 FULLTEXT 迁移（历史遗留的"手工执行"脚本），这里降级而不是 500
+      if (!MessageService.isFulltextIndexMissing(err)) throw err;
+      this.logger.warn(
+        'FULLTEXT 索引 ft_messages_search 不存在，搜索降级为 LIKE（请执行 npm run migration:run）',
+      );
+      qb = buildQb('like');
+      rows = await qb.getRawMany();
+      total = await qb.getCount();
+    }
 
     const list = rows.map((r: any) => {
       // 文本消息用 content 生成摘要；媒体消息（图/语音/视频/文件）用 file_name
@@ -1172,5 +1200,13 @@ export class MessageService {
       };
     });
     return { list, total, page, pageSize };
+  }
+
+  /** 判断错误是否 = MySQL 1191「找不到与 MATCH 列清单匹配的 FULLTEXT 索引」 */
+  private static isFulltextIndexMissing(err: any): boolean {
+    const code = Number(err?.errno ?? err?.code ?? err?.driverError?.errno ?? 0);
+    if (code === 1191) return true;
+    const msg = String(err?.message ?? '');
+    return /Can't find FULLTEXT index/i.test(msg) || /ER_CANT_FIND_FULLTEXT_INDEX/i.test(msg);
   }
 }
