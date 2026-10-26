@@ -3,34 +3,37 @@
 # 焚信 BurnMsg 后端 — 多阶段构建
 #  builder: 完整装依赖 + nest build
 #  runner : 只拷 prod 依赖 + dist，瘦身到 ~250MB
+#
+# 包管理器：npm（仓库里提交的是 package-lock.json，没有 pnpm-lock.yaml）。
+# 之前这里用 pnpm + --frozen-lockfile，缺 pnpm-lock.yaml 时构建会直接失败：
+#   ERR_PNPM_NO_LOCKFILE  Cannot install with "frozen-lockfile" because pnpm-lock.yaml is absent
+# 现在改为 npm ci，锁文件必须与 package-lock.json 一致，可复现。
 # ============================================================
 
 ARG NODE_VERSION=20.18.0
-ARG PNPM_VERSION=11.17.0
 
 # ---------- 阶段 1：构建产物 ----------
 FROM node:${NODE_VERSION}-alpine AS builder
-ARG PNPM_VERSION
 
-# pnpm 通过 corepack 启用（与本地版本一致可避免 lockfile 漂移）
-RUN corepack enable && corepack prepare pnpm@${PNPM_VERSION} --activate
+# argon2 是原生模块：alpine 下需要编译工具链（无预编译包时走源码编译）
+RUN apk add --no-cache python3 make g++
 
 WORKDIR /app
 
-# 1) 装依赖（先拷贝 lockfile，最大化层缓存）
-COPY package.json pnpm-lock.yaml* pnpm-workspace.yaml* .npmrc* ./
-RUN pnpm install --frozen-lockfile
+# 1) 装依赖（先拷 lockfile，最大化层缓存）
+#    注意：显式列文件名，不要用通配符 —— 匹配不到文件时 COPY 会直接失败
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
 
 # 2) 拷贝源码 + 构建
 COPY tsconfig.json tsconfig.build.json nest-cli.json ./
 COPY src ./src
-RUN pnpm run build && pnpm prune --prod
+RUN npm run build && npm prune --omit=dev
 
 # ---------- 阶段 2：运行时镜像 ----------
 FROM node:${NODE_VERSION}-alpine AS runner
-ARG PNPM_VERSION
 
-# 系统依赖：argon2 编译需要 python3 + make + g++（alpine 自带）；wget 用于 healthcheck
+# 系统依赖：wget 用于 healthcheck；tini 收僵尸进程
 RUN apk add --no-cache wget tini
 
 ENV NODE_ENV=production \
