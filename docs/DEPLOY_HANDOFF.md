@@ -258,14 +258,48 @@ sh scripts/test-rehearsal.sh --no-write
 docker exec fenxin-backend printenv | grep -E '^(JWT_|OSS_|JPUSH_|DB_)' | sed 's/=.*/=***/'
 ```
 
-### 关于极光推送（本次保持关闭或维持现状）
+### 关于极光推送
 
-- **如果生产已经配了 `JPUSH_*`**：保持原值不动即可，本次代码只读取这些变量。
-- **如果生产还没配**：本次**不要新增**。客户端（APK）侧的用户标识绑定还没上线，
-  现在开启推送只会收到极光返回 `1011 找不到目标用户`，等于无效推送；
-  等 App 新版本铺开后再单独配置。
-- 开启/关闭只需改 `JPUSH_ENABLED=true|false` 并重建容器，**不需要**改代码。
-- `JPUSH_MASTER_SECRET` 只允许存在于服务端环境变量，**严禁**写入 APK、前端仓库或本文档。
+**现状**：客户端（APK）已完成极光 SDK 接入、通知渠道 `messages` 创建、
+以及 `setAlias(清洗后的 userId)` 绑定 —— 推送链路已可用。
+
+**本次是否开启由开发决定，运维只需按下面操作（不改代码）**：
+
+| 操作 | 方式 |
+|---|---|
+| 开启推送 | `.env` 里 `JPUSH_ENABLED=true`，并确认 `JPUSH_APP_KEY` / `JPUSH_MASTER_SECRET` 已填，然后重建容器 |
+| 关闭推送 | `JPUSH_ENABLED=false`，重建容器 |
+| 通知渠道 | `JPUSH_CHANNEL_ID` 必须与 APK 里创建的渠道 id 一致（当前 `messages`），否则 Android 8+ 不显示通知 |
+
+**开启后的验证（3 条）**：
+
+```bash
+# ① 启动日志（含配置项，不含密钥）
+docker logs fenxin-backend 2>&1 | grep '\[Push\]'
+#   期望：push enabled: channel=messages small_icon=(unset) ttl=3600s endpoint=api.jpush.cn
+#   若显示 "push disabled ..." → 变量没生效，检查是否重建了容器
+
+# ② alias 是否绑定成功（需服务器能访问外网）
+#    alias 规则：userId 去掉非 [A-Za-z0-9_] 字符并截断 40 位
+#    UUID 7bb01d5b-bd33-45e7-98d2-bbfe221d4490 → 7bb01d5bbd3345e798d2bbfe221d4490
+curl -s -u "$JPUSH_APP_KEY:$JPUSH_MASTER_SECRET" \
+  "https://device.jpush.cn/v3/aliases/<清洗后的userId>"
+#   期望：{"registration_ids":["..."]}
+#   返回空/404 → 该用户还没用新 APK 登录过（还没绑定）
+
+# ③ 真实推送：找一个"离线"的测试账号，给它发一条消息
+docker logs --since 2m fenxin-backend 2>&1 | grep '\[JPush\]'
+#   期望：push ok users=1 resp={"sendno":"0","msg_id":"..."}
+```
+
+**注意**：
+
+- 只对**离线**用户推送（在线用户由 WebSocket 覆盖）。测试时把目标 App 切后台或退出，
+  并确认 `devices.is_online = 0`
+- 焚毁消息、加密消息的推送正文是**脱敏**的（`你有一条阅后即焚消息` / `你有一条加密消息`），
+  设计如此，不是 bug
+- `JPUSH_MASTER_SECRET` 只允许存在于服务端环境变量，**严禁**写入 APK、前端仓库或本文档；
+  如需交给运维，请通过密码管理器单独传递
 
 ---
 
