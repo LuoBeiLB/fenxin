@@ -2,7 +2,7 @@
 
 > 适用：`fenxin-server` 部署 / 升级
 > 最后更新：2026-10-26
-> 结论先行：**这个项目的库从来没有跑过迁移，新版本上线必须跑一次 `migration:run`**（共 10 个，全部幂等）。
+> 结论先行：**这个项目的库从来没有跑过迁移，新版本上线必须跑一次 `migration:run`**（共 13 个，全部幂等）。
 
 ---
 
@@ -62,7 +62,7 @@ DB_SYNC=true（.env）→ 表都是 synchronize 自动建的
 > `messages.media_duration`、`messages.is_destroyed`、`conversation_members.muted`、
 > `conversations.ai_enabled`、`message_receipts.is_delivered`。
 
-**所以：全部 10 个迁移都会"从头"执行，但因为每个都带 `hasColumn`/`hasTable` 判断，
+**所以：全部 13 个迁移都会"从头"执行，但因为每个都带 `hasColumn`/`hasTable` 判断，
 已存在的对象会跳过，不会报 `Duplicate column name`。**
 
 ---

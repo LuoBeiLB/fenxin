@@ -76,7 +76,16 @@ describe('业务状态变化 → AuthCache.invalidate', () => {
         emitToUsers: jest.fn(),
       } as any;
 
-      svc = new AuthService(dataSource, audit, tokenService, authCache, events);
+      // V6.2：新增 KeysService / E2eService 两个依赖（本测试不涉及，给空实现）
+    svc = new AuthService(
+      dataSource,
+      audit,
+      tokenService,
+      authCache,
+      events,
+      { deleteDeviceKeyByDeviceId: jest.fn() } as any,
+      { closeSecretChatsBoundTo: jest.fn() } as any,
+    );
 
       // mock 后的 argon2 是 jest auto-mock，属性可重定义
       mockedArgon2.verify.mockResolvedValue(true);

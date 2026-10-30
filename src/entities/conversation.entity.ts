@@ -48,6 +48,42 @@ export class Conversation {
   @Column({ length: 36, nullable: true })
   dissolved_by: string | null;
 
+  /* ===== 设备配对私密会话（Secret Chat，V6.2）===== */
+
+  /**
+   * 0 = 普通会话（云端，所有成员设备可见）
+   * 1 = 设备配对私密会话（仅两台绑定设备可见）
+   */
+  @Index('idx_e2e_state')
+  @Column({ type: 'tinyint', default: 0 })
+  e2e_mode: number;
+
+  /**
+   * 0 = 非私密
+   * 1 = pending 待接受（双方所有设备可见，作为"请求"）
+   * 2 = active 已激活（仅 e2e_device_a / e2e_device_b 可见）
+   *
+   * 注意：**终止动作是删除该行**，不存在 closed / rejected / expired 状态。
+   */
+  @Column({ type: 'tinyint', default: 0 })
+  e2e_state: number;
+
+  /** 参与者 1（固定取较小的 user_id，供唯一约束使用） */
+  @Column({ length: 36, nullable: true })
+  user_a: string | null;
+
+  /** 参与者 2（固定取较大的 user_id） */
+  @Column({ length: 36, nullable: true })
+  user_b: string | null;
+
+  /** 发起设备 devices.id */
+  @Column({ length: 36, nullable: true })
+  e2e_device_a: string | null;
+
+  /** 接受设备 devices.id（pending 时为 null） */
+  @Column({ length: 36, nullable: true })
+  e2e_device_b: string | null;
+
   @CreateDateColumn({ type: 'datetime' })
   created_at: Date;
 

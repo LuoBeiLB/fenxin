@@ -54,7 +54,7 @@ export class ConversationService {
     return savedConv;
   }
 
-  async listMyConversations(userId: string) {
+  async listMyConversations(userId: string, deviceId?: string) {
     const memberRepo = this.dataSource.getRepository(ConversationMember);
     const convRepo = this.dataSource.getRepository(Conversation);
     const userRepo = this.dataSource.getRepository(AppUser);
@@ -68,6 +68,15 @@ export class ConversationService {
       .whereInIds(convIds)
       // 已解散的群不出现在会话列表（数据保留供审计）
       .andWhere('c.dissolved_at IS NULL')
+      // V6.2 私密会话按设备可见（E2E_SECRET_CHAT.md §6.1）：
+      //   pending → 双方所有设备可见（作为"请求"）
+      //   active  → 仅两台绑定设备可见
+      .andWhere(
+        `(c.e2e_mode = 0
+          OR (c.e2e_mode = 1 AND c.e2e_state = 1 AND :uid IN (c.user_a, c.user_b))
+          OR (c.e2e_mode = 1 AND c.e2e_state = 2 AND :deviceId IN (c.e2e_device_a, c.e2e_device_b)))`,
+        { uid: userId, deviceId: deviceId ?? '' },
+      )
       // MySQL 不支持 NULLS LAST，用 IS NULL 表达式实现同样效果（无消息的会话排最后）
       .orderBy('c.last_message_at IS NULL', 'ASC')
       .addOrderBy('c.last_message_at', 'DESC')
@@ -95,7 +104,20 @@ export class ConversationService {
 
     return Promise.all(
       conversations.map(async (conv) => {
-        const base = { ...conv, unread_count: unreadMap.get(conv.id) ?? 0 };
+        const base = {
+          ...conv,
+          unread_count: unreadMap.get(conv.id) ?? 0,
+          // 私密会话（V6.2）：前端据此渲染「请求 / 进行中」，并判断本设备是否绑定
+          is_bound_device:
+            conv.e2e_mode === 1 &&
+            (conv.e2e_device_a === deviceId || conv.e2e_device_b === deviceId),
+          peer_device_id:
+            conv.e2e_mode === 1
+              ? conv.e2e_device_a === deviceId
+                ? conv.e2e_device_b
+                : conv.e2e_device_a
+              : null,
+        };
         if (conv.type === 'private') {
           const members = await memberRepo.find({ where: { conversation_id: conv.id } });
           const otherUserId = members.map((m) => m.user_id).find((id) => id !== userId);
@@ -111,7 +133,7 @@ export class ConversationService {
     );
   }
 
-  async getConversation(conversationId: string, userId: string) {
+  async getConversation(conversationId: string, userId: string, deviceId?: string) {
     const membership = await this.dataSource.getRepository(ConversationMember).findOne({
       where: { conversation_id: conversationId, user_id: userId },
     });
@@ -121,6 +143,12 @@ export class ConversationService {
       where: { id: conversationId },
     });
     if (!conv) throw new NotFoundException('会话不存在');
+
+    // V6.2 私密会话：active 时仅绑定设备可见
+    if (conv.e2e_mode === 1 && conv.e2e_state === 2) {
+      const bound = !!deviceId && (conv.e2e_device_a === deviceId || conv.e2e_device_b === deviceId);
+      if (!bound) throw new ForbiddenException('本设备无权访问该私密会话');
+    }
     return conv;
   }
 }

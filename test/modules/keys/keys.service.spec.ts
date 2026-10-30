@@ -1,292 +1,233 @@
+import { BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
+import { DataSource } from 'typeorm';
 import { KeysService } from 'src/modules/keys/keys.service';
-import { UserKey } from 'src/entities/user-key.entity';
-import { ConversationMember } from 'src/entities/conversation-member.entity';
+import { DeviceKey } from 'src/entities/device-key.entity';
+import { Conversation } from 'src/entities/conversation.entity';
 
 /**
- * 验证"公钥上传 / 查询 / TOFU 批量比对 / 轮换广播"链路。
+ * 设备级密钥（V6.2）。
  *
- * 覆盖 10 个关键路径：
- *   1. uploadIdentityKey 首次上传 → updated=true，不广播（无人有旧公钥可比对）
- *   2. uploadIdentityKey 相同公钥幂等 → updated=false
- *   3. uploadIdentityKey 覆盖更新（不同公钥） → updated=true
- *   3b. 覆盖更新且有共同会话用户 → 广播 key:changed 给共同会话用户（TOFU）
- *   4. getIdentityKey 拿自己公钥 → 跳过权限校验
- *   5. getIdentityKey 同 conversation 成员 → 返回公钥
- *   6. getIdentityKey 非成员 → 抛 ForbiddenException
- *   7. getIdentityKey 对方未上传公钥 → 抛 NotFoundException
- *   8. getIdentityKeysBatch 批量查询 → 一条 SQL 返回映射结果（TOFU 比对）
- *   9. hasKey 有/无公钥
+ * 覆盖：
+ *  - 上传：首次创建 / 相同公钥幂等 / 变更更新 / 缺 deviceId 报错
+ *  - 查本设备：不存在 → exists=false
+ *  - 查对方：非私密会话 400 / pending 404 / 非绑定设备 403 / 对方无公钥 404 / 正常返回
+ *  - 设备下线：按 device_id 删除
  *
  * 不接 DB：用 jest.fn 替身 repository 撑过去，目的就是验证服务层分支逻辑。
- * 权限过滤（共同会话 EXISTS 子查询）在 SQL 里，由真实库集成验证。
  */
-describe('KeysService（V4.0 §E2E 公钥服务 + TOFU）', () => {
-  let svc: KeysService;
-  let dataSource: any;
-  const events: any = { emitToUsers: jest.fn() };
 
-  // 用 entity 名字路由到对应 mock repo
-  // initial: 该 user 已存的 user_keys 行（null = 没上传过）
-  // batchKeys: getIdentityKeysBatch 的 getMany 返回值（null = 空结果）
-  const makeUserKeyRepo = (
-    initial: Partial<UserKey> | null = null,
-    batchKeys: any[] | null = null,
-  ) => {
-    let stored: Partial<UserKey> | null = initial;
-    return {
-      findOne: jest.fn(async (opts: any) => {
-        if (!stored) return null;
-        if (opts?.where?.user_id && stored.user_id !== opts.where.user_id) return null;
-        return stored;
-      }),
-      save: jest.fn(async (entity: any) => {
-        stored = { ...stored, ...entity };
-        return stored;
-      }),
-      update: jest.fn(async (id: string, patch: any) => {
-        if (stored && stored.id === id) stored = { ...stored, ...patch };
-        return { affected: 1 };
-      }),
-      create: jest.fn((data: any) => data),
-      createQueryBuilder: jest.fn(() => ({
-        select: jest.fn().mockReturnThis(),
-        where: jest.fn().mockReturnThis(),
-        andWhere: jest.fn().mockReturnThis(),
-        getCount: jest.fn(async () => (stored ? 1 : 0)),
-        getMany: jest.fn(async () => batchKeys ?? []),
-      })),
-    };
+function makeService(
+  opts: {
+    deviceKey?: any; // 本设备公钥行
+    conversation?: any; // 会话行
+    peerKey?: any; // 对方设备公钥行
+  } = {},
+) {
+  const store: any = { deviceKey: opts.deviceKey ?? null, peerKey: opts.peerKey ?? null };
+  const created: any[] = [];
+  const updated: any[] = [];
+  const deleted: any[] = [];
+
+  const deviceKeyRepo: any = {
+    findOne: jest.fn(async ({ where }: any) => {
+      if (
+        store.deviceKey &&
+        store.deviceKey.user_id === where.user_id &&
+        store.deviceKey.device_id === where.device_id
+      ) {
+        return store.deviceKey;
+      }
+      if (
+        store.peerKey &&
+        store.peerKey.user_id === where.user_id &&
+        store.peerKey.device_id === where.device_id
+      ) {
+        return store.peerKey;
+      }
+      return null;
+    }),
+    create: jest.fn((v: any) => ({ ...v })),
+    save: jest.fn(async (v: any) => {
+      created.push(v);
+      return { id: 'new-id', ...v };
+    }),
+    update: jest.fn(async (id: any, patch: any) => {
+      updated.push({ id, patch });
+      return { affected: 1 };
+    }),
+    delete: jest.fn(async (criteria: any) => {
+      deleted.push(criteria);
+      return { affected: 1 };
+    }),
   };
 
-  // myConvIds: 当前用户所在的 conversationId 列表（getIdentityKey 权限查询用）
-  // sharedWith: 给定目标 userId 时，返回的"共同" conversationId 列表（空数组 = 无共同会话）
-  // peerUserIds: 与当前用户有共同会话的其他用户（getPeerUserIds → key:changed 广播目标）
-  const makeMemberRepo = (
-    myConvIds: string[],
-    sharedWith: string[] = [],
-    peerUserIds: string[] = [],
-  ) => {
-    return {
-      createQueryBuilder: jest.fn(() => {
-        const qb: any = {
-          // 记录 select 的字段，getRawMany 据此分流两种查询（conversation_id / m2.user_id）
-          selected: null as string | null,
-          select: jest.fn((s: string) => {
-            qb.selected = s;
-            return qb;
-          }),
-          innerJoin: jest.fn().mockReturnThis(),
-          where: jest.fn().mockReturnThis(),
-          andWhere: jest.fn().mockReturnThis(),
-          limit: jest.fn().mockReturnThis(),
-          getRawMany: jest.fn(async () => {
-            if (qb.selected && qb.selected.includes('m2.user_id')) {
-              return peerUserIds.map((user_id) => ({ user_id }));
-            }
-            return myConvIds.map((conversation_id) => ({ conversation_id }));
-          }),
-          getRawOne: jest.fn(async () => {
-            if (sharedWith.length === 0) return undefined;
-            return { conversation_id: sharedWith[0] };
-          }),
-        };
-        return qb;
-      }),
-    };
+  const convRepo: any = {
+    findOne: jest.fn(async () => opts.conversation ?? null),
   };
 
-  const buildDataSource = (userKeyRepo: any, memberRepo: any) => ({
+  const dataSource: any = {
     getRepository: (entity: any) => {
-      const name = entity?.name || '';
-      if (name === 'UserKey') return userKeyRepo;
-      if (name === 'ConversationMember') return memberRepo;
+      if (entity === DeviceKey) return deviceKeyRepo;
+      if (entity === Conversation) return convRepo;
       return {};
     },
-  });
+  };
 
-  beforeEach(() => {
-    jest.clearAllMocks();
-  });
+  const service = new KeysService(dataSource as DataSource);
+  return { service, deviceKeyRepo, convRepo, created, updated, deleted };
+}
 
-  // ===== uploadIdentityKey =====
-  describe('uploadIdentityKey', () => {
-    it('首次上传：updated=true，写库，不广播（无人有旧公钥可比对）', async () => {
-      const repo = makeUserKeyRepo(null);
-      dataSource = buildDataSource(repo, makeMemberRepo([], [], ['u2', 'u3']));
-      svc = new KeysService(dataSource, events);
+const USER = 'u-1';
+const DEVICE = 'd-1';
 
-      const res = await svc.uploadIdentityKey('u1', 'PUBKEY_A_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx');
-      expect(res).toEqual({ updated: true });
-      expect(repo.save).toHaveBeenCalledTimes(1);
-      expect(events.emitToUsers).not.toHaveBeenCalled();
+describe('KeysService（V6.2 设备级密钥）', () => {
+  describe('上传设备公钥', () => {
+    it('首次上传 → 创建一行，updated=true', async () => {
+      const { service, created } = makeService({ deviceKey: null });
+      const r = await service.uploadDeviceKey(USER, DEVICE, 'p'.repeat(43));
+      expect(r.updated).toBe(true);
+      expect(created).toHaveLength(1);
+      expect(created[0]).toMatchObject({ user_id: USER, device_id: DEVICE });
     });
 
-    it('相同公钥幂等：updated=false，不写库', async () => {
-      const sameKey = 'PUBKEY_A_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx';
-      const repo = makeUserKeyRepo({
-        id: 'r1',
-        user_id: 'u1',
-        identity_pubkey: sameKey,
-      } as any);
-      dataSource = buildDataSource(repo, makeMemberRepo([]));
-      svc = new KeysService(dataSource, events);
-
-      const res = await svc.uploadIdentityKey('u1', sameKey);
-      expect(res).toEqual({ updated: false });
-      expect(repo.save).not.toHaveBeenCalled();
-      expect(repo.update).not.toHaveBeenCalled();
-      expect(events.emitToUsers).not.toHaveBeenCalled();
+    it('相同公钥重复上传 → 幂等，不写库', async () => {
+      const { service, created, updated } = makeService({
+        deviceKey: { id: 'k-1', user_id: USER, device_id: DEVICE, identity_pubkey: 'p'.repeat(43) },
+      });
+      const r = await service.uploadDeviceKey(USER, DEVICE, 'p'.repeat(43));
+      expect(r.updated).toBe(false);
+      expect(created).toHaveLength(0);
+      expect(updated).toHaveLength(0);
     });
 
-    it('不同公钥覆盖：updated=true，调 update', async () => {
-      const repo = makeUserKeyRepo({
-        id: 'r1',
-        user_id: 'u1',
-        identity_pubkey: 'PUBKEY_OLD_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-      } as any);
-      dataSource = buildDataSource(repo, makeMemberRepo([])); // 无共同会话用户
-      svc = new KeysService(dataSource, events);
-
-      const res = await svc.uploadIdentityKey('u1', 'PUBKEY_NEW_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx');
-      expect(res).toEqual({ updated: true });
-      expect(repo.update).toHaveBeenCalledWith('r1', { identity_pubkey: expect.any(String) });
+    it('公钥变更 → 覆盖本行（不影响其它设备）', async () => {
+      const { service, updated } = makeService({
+        deviceKey: { id: 'k-1', user_id: USER, device_id: DEVICE, identity_pubkey: 'a'.repeat(43) },
+      });
+      const r = await service.uploadDeviceKey(USER, DEVICE, 'b'.repeat(43));
+      expect(r.updated).toBe(true);
+      expect(updated[0]).toMatchObject({ id: 'k-1' });
     });
 
-    it('不同公钥覆盖 + 有共同会话用户：广播 key:changed（TOFU）', async () => {
-      const repo = makeUserKeyRepo({
-        id: 'r1',
-        user_id: 'u1',
-        identity_pubkey: 'PUBKEY_OLD_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-      } as any);
-      const memberRepo = makeMemberRepo(['c1'], [], ['u2', 'u3']); // u1 的共同会话用户
-      dataSource = buildDataSource(repo, memberRepo);
-      svc = new KeysService(dataSource, events);
-
-      const res = await svc.uploadIdentityKey('u1', 'PUBKEY_NEW_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx');
-      expect(res).toEqual({ updated: true });
-      expect(events.emitToUsers).toHaveBeenCalledWith(
-        'key:changed',
-        ['u2', 'u3'],
-        expect.objectContaining({ user_id: 'u1', updated_at: expect.any(String) }),
+    it('缺少 deviceId → 400', async () => {
+      const { service } = makeService();
+      await expect(service.uploadDeviceKey(USER, '', 'p'.repeat(43))).rejects.toBeInstanceOf(
+        BadRequestException,
       );
     });
   });
 
-  // ===== getIdentityKey =====
-  describe('getIdentityKey', () => {
-    it('拿自己公钥：跳过权限校验', async () => {
-      const selfKey = {
-        id: 'r1',
-        user_id: 'u1',
-        identity_pubkey: 'PUBKEY_SELF_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-        created_at: new Date('2026-01-01'),
-        updated_at: new Date('2026-01-01'),
-      } as any;
-      const repo = makeUserKeyRepo(selfKey);
-      const memberRepo = makeMemberRepo([]); // 没有任何会话
-      dataSource = buildDataSource(repo, memberRepo);
-      svc = new KeysService(dataSource, events);
-
-      const res = await svc.getIdentityKey('u1', 'u1');
-      expect(res.user_id).toBe('u1');
-      // 拿自己跳权限 → memberRepo 都没被查
-      expect(memberRepo.createQueryBuilder).not.toHaveBeenCalled();
+  describe('查询', () => {
+    it('本设备未上传 → exists=false', async () => {
+      const { service } = makeService({ deviceKey: null });
+      const r = await service.getMyDeviceKey(USER, DEVICE);
+      expect(r).toEqual({ exists: false });
     });
 
-    it('拿对方公钥 + 同会话成员：返回公钥', async () => {
-      const otherKey = {
-        id: 'r2',
-        user_id: 'u2',
-        identity_pubkey: 'PUBKEY_OTHER_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-        created_at: new Date('2026-01-01'),
-        updated_at: new Date('2026-01-01'),
-      } as any;
-      const repo = makeUserKeyRepo(otherKey);
-      const memberRepo = makeMemberRepo(['c1', 'c2'], ['c1']); // 跟 u2 有共同会话 c1
-      dataSource = buildDataSource(repo, memberRepo);
-      svc = new KeysService(dataSource, events);
-
-      const res = await svc.getIdentityKey('u1', 'u2');
-      expect(res.user_id).toBe('u2');
-      expect(res.identity_pubkey).toBe('PUBKEY_OTHER_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx');
+    it('本设备已上传 → 返回公钥', async () => {
+      const { service } = makeService({
+        deviceKey: {
+          id: 'k-1',
+          user_id: USER,
+          device_id: DEVICE,
+          identity_pubkey: 'p'.repeat(43),
+          updated_at: new Date(),
+        },
+      });
+      const r = await service.getMyDeviceKey(USER, DEVICE);
+      expect(r.exists).toBe(true);
+      expect(r.identity_pubkey).toBe('p'.repeat(43));
     });
 
-    it('拿对方公钥 + 非成员：抛 ForbiddenException', async () => {
-      const repo = makeUserKeyRepo(null);
-      const memberRepo = makeMemberRepo(['c1', 'c2'], []); // 无共同会话
-      dataSource = buildDataSource(repo, memberRepo);
-      svc = new KeysService(dataSource, events);
-
-      await expect(svc.getIdentityKey('u1', 'u2')).rejects.toThrow('对方不在你的会话中');
+    it('非私密会话 → 400', async () => {
+      const { service } = makeService({
+        conversation: { id: 'c-1', e2e_mode: 0, e2e_state: 0 },
+      });
+      await expect(service.getPeerDeviceKey(USER, DEVICE, 'c-1')).rejects.toBeInstanceOf(
+        BadRequestException,
+      );
     });
 
-    it('拿对方公钥 + 对方未上传：抛 NotFoundException', async () => {
-      const repo = makeUserKeyRepo(null); // 对方没公钥
-      const memberRepo = makeMemberRepo(['c1'], ['c1']); // 关系通过
-      dataSource = buildDataSource(repo, memberRepo);
-      svc = new KeysService(dataSource, events);
+    it('pending 会话 → 404（对方设备尚未绑定）', async () => {
+      const { service } = makeService({
+        conversation: { id: 'c-1', e2e_mode: 1, e2e_state: 1, e2e_device_a: DEVICE },
+      });
+      await expect(service.getPeerDeviceKey(USER, DEVICE, 'c-1')).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
+    });
 
-      await expect(svc.getIdentityKey('u1', 'u2')).rejects.toThrow('对方尚未上传公钥');
+    it('非绑定设备 → 403', async () => {
+      const { service } = makeService({
+        conversation: {
+          id: 'c-1',
+          e2e_mode: 1,
+          e2e_state: 2,
+          e2e_device_a: 'other-device',
+          e2e_device_b: 'another-device',
+          user_a: USER,
+          user_b: 'u-2',
+        },
+      });
+      await expect(service.getPeerDeviceKey(USER, DEVICE, 'c-1')).rejects.toBeInstanceOf(
+        ForbiddenException,
+      );
+    });
+
+    it('绑定设备但对方未上传公钥 → 404', async () => {
+      const { service } = makeService({
+        conversation: {
+          id: 'c-1',
+          e2e_mode: 1,
+          e2e_state: 2,
+          e2e_device_a: DEVICE,
+          e2e_device_b: 'peer-device',
+          user_a: USER,
+          user_b: 'u-2',
+        },
+        peerKey: null,
+      });
+      await expect(service.getPeerDeviceKey(USER, DEVICE, 'c-1')).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
+    });
+
+    it('绑定设备 + 对方已上传 → 返回对方设备公钥', async () => {
+      const { service } = makeService({
+        conversation: {
+          id: 'c-1',
+          e2e_mode: 1,
+          e2e_state: 2,
+          e2e_device_a: DEVICE,
+          e2e_device_b: 'peer-device',
+          user_a: USER,
+          user_b: 'u-2',
+        },
+        peerKey: {
+          user_id: 'u-2',
+          device_id: 'peer-device',
+          identity_pubkey: 'q'.repeat(43),
+          updated_at: new Date(),
+        },
+      });
+      const r = await service.getPeerDeviceKey(USER, DEVICE, 'c-1');
+      expect(r).toMatchObject({ user_id: 'u-2', device_id: 'peer-device' });
+      expect(r.identity_pubkey).toBe('q'.repeat(43));
     });
   });
 
-  // ===== getIdentityKeysBatch（TOFU 批量比对）=====
-  describe('getIdentityKeysBatch', () => {
-    it('一条 SQL 批量返回，结果字段映射正确', async () => {
-      const batchKeys = [
-        {
-          user_id: 'u1',
-          identity_pubkey: 'PUBKEY_SELF_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-          created_at: new Date('2026-01-01'),
-          updated_at: new Date('2026-01-01'),
-        },
-        {
-          user_id: 'u2',
-          identity_pubkey: 'PUBKEY_OTHER_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-          created_at: new Date('2026-01-01'),
-          updated_at: new Date('2026-01-02'),
-        },
-      ];
-      const repo = makeUserKeyRepo(null, batchKeys);
-      dataSource = buildDataSource(repo, makeMemberRepo(['c1']));
-      svc = new KeysService(dataSource, events);
-
-      const res = await svc.getIdentityKeysBatch('u1', ['u1', 'u2', 'u2']);
-      expect(res).toHaveLength(2);
-      expect(res[0]).toMatchObject({ user_id: 'u1', identity_pubkey: 'PUBKEY_SELF_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' });
-      expect(res[1]).toMatchObject({ user_id: 'u2', updated_at: new Date('2026-01-02') });
-      // 批量接口只查一次库（不做逐个 userId 循环查询）
-      expect(repo.createQueryBuilder).toHaveBeenCalledTimes(1);
+  describe('设备下线', () => {
+    it('按 device_id 删除设备公钥', async () => {
+      const { service, deleted } = makeService();
+      const n = await service.deleteDeviceKeyByDeviceId('d-9');
+      expect(n).toBe(1);
+      expect(deleted[0]).toMatchObject({ device_id: 'd-9' });
     });
 
-    it('无任何结果 → 空数组', async () => {
-      const repo = makeUserKeyRepo(null, []);
-      dataSource = buildDataSource(repo, makeMemberRepo([]));
-      svc = new KeysService(dataSource, events);
-
-      const res = await svc.getIdentityKeysBatch('u1', ['u2']);
-      expect(res).toEqual([]);
-    });
-  });
-
-  // ===== hasKey =====
-  describe('hasKey', () => {
-    it('有公钥 → true', async () => {
-      const repo = makeUserKeyRepo({ id: 'r1', user_id: 'u1' } as any);
-      dataSource = buildDataSource(repo, makeMemberRepo([]));
-      svc = new KeysService(dataSource, events);
-
-      const res = await svc.hasKey('u1');
-      expect(res).toBe(true);
-    });
-
-    it('无公钥 → false', async () => {
-      const repo = makeUserKeyRepo(null);
-      dataSource = buildDataSource(repo, makeMemberRepo([]));
-      svc = new KeysService(dataSource, events);
-
-      const res = await svc.hasKey('u1');
-      expect(res).toBe(false);
+    it('deviceId 为空 → 不执行删除', async () => {
+      const { service, deviceKeyRepo } = makeService();
+      await service.deleteDeviceKey('', '');
+      expect(deviceKeyRepo.delete).not.toHaveBeenCalled();
     });
   });
 });

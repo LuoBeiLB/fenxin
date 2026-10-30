@@ -1,6 +1,6 @@
 # 测试环境发布演练（一次执行）
 
-> 目标：在**生产库的副本**上验证「新镜像 + 10 个迁移 + 新接口」全部正常，确认无误后再对生产执行。
+> 目标：在**生产库的副本**上验证「新镜像 + 13 个迁移 + 新接口」全部正常，确认无误后再对生产执行。
 > 脚本：`scripts/test-rehearsal.sh`（只依赖 `curl` + `docker`，无需 node/jq/python）
 
 ---
@@ -223,7 +223,7 @@ docker exec -i -e MYSQL_PWD='生产密码' fenxin-mysql \
 
 # ② DB_SYNC 改 false（改 compose environment，然后重建容器）
 
-# ③ 迁移（确认镜像里是 10 个迁移文件）
+# ③ 迁移（确认镜像里是 13 个迁移文件）
 docker exec fenxin-backend sh -c 'ls /app/dist/database/migrations/*.js | wc -l'
 docker exec fenxin-backend node node_modules/typeorm/cli.js migration:run -d dist/database/data-source.js
 

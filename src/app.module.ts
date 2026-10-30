@@ -16,6 +16,7 @@ import { TokenModule } from './modules/auth/token.module';
 import { EventsModule } from './modules/events/events.module';
 import { AuthCacheModule } from './common/cache/auth-cache.module';
 import { KeysModule } from './modules/keys/keys.module';
+import { E2eModule } from './modules/e2e/e2e.module';
 import { AuditModule } from './modules/audit/audit.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { AccountModule } from './modules/account/account.module';
@@ -120,6 +121,7 @@ import { PushModule } from './modules/push/push.module';
     }),
     TokenModule,
     KeysModule,
+    E2eModule,
     EventsModule,
     AuditModule,
     AuthModule,

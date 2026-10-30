@@ -1,5 +1,10 @@
 # TOFU 公钥防替换 · 前端对接指南
 
+> ⚠️ **本文档已废弃（V6.2）**：已被 `docs/E2E_SECRET_CHAT.md`（V6.2 设备配对私密会话）取代。
+> 用户级 `user_keys` 表与 `POST /keys` 系列接口已下线，公钥改为按 `(user_id, device_id)` 存储。
+> 本文档仅作历史设计参考，**不要据此实现**。
+
+
 > 适用后端：**v5.7**（fenxin-server，含 `POST /keys/query` + WS `key:changed`）
 > 面向角色：前端（Web Vue3 / RN App）｜预计工作量：**0.5 ~ 1 天**
 > 配套阅读：协议总览 `docs/E2E_ENCRYPTION.md`（§2 接口、§4 TOFU 摘要）、WS 事件 `docs/websocket-events.md`

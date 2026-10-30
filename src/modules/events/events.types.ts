@@ -39,6 +39,17 @@ export const WS_EVENTS = {
   KEY_CHANGED: 'key:changed',
   /** App 新版本发布（V5.8 自更新）：管理员发布/恢复发布/切换强更时推给全部在线用户，客户端弹更新提示 */
   APP_UPDATE: 'app:update',
+  /* ===== 设备配对私密会话（Secret Chat，V6.2）===== */
+  /** 收到私密聊天请求（推给目标用户的全部设备） */
+  E2E_REQUESTED: 'e2e:requested',
+  /** 请求已被接受（推给两台绑定设备） */
+  E2E_ACCEPTED: 'e2e:accepted',
+  /** 请求被拒绝（推给发起设备） */
+  E2E_REJECTED: 'e2e:rejected',
+  /** 请求失效：已接受/已拒绝/已过期/已撤回（推给该用户其他设备，让它们把请求从列表移除） */
+  E2E_REQUEST_GONE: 'e2e:request_gone',
+  /** 私密会话已结束（推给两台绑定设备） */
+  E2E_CLOSED: 'e2e:closed',
 } as const;
 
 export type WsServerEvent = (typeof WS_EVENTS)[keyof typeof WS_EVENTS];
@@ -216,7 +227,54 @@ export interface WsAppUpdatePayload {
   published_at: string;
 }
 
-/** 事件名 → payload 类型映射，供 emitToUsers 做类型约束 */export interface WsEventPayloadMap {
+/* ===== 设备配对私密会话（Secret Chat，V6.2）===== */
+
+/**
+ * e2e:requested 的 payload —— 收到私密聊天请求。
+ * 推给目标用户的**全部设备**：任何一台都可以接受，谁接受谁成为绑定设备。
+ */
+export interface WsE2ERequestedPayload {
+  conversation_id: string;
+  /** 发起人（不带公钥，客户端需要时自行拉取） */
+  from_user: { id: string; display_name: string | null };
+  /** 请求过期时间（ISO8601，默认 7 天） */
+  expires_at: string;
+  at: string;
+}
+
+/** e2e:accepted 的 payload —— 已开启，绑定两台设备 */
+export interface WsE2EAcceptedPayload {
+  conversation_id: string;
+  /** 对方绑定的设备 ID（本端据此拉对方公钥） */
+  peer_device_id: string;
+  at: string;
+}
+
+/** e2e:rejected 的 payload —— 被拒绝（推给发起设备） */
+export interface WsE2ERejectedPayload {
+  conversation_id: string;
+  at: string;
+}
+
+/**
+ * e2e:request_gone 的 payload —— 请求失效。
+ * 推给该用户的**其他设备**：让它们把这条 pending 从列表里移除。
+ */
+export interface WsE2ERequestGonePayload {
+  conversation_id: string;
+  reason: 'accepted' | 'rejected' | 'expired' | 'cancelled';
+  at: string;
+}
+
+/** e2e:closed 的 payload —— 私密会话已结束（服务端已物理删除，客户端需清本地缓存） */
+export interface WsE2EClosedPayload {
+  conversation_id: string;
+  trigger: 'user' | 'device_removed' | 'admin';
+  at: string;
+}
+
+/** 事件名 → payload 类型映射，供 emitToUsers 做类型约束 */
+export interface WsEventPayloadMap {
   'message:new': WsMessagePayload;
   'message:edited': WsMessagePayload;
   'message:recalled': WsMessageRecalledPayload;
@@ -232,13 +290,17 @@ export interface WsAppUpdatePayload {
   'device:offline': WsDeviceOfflinePayload;
   'key:changed': WsKeyChangedPayload;
   'app:update': WsAppUpdatePayload;
+  'e2e:requested': WsE2ERequestedPayload;
+  'e2e:accepted': WsE2EAcceptedPayload;
+  'e2e:rejected': WsE2ERejectedPayload;
+  'e2e:request_gone': WsE2ERequestGonePayload;
+  'e2e:closed': WsE2EClosedPayload;
 }
 
 /** 每个用户专属的房间名：同一用户的所有在线设备（socket）都会加入该房间 */
 export function userRoom(userId: string): string {
   return `user:${userId}`;
 }
-
 /** 单台设备专属房间名：用于"只推给某一台设备"（如登录冲突踢人） */
 export function deviceRoom(deviceId: string): string {
   return `device:${deviceId}`;

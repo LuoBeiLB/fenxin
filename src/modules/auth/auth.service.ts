@@ -14,6 +14,8 @@ import { TokenService } from './token.service';
 import { AuthPayload } from '../../common/guards/jwt-auth.guard';
 import { AuthCacheService } from '../../common/cache/auth-cache.service';
 import { EventsGateway } from '../events/events.gateway';
+import { KeysService } from '../keys/keys.service';
+import { E2eService } from '../e2e/e2e.service';
 import { WS_EVENTS } from '../events/events.types';
 
 const MAX_LOGIN_FAILS = 5;
@@ -27,6 +29,8 @@ export class AuthService {
     private readonly tokenService: TokenService,
     private readonly authCache: AuthCacheService,
     private readonly events: EventsGateway,
+    private readonly keysService: KeysService,
+    private readonly e2eService: E2eService,
   ) {}
 
   /**
@@ -234,6 +238,18 @@ export class AuthService {
   /** 下线设备 = 删除设备记录；因 JWT 守卫每请求校验设备存在性，该设备 token 立即失效 */
   async removeDevice(userId: string, deviceId: string) {
     await this.dataSource.getRepository(Device).delete({ id: deviceId, user_id: userId });
+
+    // V6.2：设备下线 = 该设备的私密会话随之失效
+    //   ① 关闭它绑定的所有私密会话（物理删除并通知对方设备）
+    //   ② 删除它的设备级公钥，防止再被当作加密目标
+    try {
+      await this.e2eService.closeSecretChatsBoundTo(deviceId, 'device_removed');
+      await this.keysService.deleteDeviceKeyByDeviceId(deviceId);
+    } catch (err: any) {
+      // 私密会话清理失败不能阻塞设备下线主流程
+      console.warn(`[auth] close secret chats failed: ${err?.message || err}`);
+    }
+
     // 失效鉴权缓存（单条精准清除，不影响该用户其它在线设备）：避免 30s TTL 内被下线设备仍凭缓存通过校验
     this.authCache.invalidate(userId, deviceId);
     // WS 通知该用户全部设备（被下线设备若还连着可立即跳转登录页）

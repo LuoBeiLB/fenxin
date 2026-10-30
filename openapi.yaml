@@ -5277,20 +5277,20 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
-  /keys:
+  /keys/device:
     post:
       tags: [加密密钥]
-      summary: 上传/更新自己的 X25519 identity 公钥（1 用户 1 公钥，幂等）
+      summary: 上传/更新本设备公钥（V6.2 设备级，替换旧 POST /keys）
       description: |-
-        【用途】上传或轮换当前用户的 E2E 端到端加密身份公钥（X25519）。
+        【用途】上传当前设备的 X25519 identity 公钥，用于「设备配对私密会话」的点对点加密。
 
-        【调用时机】客户端首次生成密钥对时上传；换设备/重装后密钥对重建时轮换。
+        【与旧接口的区别】
+        - 旧 POST /keys 按用户存储：后登录设备上传会覆盖前一台，只有最后一台能解密；
+        - 新接口按 (user_id, device_id) 存储，每台设备一把，互不覆盖；
+        - device_id 一律取自 JWT，不接受 body 传参（防伪造覆盖他人公钥）。
 
-        【业务规则与注意事项】
-        - upsert 语义：已存在则覆盖公钥并更新 updated_at；相同公钥幂等不写（updated=false）。
-        - 服务端只存公钥（零接触明文私钥）；私钥仅存客户端 IndexedDB / Keychain。
-        - 公钥轮换时向所有共同会话用户广播 WS 事件 key:changed（TOFU：客户端收到后重新比对公钥，不一致则告警「对方安全密钥已变更」）。
-        - 限流：每用户每分钟 5 次（429），防脚本暴力覆盖。
+        【幂等】相同公钥重复上传返回 updated=false，不写库。
+        【限流】5 次/分钟。
       requestBody:
         required: true
         content:
@@ -5303,123 +5303,49 @@ paths:
                   type: string
                   minLength: 43
                   maxLength: 44
-                  description: X25519 identity 公钥，base64 编码（32 字节 → 43-44 字符，标准/URL-safe base64 均可）
-                  example: MCowBQYDK2VuAyEAj1Zs8a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4=
+                  description: X25519 公钥 base64（32 字节 → 43-44 字符）
+                  example: MCowBQYDK2VuAyEAj1Zs8a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4=
       responses:
         '200':
-          description: 上传成功（message 为「公钥已上传」），data 为 { updated }
+          description: 上传成功
           content:
             application/json:
               schema:
                 type: object
                 properties:
                   code: { type: integer, example: 0 }
-                  message: { type: string, example: 公钥已上传 }
+                  message: { type: string, example: 设备公钥已上传 }
                   data:
                     type: object
                     properties:
                       updated:
                         type: boolean
-                        description: 是否发生写入：true=新建或轮换；false=相同公钥幂等不写
+                        description: true=新建或轮换；false=相同公钥幂等未写
                         example: true
         '400':
-          description: 公钥格式错误（需 32 字节 X25519 公钥的 base64 编码）
+          description: 公钥格式错误 / 缺少设备上下文
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '401':
-          description: 未携带或无效/过期 token；账号已停用或设备已下线
+          description: 未携带或无效 token；账号停用或设备已下线
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '429':
-          description: 触发限流（每用户每分钟最多 5 次）
+          description: 触发限流（5 次/分钟）
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
-  /keys/query:
-    post:
-      tags: [加密密钥]
-      summary: 批量查询公钥（TOFU 前端比对用），单次上限 500 个
-      description: |-
-        【用途】App 启动 / 进群时一次拉一组联系人的公钥 + 更新时间，与本地钉住的公钥缓存比对（TOFU）。
-
-        【调用时机】App 启动加载通讯录/进入群聊时批量比对公钥，省去逐个 GET /keys/{userId}。
-
-        【业务规则与注意事项】
-        - 权限同单个查询：只返回「自己 + 与自己至少一个共同会话的成员」；未上传公钥 / 无共同会话的用户不出现在结果里（前端自行 diff 出缺的）。
-        - 结果自动去重且自己置前（自己永远可查，用于比对「我存储的 vs 服务端存的」）。
-        - 限流：每分钟 30 次（429）。
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [user_ids]
-              properties:
-                user_ids:
-                  type: array
-                  minItems: 1
-                  maxItems: 500
-                  items: { type: string, format: uuid }
-                  description: 要查询的用户 ID 列表（最多 500 个；无共同会话的用户会被服务端过滤掉）
-                  example: ['3f9a2b8e-1111-4222-8333-444455556666']
-      responses:
-        '200':
-          description: 批量查询成功（message 为「公钥批量查询成功」），data 为公钥信息数组（仅含自己 + 共同会话成员）
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  code: { type: integer, example: 0 }
-                  message: { type: string, example: 公钥批量查询成功 }
-                  data:
-                    type: array
-                    items:
-                      $ref: '#/components/schemas/UserKeyInfo'
-        '400':
-          description: user_ids 为空 / 超 500 个 / 含非法 UUID
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-        '401':
-          description: 未携带或无效/过期 token；账号已停用或设备已下线
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-        '429':
-          description: 触发限流（每分钟最多 30 次）
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-
-  /keys/{userId}:
+  /keys/device/me:
     get:
       tags: [加密密钥]
-      summary: 查询对方 X25519 公钥（须为共同会话成员；不返回任何 PII）
-      description: |-
-        【用途】E2E 加密发送前获取接收方的 identity 公钥（ECDH 计算 session key 用）。
-
-        【调用时机】给对方发送端到端加密消息前；收到 key:changed 事件后重新比对。
-
-        【业务规则与注意事项】
-        - 权限：查自己直接放行（比对「我存储的 vs 服务端存的」）；查他人必须是至少一个共同会话的成员，否则 403（对方不在你的会话中，无权获取公钥）——防止任意用户拿公钥做关联分析。
-        - 对方尚未上传公钥返回 404（你尚未上传公钥，请先生成并上传）。
-        - 纯 E2E 元数据通道：不返回 phone / display_name 等任何 PII。
-        - 限流：每分钟 60 次（429）。
-      parameters:
-        - name: userId
-          in: path
-          required: true
-          schema: { type: string, format: uuid }
-          description: 目标用户 ID（UUID；传自己的 ID 可查自己）
-          example: 3f9a2b8e-1111-4222-8333-444455556666
+      summary: 查询本设备已上传的公钥
+      description: 前端自检「服务端存的公钥与本地是否一致」。未上传时 exists=false。
       responses:
         '200':
-          description: 成功，data 为对方公钥信息
+          description: 查询成功
           content:
             application/json:
               schema:
@@ -5428,24 +5354,258 @@ paths:
                   code: { type: integer, example: 0 }
                   message: { type: string, example: ok }
                   data:
-                    $ref: '#/components/schemas/UserKeyInfo'
+                    type: object
+                    properties:
+                      exists: { type: boolean, example: true }
+                      device_id: { type: string, nullable: true }
+                      identity_pubkey: { type: string, nullable: true }
+                      updated_at: { type: string, format: date-time, nullable: true }
         '401':
-          description: 未携带或无效/过期 token；账号已停用或设备已下线
+          description: 未认证
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /keys/device/{conversationId}:
+    get:
+      tags: [加密密钥]
+      summary: 取私密会话中「对方绑定设备」的公钥
+      description: |-
+        【用途】发送加密消息前获取对端公钥。
+
+        【为什么路径是 conversationId 而不是 userId】
+        私密会话绑定的是「一对设备」，服务端可根据会话行反查对方设备，
+        客户端无需知道对方 device_id（也避免在 URL 里暴露）。
+
+        【权限】调用者必须是该会话的两台绑定设备之一，否则 403。
+        【状态】pending 会话没有对方设备，返回 404。
+      parameters:
+        - name: conversationId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: 查询成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: ok }
+                  data:
+                    type: object
+                    properties:
+                      user_id: { type: string, description: 对方用户 }
+                      device_id: { type: string, description: 对方绑定的设备 }
+                      identity_pubkey: { type: string }
+                      updated_at: { type: string, format: date-time }
+        '400':
+          description: 该会话不是私密会话
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '403':
-          description: 对方不在你的会话中，无权获取公钥
+          description: 本设备不是该私密会话的绑定设备（E2E_NOT_BOUND_DEVICE）
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '404':
-          description: 你尚未上传公钥（目标用户未上传公钥时）
+          description: 会话不存在 / 会话尚未建立 / 对方未上传设备公钥
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
-        '429':
-          description: 触发限流（每分钟最多 60 次）
+
+  /conversations/e2e-request:
+    post:
+      tags: [私密会话]
+      summary: 发起私密聊天请求（V6.2 设备配对）
+      description: |-
+        【模型】一条私密会话 = 发起设备 ↔ 接受设备。谁接受，谁就是被绑定的那台设备；
+        其余设备在会话列表里看不到这条会话。
+
+        【规则】
+        - 不能对自己发起（400 E2E_SELF_REQUEST）；
+        - 必须与对方存在共同会话（403）；
+        - 同一对用户同时只能有一条 pending/active（409 E2E_PAIR_EXISTS，返回已有 conversation_id）；
+        - pending 有效期 7 天，超时由定时任务直接删除；
+        - 发起时向对方全部设备推 e2e:requested。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [target_user_id]
+              properties:
+                target_user_id: { type: string, format: uuid }
+      responses:
+        '200':
+          description: 请求已发送
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: 私密聊天请求已发送 }
+                  data:
+                    type: object
+                    properties:
+                      conversation_id: { type: string, format: uuid }
+                      e2e_state: { type: integer, example: 1, description: '1=pending 2=active' }
+                      expires_at: { type: string, format: date-time }
+        '400':
+          description: 对自己发起 / 缺少设备上下文
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: 与对方没有共同会话（E2E_NOT_MEMBER）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: 已有 pending 或 active 会话（E2E_PAIR_EXISTS）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /conversations/{id}/e2e-accept:
+    post:
+      tags: [私密会话]
+      summary: 接受私密聊天请求（当前设备成为绑定设备）
+      description: |-
+        【规则】
+        - 调用者必须是会话成员，否则 403；
+        - 仅 pending 状态可接受，否则 409 E2E_STATE_INVALID；
+        - 超过 7 天 → 直接删除该行并返回 410 E2E_EXPIRED；
+        - 成功后向两台绑定设备推 e2e:accepted，向接受者其他设备推 e2e:request_gone。
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: 已开启
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: 私密聊天已开启 }
+                  data:
+                    type: object
+                    properties:
+                      conversation_id: { type: string, format: uuid }
+                      e2e_state: { type: integer, example: 2 }
+                      bound_device_id: { type: string, description: 本端绑定设备 }
+                      peer_device_id: { type: string, description: 对方绑定设备 }
+        '403':
+          description: 不是该会话成员
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: 请求已被处理（E2E_STATE_INVALID / E2E_PAIR_EXISTS）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '410':
+          description: 请求已过期（E2E_EXPIRED）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /conversations/{id}/e2e-reject:
+    post:
+      tags: [私密会话]
+      summary: 拒绝私密聊天请求
+      description: |-
+        【语义】拒绝 = 直接物理删除该会话行（不保留 rejected 状态，避免事后反推「曾经有过请求」）。
+        拒绝后立即可以重新发起（不限制频率）。
+
+        【权限】被邀请方任一设备可拒绝；发起方调用返回 400（应使用 close 撤回）。
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: 已拒绝
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: 已拒绝 }
+                  data:
+                    type: object
+                    properties:
+                      conversation_id: { type: string, format: uuid }
+                      deleted: { type: boolean, example: true }
+                      deleted_messages: { type: integer, example: 0 }
+        '400':
+          description: 发起方不能拒绝（请用撤回）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: 不是该会话成员
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: 请求已被处理
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /conversations/{id}/e2e-close:
+    post:
+      tags: [私密会话]
+      summary: 关闭私密会话 / 撤回待接受请求
+      description: |-
+        【语义】关闭 = 物理删除，服务端不留任何痕迹：
+        附件（OSS）→ 回执 → 墓碑 → 消息（含密文）→ 会话级焚毁设置 → 成员 → 会话行。
+        不写 audit_logs、不写 destroy_reason。
+
+        【权限】pending：仅发起设备可撤回；active：两台绑定设备均可关闭。
+        【幂等】会话已不存在时返回 deleted=true / 0 条消息。
+        【通知】active 推 e2e:closed；pending 撤回推 e2e:request_gone。
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: 已结束
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: 私密聊天已结束 }
+                  data:
+                    type: object
+                    properties:
+                      conversation_id: { type: string, format: uuid }
+                      deleted: { type: boolean, example: true }
+                      deleted_messages: { type: integer, example: 42 }
+        '400':
+          description: 不是私密会话
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: 本设备无权操作该私密会话（E2E_NOT_BOUND_DEVICE）
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

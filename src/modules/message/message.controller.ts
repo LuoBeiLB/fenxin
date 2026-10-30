@@ -46,6 +46,8 @@ export class MessageController {
     return this.messageService.sendMessage({
       conversationId: dto.conversation_id,
       senderId: user.userId,
+      // V6.2：私密会话只允许绑定设备发送（服务端从 JWT 取，不信任 body）
+      deviceId: user.deviceId,
       type: dto.type,
       content: dto.content,
       fileUrl: dto.file_url,
@@ -95,7 +97,7 @@ export class MessageController {
     @CurrentUser() user: AuthPayload,
     @Param('conversationId') conversationId: string,
   ) {
-    return this.destroyService.listPending(conversationId, user.userId);
+    return this.destroyService.listPending(conversationId, user.userId, user.deviceId);
   }
 
   /**
@@ -129,6 +131,7 @@ export class MessageController {
     return this.messageService.listMessages({
       conversationId,
       userId: user.userId,
+      deviceId: user.deviceId,
       before,
       limit: limit ? Number(limit) : undefined,
       // include_destroyed=1：历史里也返回已焚毁消息（墓碑形式，正文全 null）
@@ -147,6 +150,7 @@ export class MessageController {
     return this.messageService.searchMessages({
       conversationId,
       userId: user.userId,
+      deviceId: user.deviceId,
       keyword,
       before,
       limit,  // service 内 Math.min(limit, 200) 二次兜底
@@ -170,13 +174,13 @@ export class MessageController {
   @Put(':id')
   @ResponseMessage('消息已编辑')
   edit(@CurrentUser() user: AuthPayload, @Param('id') id: string, @Body() dto: EditMessageDto) {
-    return this.messageService.editMessage(id, user.userId, dto.content);
+    return this.messageService.editMessage(id, user.userId, dto.content, user.deviceId);
   }
 
   @Post(':id/recall')
   @ResponseMessage('消息已撤回')
   async recall(@CurrentUser() user: AuthPayload, @Param('id') id: string) {
-    await this.messageService.recallMessage(id, user.userId);
+    await this.messageService.recallMessage(id, user.userId, user.deviceId);
     return null;
   }
 
@@ -194,7 +198,12 @@ export class MessageController {
     @Param('id') id: string,
     @Body() dto?: RevealMessageDto,
   ) {
-    return this.messageService.revealMessage(id, user.userId, dto?.media_duration_seconds);
+    return this.messageService.revealMessage(
+      id,
+      user.userId,
+      dto?.media_duration_seconds,
+      user.deviceId,
+    );
   }
 
   /**
@@ -205,7 +214,7 @@ export class MessageController {
   @Post(':id/consume')
   @ResponseMessage('已消费，进入焚毁')
   consume(@CurrentUser() user: AuthPayload, @Param('id') id: string) {
-    return this.messageService.consumeMessage(id, user.userId);
+    return this.messageService.consumeMessage(id, user.userId, user.deviceId);
   }
 
   /** :id 为会话 ID（与旧版 API 保持一致）；body 可带 up_to_message_id 只标记到某条（V6.0） */
@@ -216,7 +225,12 @@ export class MessageController {
     @Param('id') conversationId: string,
     @Body() dto?: MarkReadDto,
   ) {
-    await this.messageService.markAsRead(conversationId, user.userId, dto?.up_to_message_id);
+    await this.messageService.markAsRead(
+      conversationId,
+      user.userId,
+      dto?.up_to_message_id,
+      user.deviceId,
+    );
     return null;
   }
 
@@ -231,7 +245,12 @@ export class MessageController {
     @Param('conversationId') conversationId: string,
     @Body() dto: MarkMessagesReadDto,
   ) {
-    return this.messageService.markMessagesRead(conversationId, user.userId, dto.message_ids);
+    return this.messageService.markMessagesRead(
+      conversationId,
+      user.userId,
+      dto.message_ids,
+      user.deviceId,
+    );
   }
 
   /**
@@ -241,6 +260,6 @@ export class MessageController {
    */
   @Get(':id/receipt')
   receipts(@CurrentUser() user: AuthPayload, @Param('id') id: string) {
-    return this.messageService.getMessageReceipts(id, user.userId);
+    return this.messageService.getMessageReceipts(id, user.userId, user.deviceId);
   }
 }

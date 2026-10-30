@@ -66,6 +66,10 @@ describe('MessageService 音视频播完才焚（v5.8.9）', () => {
         if (name === 'Message') return messageRepo;
         if (name === 'ConversationMember') return memberRepo;
         if (name === 'MessageReceipt') return receiptRepo;
+        // V6.2：assertDeviceAccess 会读会话行；本套用例都是普通会话（e2e_mode=0）
+        if (name === 'Conversation') {
+          return { findOne: jest.fn(async () => ({ id: 'c-1', e2e_mode: 0 })) };
+        }
         return {};
       },
     };

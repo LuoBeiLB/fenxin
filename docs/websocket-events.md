@@ -61,6 +61,11 @@ token 过期后重连会持续失败，前端应在刷新 token 后先 `disconne
 | `device:online` | `EventsGateway.handleConnection()` WS 握手成功 | `WsDeviceOnlinePayload` |
 | `device:offline` | `PresenceScheduler` 判定设备离线（WS 全断开 + 心跳超时） | `WsDeviceOfflinePayload` |
 | `key:changed` | `KeysService.uploadIdentityKey()` 轮换 identity 公钥时（覆盖更新，首次上传不推） | `WsKeyChangedPayload` |
+| `e2e:requested` | `E2eService.requestSecretChat()` 发起私密聊天请求（V6.2） | `WsE2ERequestedPayload` |
+| `e2e:accepted` | `E2eService.acceptSecretChat()` 接受请求（绑定当前设备） | `WsE2EAcceptedPayload` |
+| `e2e:rejected` | `E2eService.rejectSecretChat()` 拒绝请求 | `WsE2ERejectedPayload` |
+| `e2e:request_gone` | 请求失效：已接受/已拒绝/已过期/已撤回 | `WsE2ERequestGonePayload` |
+| `e2e:closed` | `E2eService.closeSecretChat()` 关闭私密会话（服务端已物理删除） | `WsE2EClosedPayload` |
 | `app:update` | `AppVersionService` 发布新版本 / 恢复发布 / 已发布版本切强更时 | `WsAppUpdatePayload` |
 
 > 注：`key:changed` 与 `app:update` 不带 `conversation_id` —— 它们与单个会话无关。
@@ -249,6 +254,58 @@ version_name 字符串比较）→ 有新版本则弹更新窗（force=true 时�
 用于「设备管理页」与在线状态展示实时刷新。注意 `device_id` 是 `devices.id`（记录主键），
 不是设备指纹 `device_id` 字段（前端侧叫 deviceId/指纹的那个）。
 
+
+### 私密会话事件（V6.2 设备配对 Secret Chat）
+
+> 这 5 个事件**不使用** `user:{userId}` 房间，全部走 `device:{deviceId}`：
+> 私密会话只属于两台绑定设备，推给用户级房间会泄露"存在一条私密消息"的元数据。
+
+```ts
+/** e2e:requested —— 收到私密聊天请求（推给目标用户的全部设备，谁接受谁绑定） */
+interface WsE2ERequestedPayload {
+  conversation_id: string;
+  from_user: { id: string; display_name: string | null };
+  expires_at: string; // ISO8601，默认 7 天后过期
+  at: string;
+}
+
+/** e2e:accepted —— 已开启（推给两台绑定设备） */
+interface WsE2EAcceptedPayload {
+  conversation_id: string;
+  peer_device_id: string; // 对方绑定的设备，本端据此拉对方公钥
+  at: string;
+}
+
+/** e2e:rejected —— 被拒绝（推给发起设备） */
+interface WsE2ERejectedPayload {
+  conversation_id: string;
+  at: string;
+}
+
+/** e2e:request_gone —— 请求失效（推给该用户其他设备，让它们把 pending 从列表移除） */
+interface WsE2ERequestGonePayload {
+  conversation_id: string;
+  reason: 'accepted' | 'rejected' | 'expired' | 'cancelled';
+  at: string;
+}
+
+/** e2e:closed —— 私密会话已结束（服务端已物理删除，客户端需清本地缓存） */
+interface WsE2EClosedPayload {
+  conversation_id: string;
+  trigger: 'user' | 'device_removed' | 'admin';
+  at: string;
+}
+```
+
+**客户端处理建议**
+
+| 事件 | 前端动作 |
+|---|---|
+| `e2e:requested` | 会话列表插入一条"加密聊天请求"，显示 [接受] [拒绝] |
+| `e2e:accepted` | 把请求转为正式会话；若是发起方，记录 `peer_device_id` |
+| `e2e:request_gone` | 移除该 pending 请求（不提示，避免暴露给非接受设备） |
+| `e2e:rejected` | 提示"对方拒绝了私密聊天请求"，移除该请求 |
+| `e2e:closed` | **立即移除会话 + 清空本地明文缓存**，Toast「私密聊天已结束」 |
 
 ## 服务端注入点一览
 

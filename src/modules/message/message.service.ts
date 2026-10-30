@@ -109,6 +109,66 @@ export class MessageService {
   }
 
   /**
+   * 设备级访问控制（V6.2 私密会话）：
+   *  - 普通会话：直接放行（返回会话对象）；
+   *  - 私密会话 active：只有 e2e_device_a / e2e_device_b 能读写；
+   *  - 私密会话 pending：还不能收发消息。
+   *
+   * `deviceId` 缺失时对私密会话**拒绝**（fail-closed），避免忘记传参导致越权。
+   */
+  private async assertDeviceAccess(
+    conversationId: string,
+    userId: string,
+    deviceId?: string,
+  ): Promise<Conversation> {
+    const conv = await this.dataSource.getRepository(Conversation).findOne({
+      where: { id: conversationId },
+    });
+    if (!conv) throw new NotFoundException('会话不存在');
+    if (conv.e2e_mode !== 1) return conv;
+
+    if (conv.e2e_state !== 2) {
+      throw new ForbiddenException({ code: 'E2E_STATE_INVALID', message: '私密会话尚未建立' });
+    }
+    const bound = !!deviceId && (conv.e2e_device_a === deviceId || conv.e2e_device_b === deviceId);
+    if (!bound) {
+      throw new ForbiddenException({
+        code: 'E2E_NOT_BOUND_DEVICE',
+        message: '本设备无权访问该私密会话',
+      });
+    }
+    return conv;
+  }
+
+  /**
+   * 会话事件广播（V6.2）：
+   *  - 普通会话：推给成员的所有在线设备（user room）；
+   *  - 私密会话：**只推两台绑定设备**（device room），
+   *    否则该用户其它设备会收到"存在一条私密消息"的元数据。
+   */
+  private async emitConversationEvent<E extends keyof typeof WS_EVENTS>(
+    event: (typeof WS_EVENTS)[E],
+    conversationId: string,
+    memberIds: string[],
+    payload: any,
+  ): Promise<void> {
+    if (conversationId) {
+      const conv = await this.dataSource.getRepository(Conversation).findOne({
+        where: { id: conversationId },
+        select: ['id', 'e2e_mode', 'e2e_device_a', 'e2e_device_b'],
+      });
+      if (conv?.e2e_mode === 1) {
+        const devices = [conv.e2e_device_a, conv.e2e_device_b].filter(Boolean) as string[];
+        if (devices.length > 0) {
+          this.events.emitToDevices(event as any, devices, payload);
+          return;
+        }
+      }
+    }
+    this.events.emitToUsers(event as any, memberIds, payload);
+  }
+
+  /**
    * 归一化焚毁时长（V6.0）：
    * - 优先 `burn_ttl_seconds`（新协议，秒）
    * - 旧客户端只传 `destroy_at`（ISO8601）→ 反算 ttl，避免"旧 APK 发的焚毁消息变成永久消息"
@@ -155,6 +215,8 @@ export class MessageService {
   async sendMessage(params: {
     conversationId: string;
     senderId: string;
+    /** 发送设备 ID（V6.2 私密会话必需）：只允许绑定设备发送 */
+    deviceId?: string;
     type: string;
     content?: string;
     fileUrl?: string;
@@ -183,6 +245,22 @@ export class MessageService {
     if (!conv) throw new NotFoundException('会话不存在');
     if (conv.dissolved_at) throw new ForbiddenException('群组已解散，不能再发送消息');
 
+    // V6.2 私密会话：仅绑定设备可发，且必须加密
+    if (conv.e2e_mode === 1) {
+      if (conv.e2e_state !== 2) {
+        throw new ForbiddenException({ code: 'E2E_STATE_INVALID', message: '私密会话尚未建立' });
+      }
+      const bound =
+        !!params.deviceId &&
+        (conv.e2e_device_a === params.deviceId || conv.e2e_device_b === params.deviceId);
+      if (!bound) {
+        throw new ForbiddenException({
+          code: 'E2E_NOT_BOUND_DEVICE',
+          message: '本设备无权在该私密会话中发送消息',
+        });
+      }
+    }
+
     // 个人频道为纯广播（v5.8.6）：仅频道主（owner）可以发布内容，订阅者只读
     if (conv.type === 'channel' && membership.role !== 'owner') {
       throw new ForbiddenException('频道为广播模式，仅频道主可以发布内容');
@@ -206,6 +284,13 @@ export class MessageService {
     // 加密消息豁免 content 必填：密文在 cipher_text，服务端不应接触明文
     if (params.type === 'text' && !params.content && !isEncrypted) {
       throw new BadRequestException('文本消息 content 不能为空');
+    }
+    // V6.2 私密会话强制加密：不允许在私密会话里发明文
+    if (conv.e2e_mode === 1 && !isEncrypted) {
+      throw new BadRequestException({
+        code: 'E2E_ENCRYPTION_REQUIRED',
+        message: '私密会话必须加密发送（cipher_text / cipher_nonce / sender_ephemeral_pubkey）',
+      });
     }
     if (params.type !== 'text' && !params.fileUrl) {
       throw new BadRequestException(`${params.type} 消息 file_url 不能为空`);
@@ -263,21 +348,31 @@ export class MessageService {
     // 实时推送：新消息 + 会话列表刷新信号（推给全体成员，含发送者的其他在线设备）
     // 焚毁消息必须马赛克化推送，否则前端从 WS 推送体里直接拿到内容，马赛克形同虚设
     const memberIds = members.map((m) => m.user_id);
-    this.events.emitToUsers(WS_EVENTS.MESSAGE_NEW, memberIds, {
+    // V6.2：私密会话只推绑定设备（走 device room），普通会话仍推所有成员设备
+    void this.emitConversationEvent(WS_EVENTS.MESSAGE_NEW, params.conversationId, memberIds, {
       conversation_id: params.conversationId,
       message: savedMsg.burn_ttl_seconds ? this.maskBurnMessage(savedMsg) : savedMsg,
     });
-    this.events.emitToUsers(WS_EVENTS.CONVERSATION_UPDATED, memberIds, {
-      conversation_id: params.conversationId,
-      reason: 'message',
-    });
+    void this.emitConversationEvent(
+      WS_EVENTS.CONVERSATION_UPDATED,
+      params.conversationId,
+      memberIds,
+      {
+        conversation_id: params.conversationId,
+        reason: 'message',
+      },
+    );
 
     // 离线推送（V6.2）：只推当前离线的成员，内容按类型脱敏。
     // 必须异步、不 await —— 极光慢或挂掉都不能拖慢/影响发消息。
     // catch 里**要落日志**：PushService 内部已兜底，这层是防止将来改动后异常被静默吞掉。
-    void this.push
-      .notifyNewMessage({ message: savedMsg, memberIds, senderId: params.senderId })
-      .catch((err: any) => this.logger.warn(`[push] notify skipped: ${err?.message || err}`));
+    // V6.2 私密会话**不推送**：当前推送按 alias=userId 分发，会通知到该用户的所有设备，
+    // 等于告诉未绑定设备"存在一条加密消息"，违反私密会话的设备级隔离。
+    if (conv.e2e_mode !== 1) {
+      void this.push
+        .notifyNewMessage({ message: savedMsg, memberIds, senderId: params.senderId })
+        .catch((err: any) => this.logger.warn(`[push] notify skipped: ${err?.message || err}`));
+    }
 
     return savedMsg;
   }
@@ -350,12 +445,15 @@ export class MessageService {
   async listMessages(params: {
     conversationId: string;
     userId: string;
+    /** V6.2 私密会话必需：只有绑定设备能读 */
+    deviceId?: string;
     before?: string;
     limit?: number;
     /** true = 历史里也返回已焚毁消息（墓碑形式；正文/附件全 null，占分页位置） */
     includeDestroyed?: boolean;
   }): Promise<unknown[]> {
     await this.assertMember(params.conversationId, params.userId);
+    await this.assertDeviceAccess(params.conversationId, params.userId, params.deviceId);
 
     const limit = params.limit || 50;
     const now = new Date();
@@ -542,13 +640,19 @@ export class MessageService {
    * v5.8.9 播完才焚：voice/video 焚毁消息的倒计时为消费窗口（max(ttl, 媒体时长+缓冲)），
    * 返回 media_burn_pending / consume_deadline 提示前端播完调 consume 提前焚毁。
    */
-  async revealMessage(messageId: string, userId: string, mediaDurationSeconds?: number) {
+  async revealMessage(
+    messageId: string,
+    userId: string,
+    mediaDurationSeconds?: number,
+    deviceId?: string,
+  ) {
     const msgRepo = this.dataSource.getRepository(Message);
     const receiptRepo = this.dataSource.getRepository(MessageReceipt);
 
     const msg = await msgRepo.findOne({ where: { id: messageId } });
     if (!msg || msg.is_destroyed) throw new NotFoundException('消息不存在');
     await this.assertMember(msg.conversation_id, userId);
+    await this.assertDeviceAccess(msg.conversation_id, userId, deviceId);
     if (!msg.burn_ttl_seconds) throw new BadRequestException('该消息不是焚毁消息，无需点开');
     if (msg.is_recalled) throw new BadRequestException('消息已撤回');
 
@@ -607,7 +711,7 @@ export class MessageService {
 
       // 广播已读回执：发送方实时看到「对方已点开」
       const memberIds = await this.getMemberUserIds(msg.conversation_id);
-      this.events.emitToUsers(WS_EVENTS.RECEIPT_READ, memberIds, {
+      void this.emitConversationEvent(WS_EVENTS.RECEIPT_READ, msg.conversation_id, memberIds, {
         conversation_id: msg.conversation_id,
         user_id: userId,
         last_read_message_id: messageId,
@@ -643,7 +747,7 @@ export class MessageService {
    * - 返回焚毁视图：is_blurred=true、content/file_url 置 null、burned=true（对齐前端契约）
    * - 广播 message:consumed 事件：对端与本人其他设备实时切「已焚毁」态
    */
-  async consumeMessage(messageId: string, userId: string) {
+  async consumeMessage(messageId: string, userId: string, deviceId?: string) {
     const msgRepo = this.dataSource.getRepository(Message);
     const receiptRepo = this.dataSource.getRepository(MessageReceipt);
 
@@ -652,6 +756,7 @@ export class MessageService {
     if (!msg) return { burned: true, already: true };
 
     await this.assertMember(msg.conversation_id, userId);
+    await this.assertDeviceAccess(msg.conversation_id, userId, deviceId);
     if (!msg.burn_ttl_seconds) {
       throw new BadRequestException('该消息不是焚毁消息，无需消费');
     }
@@ -713,7 +818,12 @@ export class MessageService {
     };
   }
 
-  async editMessage(messageId: string, userId: string, newContent: string): Promise<Message> {
+  async editMessage(
+    messageId: string,
+    userId: string,
+    newContent: string,
+    deviceId?: string,
+  ): Promise<Message> {
     const msgRepo = this.dataSource.getRepository(Message);
     const message = await msgRepo.findOne({ where: { id: messageId } });
     if (!message || message.is_destroyed) throw new NotFoundException('消息不存在');
@@ -721,6 +831,8 @@ export class MessageService {
     if (message.is_recalled) throw new BadRequestException('Cannot edit a recalled message');
     // 焚毁消息禁止编辑：内容只在点开时下发，编辑会破坏「点开才焚」计时语义
     if (message.burn_ttl_seconds) throw new BadRequestException('焚毁消息不支持编辑');
+    // V6.2 私密会话：只有绑定设备可编辑
+    await this.assertDeviceAccess(message.conversation_id, userId, deviceId);
 
     const hoursSinceCreated = (Date.now() - new Date(message.created_at).getTime()) / (1000 * 60 * 60);
     if (hoursSinceCreated > 48) throw new BadRequestException('Cannot edit messages older than 48 hours');
@@ -739,11 +851,13 @@ export class MessageService {
     return updated;
   }
 
-  async recallMessage(messageId: string, userId: string): Promise<void> {
+  async recallMessage(messageId: string, userId: string, deviceId?: string): Promise<void> {
     const msgRepo = this.dataSource.getRepository(Message);
     const message = await msgRepo.findOne({ where: { id: messageId } });
     if (!message || message.is_destroyed) throw new NotFoundException('消息不存在');
     if (message.sender_id !== userId) throw new ForbiddenException('You can only recall your own messages');
+    // V6.2 私密会话：只有绑定设备可撤回
+    await this.assertDeviceAccess(message.conversation_id, userId, deviceId);
 
     const hoursSinceCreated = (Date.now() - new Date(message.created_at).getTime()) / (1000 * 60 * 60);
     if (hoursSinceCreated > 48) throw new BadRequestException('Cannot recall messages older than 48 hours');
@@ -770,8 +884,10 @@ export class MessageService {
     conversationId: string,
     userId: string,
     upToMessageId?: string,
+    deviceId?: string,
   ): Promise<void> {
     await this.assertMember(conversationId, userId);
+    await this.assertDeviceAccess(conversationId, userId, deviceId);
 
     // 上界消息的 created_at（用于只标记到该条）
     let upToCreatedAt: Date | null = null;
@@ -828,7 +944,7 @@ export class MessageService {
     // 避免用户每次打开聊天页都向会话其他成员发送无效事件）
     if (affected > 0) {
       const memberIds = await this.getMemberUserIds(conversationId);
-      this.events.emitToUsers(WS_EVENTS.RECEIPT_READ, memberIds, {
+      void this.emitConversationEvent(WS_EVENTS.RECEIPT_READ, conversationId, memberIds, {
         conversation_id: conversationId,
         user_id: userId,
         last_read_message_id: lastMsg ? lastMsg.id : null,
@@ -851,8 +967,10 @@ export class MessageService {
     conversationId: string,
     userId: string,
     messageIds: string[],
+    deviceId?: string,
   ): Promise<{ marked: number; conversation_id: string }> {
     await this.assertMember(conversationId, userId);
+    await this.assertDeviceAccess(conversationId, userId, deviceId);
 
     const conv = await this.dataSource
       .getRepository(Conversation)
@@ -892,7 +1010,7 @@ export class MessageService {
       if (latest) await this.advanceLastRead(conversationId, userId, latest.id);
 
       const memberIds = await this.getMemberUserIds(conversationId);
-      this.events.emitToUsers(WS_EVENTS.RECEIPT_READ, memberIds, {
+      void this.emitConversationEvent(WS_EVENTS.RECEIPT_READ, conversationId, memberIds, {
         conversation_id: conversationId,
         user_id: userId,
         last_read_message_id: latest ? latest.id : null,
@@ -937,12 +1055,13 @@ export class MessageService {
    *   （100 人群聊从 101 次 SQL 降到 2 次）。
    * - 返回结构保持**数组**（不加外层包装），老前端的 `asArray(resp)` 无需改动。
    */
-  async getMessageReceipts(messageId: string, userId: string) {
+  async getMessageReceipts(messageId: string, userId: string, deviceId?: string) {
     const msgRepo = this.dataSource.getRepository(Message);
     const message = await msgRepo.findOne({ where: { id: messageId } });
     if (!message || message.is_destroyed) throw new NotFoundException('消息不存在');
 
     await this.assertMember(message.conversation_id, userId);
+    await this.assertDeviceAccess(message.conversation_id, userId, deviceId);
 
     const qb = this.dataSource.getRepository(MessageReceipt).createQueryBuilder('r');
     qb.leftJoin(AppUser, 'u', 'u.id = r.user_id');
@@ -1010,6 +1129,8 @@ export class MessageService {
   async searchMessages(params: {
     conversationId: string;
     userId: string;
+    /** V6.2 私密会话必需 */
+    deviceId?: string;
     keyword: string;
     before?: string;
     limit?: number;
@@ -1022,6 +1143,7 @@ export class MessageService {
       throw new BadRequestException('关键字过长（最长 100 字符）');
     }
     await this.assertMember(params.conversationId, params.userId);
+    await this.assertDeviceAccess(params.conversationId, params.userId, params.deviceId);
 
     // 限制单次返回数量上限为 200，防止恶意传大 limit 导致内存爆掉
     const limit = Math.min(params.limit || 50, 200);
@@ -1155,6 +1277,10 @@ export class MessageService {
         .andWhere('(m.destroy_at IS NULL OR m.destroy_at > :now)', { now: new Date() })
         .andWhere('m.is_recalled = :isRecalled', { isRecalled: false })
         .andWhere('m.burn_ttl_seconds IS NULL')
+        // V6.2：私密会话不参与全局搜索（服务端无明文，且不应暴露消息存在性）
+        .andWhere(
+          'NOT EXISTS (SELECT 1 FROM conversations c2 WHERE c2.id = m.conversation_id AND c2.e2e_mode = 1)',
+        )
         .orderBy('m.created_at', 'DESC')
         .skip((page - 1) * pageSize)
         .take(pageSize);

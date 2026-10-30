@@ -1,189 +1,149 @@
-import { Injectable, Logger, NotFoundException, ForbiddenException } from '@nestjs/common';
-import { DataSource } from 'typeorm';
-import { UserKey } from '../../entities/user-key.entity';
+import {
+  BadRequestException,
+  ForbiddenException,
+  Injectable,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
+import { DataSource, SelectQueryBuilder } from 'typeorm';
+import { DeviceKey } from '../../entities/device-key.entity';
+import { Conversation } from '../../entities/conversation.entity';
 import { ConversationMember } from '../../entities/conversation-member.entity';
-import { EventsGateway } from '../events/events.gateway';
-import { WS_EVENTS } from '../events/events.types';
+import { DeviceKeyUploadResult, MyDeviceKeyView, PeerDeviceKeyView } from './dto/response';
 
 /**
- * 用户公钥服务（V4.0 §E2E 单聊加密 / 方案 B 简化版）。
+ * 设备级加密密钥（V6.2 设备配对私密会话）。
  *
- * 职责：
- *   - 上传/更新自己 X25519 identity 公钥（1 用户 1 行，多次上传覆盖）
- *   - 查询对方公钥：必须满足"业务关系"（同 conversation 成员 或 contacts 关系），
- *     防止任意用户通过 API 枚举活跃用户 → 拿公钥做关联分析
- *   - 批量查询公钥（TOFU）：一次拉一组有会话关系的用户公钥，供前端与本地缓存比对
- *   - 公钥轮换通知（TOFU）：identity 公钥被覆盖时，向共同会话用户广播 key:changed，
- *     客户端收到后重新拉取比对，不一致即告警 —— 服务端偷换公钥会立刻暴露
+ * 与旧 `user_keys` 的区别：
+ *   - 旧：一用户一行，后登录设备上传会覆盖前一台 → 只有最后一台能解密；
+ *   - 新：`(user_id, device_id)` 唯一，每台设备独立，登录再多互不影响。
  *
- * 不做：
- *   - 曲线点合法性校验（前端解密失败会回流，错误时重传即可）
- *   - 公钥签名（防 MITM 留待 X3DH 升级）
- *   - 私钥托管（绝对不做）
+ * 服务端只做三件事：
+ *   ① 存/更新本设备公钥（device_id 取自 JWT，不信任 body）；
+ *   ② 按会话返回**对方绑定设备**的公钥（仅绑定设备可读）；
+ *   ③ 设备下线时删除该设备的公钥（由 AuthService 调用）。
+ *
+ * 不做的：曲线点合法性校验（解密失败由客户端回流）、私钥托管（绝对不做）。
  */
 @Injectable()
 export class KeysService {
   private readonly logger = new Logger('KeysService');
 
-  constructor(
-    private readonly dataSource: DataSource,
-    private readonly events: EventsGateway,
-  ) {}
+  constructor(private readonly dataSource: DataSource) {}
 
   /**
-   * 上传/更新自己的 identity 公钥。
-   * 1 用户 1 行：upsert 语义（已存在则覆盖公钥 + updated_at）。
+   * 上传/更新本设备公钥（幂等：相同公钥不写）。
    */
-  async uploadIdentityKey(userId: string, identityPubkey: string): Promise<{ updated: boolean }> {
-    const repo = this.dataSource.getRepository(UserKey);
-    const existing = await repo.findOne({ where: { user_id: userId }, select: ['id', 'identity_pubkey'] });
-    if (existing) {
-      if (existing.identity_pubkey === identityPubkey) {
-        return { updated: false }; // 幂等：相同公钥不写
-      }
-      await repo.update(existing.id, { identity_pubkey: identityPubkey });
-      this.logger.log(`Identity key rotated for userId=${userId}`);
+  async uploadDeviceKey(
+    userId: string,
+    deviceId: string,
+    identityPubkey: string,
+  ): Promise<DeviceKeyUploadResult> {
+    if (!deviceId) throw new BadRequestException('缺少设备上下文，请重新登录');
 
-      // TOFU：公钥轮换 → 广播给所有共同会话用户。
-      // 客户端收到 key:changed 后重新 GET /keys/:userId 与本地钉住的公钥比对：
-      //   一致 → 幂等重传（可能是服务端重复通知）；不一致 → 告警"对方安全密钥已变更"。
-      // emitToUsers 内部自带 try-catch，推送失败不影响上传主流程。
-      const peers = await this.getPeerUserIds(userId);
-      this.events.emitToUsers(WS_EVENTS.KEY_CHANGED, peers, {
-        user_id: userId,
-        updated_at: new Date().toISOString(),
-      });
+    const repo = this.dataSource.getRepository(DeviceKey);
+    const existing = await repo.findOne({
+      where: { user_id: userId, device_id: deviceId },
+      select: ['id', 'identity_pubkey'],
+    });
+
+    if (existing) {
+      if (existing.identity_pubkey === identityPubkey) return { updated: false };
+      await repo.update(existing.id, { identity_pubkey: identityPubkey });
+      this.logger.log(`device key rotated user=${userId} device=${deviceId}`);
       return { updated: true };
     }
-    await repo.save(repo.create({ user_id: userId, identity_pubkey: identityPubkey }));
-    this.logger.log(`Identity key created for userId=${userId}`);
+
+    await repo.save(repo.create({ user_id: userId, device_id: deviceId, identity_pubkey: identityPubkey }));
+    this.logger.log(`device key created user=${userId} device=${deviceId}`);
     return { updated: true };
   }
 
-  /**
-   * 查询对方公钥。必须满足"业务关系"：
-   *   ① 对方是当前用户的 contacts（用 AppUser 反查 — contacts 模块单独维护关系表，
-   *      简化版只校验"是否在至少一个共同 conversation 成员里"）
-   *   ② 否则抛 ForbiddenException，避免任意用户拿公钥做关联分析
-   */
-  async getIdentityKey(currentUserId: string, targetUserId: string): Promise<{ user_id: string; identity_pubkey: string; created_at: Date; updated_at: Date }> {
-    if (currentUserId === targetUserId) {
-      // 拿自己的公钥：跳过关系校验（前端需要比对"我存储的 vs 服务端存的"）
-      const self = await this.dataSource
-        .getRepository(UserKey)
-        .findOne({ where: { user_id: currentUserId } });
-      if (!self) throw new NotFoundException('你尚未上传公钥，请先生成并上传');
-      return {
-        user_id: self.user_id,
-        identity_pubkey: self.identity_pubkey,
-        created_at: self.created_at,
-        updated_at: self.updated_at,
-      };
-    }
-
-    // 业务关系校验：是否在至少一个共同 conversation
-    // 复用 ConversationMember：找到 currentUserId 所在的 conversationId 集合，
-    // 再查这些 conversationId 集合里是否有 targetUserId
-    const myConvs = await this.dataSource
-      .getRepository(ConversationMember)
-      .createQueryBuilder('m')
-      .select('DISTINCT m.conversation_id', 'conversation_id')
-      .where('m.user_id = :uid', { uid: currentUserId })
-      .getRawMany<{ conversation_id: string }>();
-
-    if (myConvs.length === 0) {
-      throw new ForbiddenException('对方不在你的会话中，无权获取公钥');
-    }
-    const myConvIds = myConvs.map((c) => c.conversation_id);
-
-    const shared = await this.dataSource
-      .getRepository(ConversationMember)
-      .createQueryBuilder('m')
-      .select('m.conversation_id', 'conversation_id')
-      .where('m.user_id = :tid', { tid: targetUserId })
-      .andWhere('m.conversation_id IN (:...ids)', { ids: myConvIds })
-      .limit(1)
-      .getRawOne();
-
-    if (!shared) {
-      throw new ForbiddenException('对方不在你的会话中，无权获取公钥');
-    }
-
-    // 通过校验，查对方公钥
-    const key = await this.dataSource
-      .getRepository(UserKey)
-      .findOne({ where: { user_id: targetUserId } });
-    if (!key) {
-      throw new NotFoundException('对方尚未上传公钥，无法加密发送');
-    }
+  /** 查本设备已上传的公钥（前端自检用） */
+  async getMyDeviceKey(userId: string, deviceId: string): Promise<MyDeviceKeyView> {
+    if (!deviceId) return { exists: false };
+    const row = await this.dataSource
+      .getRepository(DeviceKey)
+      .findOne({ where: { user_id: userId, device_id: deviceId } });
+    if (!row) return { exists: false };
     return {
-      user_id: key.user_id,
-      identity_pubkey: key.identity_pubkey,
-      created_at: key.created_at,
-      updated_at: key.updated_at,
+      exists: true,
+      device_id: row.device_id,
+      identity_pubkey: row.identity_pubkey,
+      updated_at: row.updated_at,
     };
   }
 
-  /** 检查 user 是否已上传公钥（内部用，给 message.sendMessage 加密路径校验） */
-  async hasKey(userId: string): Promise<boolean> {
-    const count = await this.dataSource
-      .getRepository(UserKey)
-      .createQueryBuilder('k')
-      .where('k.user_id = :uid', { uid: userId })
-      .getCount();
-    return count > 0;
+  /**
+   * 取私密会话中**对方绑定设备**的公钥。
+   *
+   * 权限：调用者必须是该会话的绑定设备之一；pending 状态下没有对方设备，返回 404。
+   * 这样客户端只需要一个 conversation_id 就能拿到唯一的对端公钥，
+   * 不需要知道对方的 device_id（也避免在 URL 里暴露对方设备）。
+   */
+  async getPeerDeviceKey(
+    userId: string,
+    deviceId: string,
+    conversationId: string,
+  ): Promise<PeerDeviceKeyView> {
+    const conv = await this.dataSource
+      .getRepository(Conversation)
+      .findOne({ where: { id: conversationId } });
+
+    if (!conv) throw new NotFoundException('会话不存在');
+    if (conv.e2e_mode !== 1) throw new BadRequestException('该会话不是端到端加密会话');
+    if (conv.e2e_state !== 2) throw new NotFoundException('私密会话尚未建立');
+
+    const bound = conv.e2e_device_a === deviceId || conv.e2e_device_b === deviceId;
+    if (!bound) throw new ForbiddenException('本设备不是该私密会话的绑定设备');
+
+    const peerDeviceId = conv.e2e_device_a === deviceId ? conv.e2e_device_b : conv.e2e_device_a;
+    const peerUserId = conv.user_a === userId ? conv.user_b : conv.user_a;
+    if (!peerDeviceId || !peerUserId) throw new NotFoundException('对方设备信息缺失');
+
+    const row = await this.dataSource
+      .getRepository(DeviceKey)
+      .findOne({ where: { user_id: peerUserId, device_id: peerDeviceId } });
+
+    if (!row) throw new NotFoundException('对方尚未上传设备公钥，无法加密发送');
+
+    return {
+      user_id: row.user_id,
+      device_id: row.device_id,
+      identity_pubkey: row.identity_pubkey,
+      updated_at: row.updated_at,
+    };
+  }
+
+  /** 设备下线/被踢：删除该设备公钥（可顺便清理，失败不影响主流程） */
+  async deleteDeviceKey(userId: string, deviceId: string): Promise<void> {
+    if (!deviceId) return;
+    await this.dataSource.getRepository(DeviceKey).delete({ user_id: userId, device_id: deviceId });
   }
 
   /**
-   * 批量查询公钥（TOFU 前端比对用）。
-   * 权限与单个查询一致：只返回「自己 + 与自己至少一个共同 conversation 的成员」；
-   * 未上传公钥 / 无共同会话的用户直接不出现在结果里（前端自行 diff 出缺的）。
-   * 一条 SQL 搞定，不做逐个权限校验。
+   * 删除某台设备的所有公钥（按 device_id，用于管理员强制下线 / 会话策略踢人）。
+   * 只按 device_id 删是因为 device_id 本身全局唯一。
    */
-  async getIdentityKeysBatch(
-    currentUserId: string,
-    userIds: string[],
-  ): Promise<Array<{ user_id: string; identity_pubkey: string; created_at: Date; updated_at: Date }>> {
-    // 去重 + 自己置前（自己永远可查，前端需要比对"我存储的 vs 服务端存的"）
-    const others = [...new Set(userIds)].filter((id) => id !== currentUserId);
-    const ids = [currentUserId, ...others];
-
-    const keys = await this.dataSource
-      .getRepository(UserKey)
-      .createQueryBuilder('k')
-      .select(['k.user_id', 'k.identity_pubkey', 'k.created_at', 'k.updated_at'])
-      .where('k.user_id IN (:...ids)', { ids })
-      .andWhere(
-        `(k.user_id = :me OR EXISTS (
-           SELECT 1 FROM conversation_members m1
-           JOIN conversation_members m2 ON m2.conversation_id = m1.conversation_id
-           WHERE m1.user_id = :me AND m2.user_id = k.user_id
-         ))`,
-        { me: currentUserId },
-      )
-      .getMany();
-
-    return keys.map((k) => ({
-      user_id: k.user_id,
-      identity_pubkey: k.identity_pubkey,
-      created_at: k.created_at,
-      updated_at: k.updated_at,
-    }));
+  async deleteDeviceKeyByDeviceId(deviceId: string): Promise<number> {
+    if (!deviceId) return 0;
+    const r = await this.dataSource.getRepository(DeviceKey).delete({ device_id: deviceId });
+    return r.affected ?? 0;
   }
 
   /**
-   * 取与 userId 有共同会话的其他用户 ID（去重）。
-   * 供公钥轮换广播用：只有"可能缓存了旧公钥"的人需要收到 key:changed。
+   * 判断两个用户是否有业务关系（共同会话）——发起私密会话前的关系校验。
+   * 保留在 keys 服务里是因为它原本就属于"密钥可见性"的判定逻辑。
    */
-  private async getPeerUserIds(userId: string): Promise<string[]> {
-    const rows = await this.dataSource
+  async assertPeerRelation(currentUserId: string, targetUserId: string): Promise<void> {
+    const qb: SelectQueryBuilder<ConversationMember> = this.dataSource
       .getRepository(ConversationMember)
-      .createQueryBuilder('m1')
-      .select('DISTINCT m2.user_id', 'user_id')
-      .innerJoin(ConversationMember, 'm2', 'm2.conversation_id = m1.conversation_id')
-      .where('m1.user_id = :uid', { uid: userId })
-      .andWhere('m2.user_id != :uid', { uid: userId })
-      .getRawMany<{ user_id: string }>();
-    return rows.map((r) => r.user_id);
+      .createQueryBuilder('m1');
+    qb.innerJoin(ConversationMember, 'm2', 'm2.conversation_id = m1.conversation_id');
+    qb.where('m1.user_id = :me', { me: currentUserId });
+    qb.andWhere('m2.user_id = :target', { target: targetUserId });
+    qb.limit(1);
+    const shared = await qb.getOne();
+    if (!shared) throw new ForbiddenException('对方不在你的会话中，不能发起私密聊天');
   }
 }

@@ -1,5 +1,10 @@
 # 端到端加密协议（V4.0 §E2E — 方案 B 简化版）
 
+> ⚠️ **本文档已废弃（V6.2）**：已被 `docs/E2E_SECRET_CHAT.md`（V6.2 设备配对私密会话）取代。
+> 用户级 `user_keys` 表与 `POST /keys` 系列接口已下线，公钥改为按 `(user_id, device_id)` 存储。
+> 本文档仅作历史设计参考，**不要据此实现**。
+
+
 > 状态：服务端 ✅ 已就绪 | 客户端：待前端实现
 > 覆盖范围：仅单聊（conversation.type='private'），群聊/频道留 TODO
 

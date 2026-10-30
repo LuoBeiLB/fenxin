@@ -1,4 +1,10 @@
-import { BadRequestException, ForbiddenException, Injectable, Logger } from '@nestjs/common';
+import {
+  BadRequestException,
+  ForbiddenException,
+  Injectable,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -61,11 +67,28 @@ export class DestroyService {
   }
 
   /**
+   * 私密会话（V6.2）设备校验：active 状态只有两台绑定设备可访问。
+   * 普通会话直接放行；deviceId 缺失时对私密会话 fail-closed。
+   */
+  private async assertDeviceVisible(conversationId: string, deviceId?: string): Promise<void> {
+    const conv = await this.dataSource.getRepository(Conversation).findOne({
+      where: { id: conversationId },
+    });
+    if (!conv) throw new NotFoundException('会话不存在');
+    if (conv.e2e_mode !== 1) return;
+    const bound = !!deviceId && (conv.e2e_device_a === deviceId || conv.e2e_device_b === deviceId);
+    if (!bound || conv.e2e_state !== 2) {
+      throw new ForbiddenException({ code: 'E2E_NOT_BOUND_DEVICE', message: '本设备无权访问该私密会话' });
+    }
+  }
+
+  /**
    * 待确认真删除列表：本会话内「已焚毁」且「我还没确认过」的消息。
    * 只返回渲染/确认必需的元数据，**不含任何消息内容**。
    */
-  async listPending(conversationId: string, userId: string) {
+  async listPending(conversationId: string, userId: string, deviceId?: string) {
     await this.assertMember(conversationId, userId);
+    await this.assertDeviceVisible(conversationId, deviceId);
 
     const rows = await this.dataSource
       .getRepository(Message)
@@ -115,6 +138,7 @@ export class DestroyService {
     const { conversationId, userId, deviceId } = params;
     const ids = [...new Set(params.messageIds.filter(Boolean))];
     await this.assertMember(conversationId, userId);
+    await this.assertDeviceVisible(conversationId, deviceId ?? undefined);
     if (ids.length === 0) return { acked: 0, purged: 0, purged_ids: [] };
 
     const conv = await this.dataSource

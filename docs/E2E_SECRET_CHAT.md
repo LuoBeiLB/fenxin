@@ -1,7 +1,8 @@
 # 设备配对私密会话（Secret Chat）— 后端实现方案
 
-> 版本：v1（待评审）
-> 状态：设计稿，未实现
+> 版本：v1.1（已实现）
+> 状态：**后端已实现**（2026-10-30），前端待对接
+> 实现：迁移 3 个 · 接口 7 个 · 单测 16 条（e2e）+ 13 条（keys）
 > 关联文档：[E2E_ENCRYPTION.md](./E2E_ENCRYPTION.md) · [TOFU_FRONTEND.md](./TOFU_FRONTEND.md) · [websocket-events.md](./websocket-events.md)
 > 参考模型：Telegram Secret Chat
 
@@ -310,17 +311,27 @@ POST /api/v1/keys/device
 - 首建或变更时向该用户的**共同会话用户**广播 `slot:key:changed`（见 §8）
 - 响应：`{ "updated": true|false }`
 
-### 5.6 查询对方设备公钥
+### 5.6 查询对方设备公钥（已按"可选优化"实现）
 
 ```http
-GET /api/v1/keys/device/:userId/:deviceId
+GET /api/v1/keys/device/:conversationId
 ```
 
-- 关系校验：与目标用户存在共同会话（沿用现有 `keys.service.getIdentityKey` 规则）
-- 未上传 → 404 `E2E_KEY_MISSING`
+- **路径参数是 conversationId 而不是对方 userId/deviceId**：服务端根据私密会话的绑定关系反查对方设备，
+  客户端无需知道对方设备 ID（也避免在 URL 里暴露）
+- 权限：调用者必须是该会话的绑定设备之一，否则 403 `E2E_NOT_BOUND_DEVICE`
+- pending 会话 → 404（对方设备尚未绑定）
+- 对方未上传公钥 → 404
 - 响应：`{ user_id, device_id, identity_pubkey, updated_at }`
 
-> **可选优化**：合并到 `GET /conversations/:id/e2e-key`，服务端直接返回"绑定设备的公钥"，减少前端两次请求。
+### 5.7 查询本设备公钥（自检用）
+
+```http
+GET /api/v1/keys/device/me
+```
+
+- 未上传 → `{ exists: false }`
+- 已上传 → `{ exists: true, device_id, identity_pubkey, updated_at }`
 
 ---
 
@@ -775,3 +786,57 @@ v2 可选方案：为设备单独注册 alias（`{userId}_{deviceIdHash}`），�
 | 推送 | 用户级 | 私密会话不推（v1） |
 | 迁移数量 | — | **3 个**（conversations 扩展、device_keys 建表、DROP user_keys） |
 
+---
+
+## 16. 实现记录（2026-10-30）
+
+### 16.1 迁移（3 个，全部幂等）
+
+| 文件 | 内容 |
+|---|---|
+| `1768200000000-AddSecretChatFields.ts` | conversations 加 6 列 + `e2e_pair_key` 生成列 + `uk_e2e_pair` 唯一索引 + 2 个普通索引 |
+| `1768200001000-AddDeviceKeys.ts` | 建 `device_keys` 表（`uk_device_keys_user_device` 唯一） |
+| `1768200002000-DropUserKeys.ts` | `DROP TABLE user_keys`（down() 只能重建空表，数据不可恢复） |
+
+### 16.2 接口（7 个）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/conversations/e2e-request` | 发起请求（建 pending 会话） |
+| POST | `/conversations/:id/e2e-accept` | 接受（绑定当前设备） |
+| POST | `/conversations/:id/e2e-reject` | 拒绝（物理删除） |
+| POST | `/conversations/:id/e2e-close` | 关闭 / 撤回（物理删除） |
+| POST | `/keys/device` | 上传本设备公钥 |
+| GET | `/keys/device/me` | 查本设备公钥（自检） |
+| GET | `/keys/device/:conversationId` | 取对方绑定设备公钥 |
+
+### 16.3 代码改动清单
+
+| 文件 | 改动 |
+|---|---|
+| `src/entities/conversation.entity.ts` | 加 `e2e_mode` / `e2e_state` / `user_a` / `user_b` / `e2e_device_a` / `e2e_device_b` |
+| `src/entities/device-key.entity.ts` | 新增（`device_keys`） |
+| `src/entities/user-key.entity.ts` | **已删除** |
+| `src/modules/e2e/*` | 新增 module / service / controller / dto（request/accept/reject/close + 过期定时任务 + 设备下线联动） |
+| `src/modules/keys/*` | 重写为设备级：上传 / 查本设备 / 查对方绑定设备 / 下线删除；旧三个接口下线 |
+| `src/modules/conversation/conversation.service.ts` | 列表按设备过滤；返回 `is_bound_device` / `peer_device_id`；`getConversation` 加设备校验 |
+| `src/modules/message/message.service.ts` | 新增 `assertDeviceAccess` / `emitConversationEvent`；发送强制加密、禁止非绑定设备、搜索排除私密会话、私密会话不推送 |
+| `src/modules/message/destroy.service.ts` | `listPending` / `ack` 加设备校验 |
+| `src/modules/auth/auth.service.ts` | `removeDevice` 联动：关闭绑定私密会话 + 删除设备公钥 |
+| `src/modules/events/events.types.ts` | 新增 5 个 WS 事件与 payload 类型 |
+| `src/app.module.ts` | 注册 `E2eModule` |
+| `openapi.yaml` | 移除旧 3 个 keys 接口，新增设备级 3 个 + 私密会话 4 个 |
+| `docs/websocket-events.md` | 新增 5 个事件与 payload |
+| `docs/E2E_ENCRYPTION.md` / `docs/TOFU_FRONTEND.md` | 加"已废弃"横幅 |
+
+### 16.4 验证
+
+```
+tsc --noEmit      : 0 error
+jest (--runInBand): 28 suites / 259 tests 全绿
+  · test/modules/secret-chat/e2e.service.spec.ts  16 条
+  · test/modules/keys/keys.service.spec.ts        13 条（重写为设备级）
+```
+
+> ⚠️ **迁移尚未在真实 MySQL 上跑过**：开发机没有可用 Docker/MySQL。
+> 上线前必须在测试机执行 `migration:run` → `migration:show`（全 [X]）→ `migration:revert` → 再 `run` 验证。
