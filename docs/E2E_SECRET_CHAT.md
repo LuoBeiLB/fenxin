@@ -149,22 +149,37 @@ CREATE TABLE `device_keys` (
 
 > `user_keys` **保留不删**（历史消息兼容用，见 §10）。
 
-### 4.3 迁移 ③：销毁原因枚举 + 设备索引
+### 4.3 迁移 ③（**可省略**）：关闭原因注释 + 设备索引
+
+> ⚠️ 先说清楚：**这一步不建表、不存任何聊天内容、不产生任何"记录"**。
+> 它只做两件纯结构层面的小事，且都可以不做。
 
 ```sql
--- messages.destroy_reason 增加 'e2e_closed'
+-- ① 仅改注释：destroy_reason 本来就是 varchar(20)，加值不需要改结构，
+--    改注释只是让后人知道存在 'e2e_closed' 这个取值（纯文档性质）
 ALTER TABLE `messages`
   MODIFY COLUMN `destroy_reason` varchar(20) NULL
     COMMENT 'fallback_expired/all_read/owner_dissolve/admin_dissolve/manual/e2e_closed';
 
--- 加速"设备被移除时联动关闭"
+-- ② 仅加索引：用于「设备被踢下线时，快速找出它绑定的私密会话」
+--    数据量小时（万级以下）完全可以不加，走全表扫描也就几毫秒
 CREATE INDEX `idx_e2e_device_a` ON `conversations` (`e2e_device_a`);
 CREATE INDEX `idx_e2e_device_b` ON `conversations` (`e2e_device_b`);
 ```
 
+**建议**：
+
+| 项 | 建议 | 理由 |
+|---|---|---|
+| ① 注释 | **可以合到迁移 ①** | 纯注释，无数据影响 |
+| ② 索引 | **数据量大于 10 万会话再加** | 当前库只有几百条会话，加了也是浪费写放大 |
+
+> 也就是说：**真正必需的迁移只有 ①（conversations 扩展）和 ②（device_keys 表）**。
+> 迁移 ③ 降级为"可选优化"，删掉它功能完全不受影响。
+
 ### 4.4 幂等要求
 
-三个迁移全部使用 `information_schema` 判断（沿用现有迁移风格），可重复执行。
+所有迁移使用 `information_schema` 判断（沿用现有迁移风格），可重复执行。
 
 ---
 
@@ -449,7 +464,42 @@ async closeSecretChatsBoundTo(deviceId: string, reason = 'device_removed') {
 - 触发点：`POST /auth/devices/:deviceId/offline`、会话策略 `single`/`notify` 踢人、管理员强制下线
 - 通知：向对方设备发 `e2e:closed`（`reason='device_removed'`），前端提示"对方设备已下线，私密聊天已结束"
 
-### 7.4 pending 过期
+### 7.4 关闭后服务端到底还留什么（**逐项明确**）
+
+私密会话"不留记录"要分**内容**和**元数据**两层看，两者处理方式不同：
+
+| 数据 | 关闭后 | 何时彻底消失 | 说明 |
+|---|---|---|---|
+| **消息正文（密文）** `messages.cipher_text` / `content` | 关闭时软删（`is_destroyed=1`） | **24 小时后物理删除** | 内容层：一定不留 |
+| **消息元数据**（谁发的、时间、类型） | 随消息行一起软删 | 24 小时后随行删除 | 内容层：不留 |
+| **附件**（`file_url` / `file_original_url` 指向的 OSS 对象） | 立即从 OSS 删除 | 即时 | `DestroyService.deleteAttachments()` |
+| **回执** `message_receipts` | 随消息级联删除 | 24 小时后 | — |
+| **墓碑** `message_tombstones` | 删除 | 即时 | 不留"这里曾有一条消息"的痕迹 |
+| **会话行** `conversations` | **保留**（仅元数据：谁和谁、开/关时间、关闭原因、绑定设备 id） | 取决于配置（见下） | 见下方三档 |
+| **审计日志** | 可选 | 取决于合规要求 | 谁在何时开了私密会话（不含内容） |
+
+#### 会话行的三档策略（需产品/合规拍板）
+
+| 档 | 行为 | 优点 | 缺点 | 建议 |
+|---|---|---|---|---|
+| **A. 保留元数据（默认）** | 会话行留下：`user_a/user_b`、`e2e_state=4`、`e2e_closed_at`、`e2e_close_reason`、`e2e_device_a/b`；消息与附件全清 | 可审计（"某天 A 和 B 开过一条私密会话，关闭原因=设备移除"）、客服排查、唯一约束自然释放 | 库里留一条"谁和谁开过私密会话"的记录 | ✅ 企业 IM 通常需要 |
+| **B. 保留 N 天后删除** | 同 A，但定时任务在 N 天后删除会话行与 `conversation_members` | 兼顾审计与最小化留存 | 多一个定时任务 | 合规要求"最小留存"时选 |
+| **C. 关闭即删除** | 会话行、members、消息、回执、墓碑全部立即物理删除 | 服务端零留存 | **无法审计、无法排查、无法回答"我明明开过"**；且删除后无法通知离线对方（只能等它拉列表时发现消失） | 除非合规明确要求，否则不建议 |
+
+**配置项**（建议）：
+
+```bash
+# 私密会话关闭后的会话行保留策略
+E2E_CLOSED_RETENTION=keep            # keep（默认，档 A）| 30d（档 B，N 天）| delete（档 C，立即删）
+```
+
+**注意**：无论选哪档，**内容（明文/密文/附件/附件地址）在 24 小时内一定全部消失**，"记录"只剩下"这两个人在某天开过一次私密会话"这一条元数据。
+
+> 补充一个容易误解的点：**E2E ≠ 服务端不暂存**。
+> 对方离线时，密文必须先在服务端排队，否则无法投递（Telegram 的 secret chat 同样如此——服务器在消息送达前也会暂存密文）。
+> 我们能控制的是"送达后/关闭后多久清理"，而不是"完全不经过服务端"。
+
+### 7.5 pending 过期
 
 ```ts
 // 新增 PresenceScheduler 同级定时任务（每小时）
@@ -615,6 +665,7 @@ v2 可选方案：为设备单独注册 alias（`{userId}_{deviceIdHash}`），�
 | 4 | 私密会话是否也支持焚毁时长 | 是/否 | 否（v1 简化，整会话关闭即销毁）|
 | 5 | 同一对用户是否允许多条 active | 是/否 | **否**（已被唯一约束约束）|
 | 6 | 私密会话入口开关 | 环境变量 / 数据库开关 | **环境变量** `E2E_SECRET_CHAT_ENABLED` |
+| 7 | 关闭后会话元数据留存 | keep / 30d / delete | **keep**（可审计；见 §7.4，配置 E2E_CLOSED_RETENTION）|
 
 ---
 
