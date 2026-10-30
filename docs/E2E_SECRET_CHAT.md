@@ -838,5 +838,21 @@ jest (--runInBand): 28 suites / 259 tests 全绿
   · test/modules/keys/keys.service.spec.ts        13 条（重写为设备级）
 ```
 
-> ⚠️ **迁移尚未在真实 MySQL 上跑过**：开发机没有可用 Docker/MySQL。
-> 上线前必须在测试机执行 `migration:run` → `migration:show`（全 [X]）→ `migration:revert` → 再 `run` 验证。
+### 16.5 迁移实跑验证（本地 MySQL 5.7.26，库 `yy`）
+
+| 步骤 | 结果 |
+|---|---|
+| `migration:show`（执行前） | 10 个 `[X]` + 3 个 `[ ]` |
+| `migration:run` | 3 个迁移全部 `executed successfully` |
+| 结构校验 | 6 列 + 生成列 `STORED GENERATED` + `uk_e2e_pair`/`idx_e2e_state`/`idx_e2e_devices` + `device_keys` 表全部存在；`user_keys` 已删除 |
+| 生成列行为 | pending/active 生成 `userA:userB`；普通会话为 `NULL`（不参与唯一性） |
+| 唯一约束 | 同一对用户第二条 pending → `ER_DUP_ENTRY`；用户顺序颠倒同样命中 |
+| 释放语义 | `DELETE` 会话行后可立即重新插入（关闭后可重发） |
+| 设备公钥 | 同设备重复插入被拦；同一用户第二台设备可独立上传 |
+| `migration:revert` ×3 | `down()` 全部成功（重建空 `user_keys`、删 `device_keys`、删列与索引） |
+| 再次 `migration:run` | 3 个再次成功；再跑一次输出 `No migrations are pending`（幂等） |
+
+> 本地为 **MySQL 5.7.26**，生产为 **8.4**；本次用到的语法（`GENERATED ... STORED`、`information_schema` 判断、
+> `tinyint DEFAULT 0`、`utf8mb4_unicode_ci`）两者都支持。上线前仍建议在测试机（8.x 容器）再跑一遍。
+>
+> `user_keys` 的 5 行数据已在 DROP 前备份到 `tmp-schema/user_keys-backup.json`（未提交，本地文件）。
