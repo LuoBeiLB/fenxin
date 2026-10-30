@@ -157,23 +157,46 @@ CREATE TABLE `device_keys` (
 
 > `device_keys` 只存**公钥**，不含任何会话关系，无法从它推断谁和谁开过私密会话。
 
-> `user_keys` **保留不删**（历史消息兼容用，见 §10）。
+> `user_keys` 在本方案中被**删除**（见迁移 ③）；历史加密消息将不可解密，产品已接受此损失。
 
-### 4.3 为什么**没有**迁移 ③
+### 4.3 迁移 ③：删除 `user_keys`（用户级密钥退役）
 
-原方案里曾有一条"给 `messages.destroy_reason` 增加 `e2e_closed` 取值"的迁移，**已删除**。
+按项目约定（**不做向后兼容**，见 [AGENTS.md](../AGENTS.md) §2），迁移到设备级密钥后直接删除用户级公钥表。
 
-| 原因 | 说明 |
+```sql
+-- 幂等：先判断表存在再删
+DROP TABLE `user_keys`;
+```
+
+**影响（必须接受）**
+
+| 影响 | 说明 |
 |---|---|
-| 它会留下痕迹 | 哪怕行 24 小时后被物理删除，期间任何能读库的人都能从 `destroy_reason='e2e_closed'` 推断出"这里曾有一条私密消息" |
-| 关闭改成了物理删除 | 既然不存在"软删 24 小时"阶段，就不需要区分销毁原因 |
-| 普通销毁原因已够用 | 若将来确实需要走软删，复用现有的 `manual` 即可，**不要新增能指向私密会话的取值** |
+| 存量加密消息无法解密 | 解密需要发送方的 `user_keys.identity_pubkey`，表没了就取不到 → 前端显示「旧版加密消息，已无法解密」 |
+| 3 个接口下线 | `POST /keys`、`GET /keys/:userId`、`POST /keys/query`（清单见 §10.1） |
+| 不可回滚 | `down()` 只能重建空表，**数据不可恢复**；需要恢复请用数据库备份 |
 
-**结论：本次只有 2 个迁移** —— `conversations` 扩展 + `device_keys` 建表。
+```ts
+// 迁移 ③ 的 down()：只能重建结构，数据无法恢复（显式说明）
+public async down(qr: QueryRunner): Promise<void> {
+  await qr.query(`
+    CREATE TABLE IF NOT EXISTS \`user_keys\` (
+      \`id\` varchar(36) NOT NULL,
+      \`user_id\` varchar(36) NOT NULL,
+      \`identity_pubkey\` varchar(100) NOT NULL,
+      \`created_at\` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      \`updated_at\` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (\`id\`),
+      UNIQUE KEY \`uk_user_keys_user_id\` (\`user_id\`)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
+}
+```
+
+> **结论：本次共 3 个迁移** —— ① `conversations` 扩展、② `device_keys` 建表、③ `DROP TABLE user_keys`。
 
 ### 4.4 幂等要求
 
-两个迁移都使用 `information_schema` 判断（沿用现有迁移风格），可重复执行。
+三个迁移都使用 `information_schema` 判断（沿用现有迁移风格），可重复执行。
 
 ---
 
@@ -603,16 +626,38 @@ v2 可选方案：为设备单独注册 alias（`{userId}_{deviceIdHash}`），�
 
 ---
 
-## 10. 兼容与灰度
+## 10. 发布策略（**不做兼容**）
 
-| 关注点 | 方案 |
+> 依据项目约定（见 [AGENTS.md](../AGENTS.md) §2）：**本项目不做向后兼容**，
+> 前端随后端同版本发版；聊天记录不是核心资产，历史数据丢失可接受。
+> 唯一红线是**登录与核心链路不能被破坏**。
+
+| 关注点 | 处理 |
 |---|---|
-| 存量数据 | `e2e_mode` 默认 0，所有既有会话行为完全不变 |
-| 存量 `user_keys` | 保留；旧加密消息（`e2e_version` 缺失）仍按原逻辑解密，能解则解，否则显示"旧版加密消息" |
-| 新消息 | 私密会话走 `device_keys` + 设备级 ECDH，**不复用** `user_keys` |
-| 前端未上线 | 后端改动对非私密会话无影响，可先发布 |
-| 前端灰度 | 私密聊天入口用配置开关控制（`E2E_SECRET_CHAT_ENABLED`），后端同样读取该开关做 404 |
-| 回滚 | 关闭开关即可；已建的私密会话建议一并 `e2e-close` 清空 |
+| 存量 `user_keys` | **直接删除**（迁移 ③ `DROP TABLE user_keys`），不保留只读 |
+| 存量加密消息 | 删表后无法解密 → 前端统一显示「旧版加密消息，已无法解密」。**接受此损失** |
+| 存量 `POST /keys` 等接口 | **直接下线**（前端同版本发版后不再调用） |
+| `e2e_mode` 默认值 | 0，既有普通会话行为完全不变（这部分是"加字段"，不影响旧逻辑） |
+| 前端灰度开关 | `E2E_SECRET_CHAT_ENABLED`，后端同样读取；关闭时相关接口返回 404 |
+| 发版顺序 | **先跑迁移，再切新镜像**（与现有发布流程一致，见 DEPLOY_HANDOFF.md） |
+| 回滚 | 回滚镜像到上一版；`user_keys` 已删 → 若回滚需从备份恢复（备份里必须包含该表） |
+
+### 10.1 删除 `user_keys` 的影响清单（必须同版本完成）
+
+| # | 文件 | 动作 |
+|---|---|---|
+| 1 | `src/entities/user-key.entity.ts` | 删除 |
+| 2 | `src/modules/keys/keys.service.ts` | 删除 `uploadIdentityKey` / `getIdentityKey` / `getIdentityKeysBatch` / `hasKey`；**保留** `getPeerUserIds`（新逻辑复用） |
+| 3 | `src/modules/keys/keys.controller.ts` | 删除 `POST /keys`、`GET /keys/:userId`、`POST /keys/query`；新增设备级接口（§5.5 / §5.6） |
+| 4 | `src/modules/keys/dto/index.ts` | 删除旧 DTO，新增 `UploadDeviceKeyDto` |
+| 5 | `test/modules/keys/keys.service.spec.ts` | 改写为 `device_keys` 版本 |
+| 6 | `src/database/migrations/` | 新增迁移 ③：`DROP TABLE user_keys` |
+| 7 | 前端 `store/index.js` `initE2E()` | 不再调用 `POST /keys`，改调 `POST /keys/device` |
+| 8 | 前端 `utils/tofu.js` | 从「用户级公钥」改为「设备级公钥」比对 |
+| 9 | `docs/E2E_ENCRYPTION.md`、`docs/TOFU_FRONTEND.md` | 顶部标注「已被 `E2E_SECRET_CHAT.md` 取代」 |
+| 10 | `openapi.yaml` | 移除 3 个旧 keys 接口，新增 2 个设备级接口 |
+
+> **必须前后端同版本发布**：只发后端会导致前端启动时 `POST /keys` 404、历史加密消息报错（虽被 catch，但 E2E 初始化会断）。
 
 ---
 
@@ -679,6 +724,8 @@ v2 可选方案：为设备单独注册 alias（`{userId}_{deviceIdHash}`），�
 | 24 | 伪造 `device_id` 调 accept | 用 JWT 的 deviceId，body 传参被忽略 |
 | 25 | 管理端查询私密会话 | 只有元数据，不返回 `cipher_text` |
 | 26 | 其他设备的 WS | 收不到该私密会话任何事件 |
+| 27 | 迁移 ③ 执行后的旧加密消息 | 前端显示「旧版加密消息，已无法解密」；**登录 / 普通会话 / 发消息均不受影响** |
+| 28 | 迁移 ③ 执行后调用 `POST /keys` | 404（前端同版本已不再调用） |
 
 ---
 
@@ -686,13 +733,13 @@ v2 可选方案：为设备单独注册 alias（`{userId}_{deviceIdHash}`），�
 
 | 阶段 | 内容 | 估时 |
 |---|---|---|
-| 后端 P1 | 2 个迁移 + 状态机 + 6 个接口（不含可见性改造） | 2.5 天 |
+| 后端 P1 | 3 个迁移 + 状态机 + 6 个接口 + 删除旧 keys 模块（不含可见性改造） | 3 天 |
 | 后端 P2 | 10 处可见性改造 + WS device room 分流 + 推送跳过 | 2 天 |
 | 后端 P3 | 关闭(物理删除)/联动/过期 + 单测（≈26 例） | 2 天 |
 | 后端 P4 | 联调修复 + 管理端适配 | 1 天 |
-| **后端合计** | | **约 7.5 天** |
+| **后端合计** | | **约 8 天** |
 | 前端 | 设备密钥、请求/接受/关闭 UI、列表分区、解密分支 | 5~7 天 |
-| 测试 | 26 条用例 × 多设备矩阵 | 3~4 天 |
+| 测试 | 28 条用例 × 多设备矩阵 | 3~4 天 |
 
 **建议排期**：后端先做 P1+P2（4.5 天）产出一个可联调的版本，前端并行开发；P3 在前端联调期间完成。
 
@@ -721,9 +768,10 @@ v2 可选方案：为设备单独注册 alias（`{userId}_{deviceIdHash}`），�
 | 多设备 | 互相覆盖，只有一台能解 | 各设备独立会话，互不影响 |
 | 关闭语义 | 无 | **关闭 = 物理删除**（会话行/消息/回执/成员/附件全删，可立即重新发起） |
 | 关闭后残留 | — | **业务表零残留**；binlog/备份/日志由运维策略处理（§7.6） |
+| 旧用户级密钥 | user_keys 表 | **直接删除**，旧加密消息不再可解 |
 | 唯一性 | 无 | 一对用户同一时间仅一条 pending/active |
 | 结束状态 | — | 不设 closed/rejected/expired 状态，删行即结束 |
 | 审计 | — | **刻意不写**（避免反推"曾经有过私密会话"） |
 | 推送 | 用户级 | 私密会话不推（v1） |
-| 迁移数量 | — | **2 个**（conversations 扩展、device_keys 建表） |
+| 迁移数量 | — | **3 个**（conversations 扩展、device_keys 建表、DROP user_keys） |
 
