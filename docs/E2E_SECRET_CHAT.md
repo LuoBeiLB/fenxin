@@ -58,44 +58,49 @@
 
 ## 3. 状态机
 
+> **设计原则：关闭 = 物理删除，不留状态、不留标记、不留记录。**
+> 因此只有「存在」和「不存在」两种持久化状态，没有 closed/expired/rejected 这类"墓碑状态"。
+
 ```
                       ┌───────────────────────────────┐
-                      │ 0 无（无 e2e 会话）            │
+                      │ 无（库里没有这一行）           │
                       └───────────────┬───────────────┘
-                                      │ A(设备A1) 发起
+                                      │ A(设备A1) 发起 → 插入一行
                                       ▼
                       ┌───────────────────────────────┐
-        B 拒绝 ──────►│ 1 pending（待接受，7 天过期）   │◄──── 发起方可撤回
-                      └───────┬───────────────┬───────┘
-                              │ B 接受         │ 超时
-                              ▼               ▼
-                      ┌───────────────┐  ┌───────────────┐
-                      │ 2 active      │  │ 5 expired     │
-                      │ A1 ↔ B2       │  └───────────────┘
-                      └───────┬───────┘
-                              │ 任一方关闭 / 绑定设备被移除 / 管理员强制
-                              ▼
-                      ┌───────────────┐
-        ┌────────────►│ 4 closed      │
-        │             └───────────────┘
-        │
-  ┌───────────────┐
-  │ 3 rejected    │
-  └───────────────┘
+        B 拒绝 ──────►│ 1 pending（待接受，7 天过期）  │◄──── 发起方可撤回
+        （删除该行）   └───────────────┬───────────────┘
+                           （删除该行） │ B 接受
+                                      ▼
+                      ┌───────────────────────────────┐
+                      │ 2 active（A1 ↔ B2）           │
+                      └───────────────┬───────────────┘
+                                      │ 任一方关闭 / 绑定设备被移除 / 管理员强制
+                                      ▼
+                      ┌───────────────────────────────┐
+                      │ 无（该行被物理删除）           │
+                      └───────────────────────────────┘
 ```
 
-**状态枚举**（`conversations.e2e_state`）
+**`conversations.e2e_state` 只保留 3 个值**
 
-| 值 | 含义 | 释放唯一约束 | 谁可操作 |
-|---|---|---|---|
-| 0 | 非私密会话 | — | — |
-| 1 | pending 待接受 | ❌ 占用 | 发起设备可撤回；目标用户任一设备可接受/拒绝 |
-| 2 | active 进行中 | ❌ 占用 | 两台绑定设备可收发、关闭 |
-| 3 | rejected 已拒绝 | ✅ 释放 | 无 |
-| 4 | closed 已关闭 | ✅ 释放 | 无（历史不可恢复） |
-| 5 | expired 已过期 | ✅ 释放 | 无 |
+| 值 | 含义 | 是否占用唯一约束 |
+|---|---|---|
+| 0 | 非私密会话 | — |
+| 1 | pending 待接受 | ✅ 占用 |
+| 2 | active 进行中 | ✅ 占用 |
 
-> **唯一约束只作用于 1 和 2**：rejected / closed / expired 一旦进入即允许重新发起，不限制频率。
+**终止动作一律是"删除行"，而不是"改状态"**
+
+| 动作 | 持久化结果 | 对方如何得知 |
+|---|---|---|
+| 拒绝 | `DELETE` 该行 | WS `e2e:rejected`；离线则无感知（可重新发起）|
+| 撤回（发起方取消 pending） | `DELETE` 该行 | WS `e2e:request_gone` |
+| pending 7 天过期 | 定时任务 `DELETE` 该行 | WS `e2e:request_gone`；离线则列表里自然消失 |
+| 关闭 active | `DELETE` 该行 + 消息/回执/附件/成员全部删除 | WS `e2e:closed`；离线则下次拉列表时消失 |
+
+> **没有 closed / expired / rejected 这些值**，也就没有"某天 A 和 B 开过私密会话"的元数据残留。
+> 唯一约束在行被删除后自动释放，所以"关闭后可立即重新发起"是天然成立的。
 
 ---
 
@@ -103,21 +108,21 @@
 
 ### 4.1 迁移 ①：`conversations` 扩展
 
+> 只加"**会话存活期间**需要的字段"。
+> **不加** `e2e_closed_at` / `e2e_closed_by` / `e2e_close_reason` —— 关闭即删行，这些字段没有意义，
+> 而且保留它们就等于留下"曾经有过私密会话"的痕迹。
+
 ```sql
 ALTER TABLE `conversations`
-  ADD COLUMN `e2e_mode`        tinyint     NOT NULL DEFAULT 0
+  ADD COLUMN `e2e_mode`     tinyint     NOT NULL DEFAULT 0
       COMMENT '0=普通会话 1=设备配对私密会话',
-  ADD COLUMN `e2e_state`       tinyint     NOT NULL DEFAULT 0
-      COMMENT '0=非私密 1=待接受 2=已激活 3=已拒绝 4=已关闭 5=已过期',
-  ADD COLUMN `user_a`          varchar(36) NULL COMMENT '参与者1（固定取较小 user_id）',
-  ADD COLUMN `user_b`          varchar(36) NULL COMMENT '参与者2（固定取较大 user_id）',
-  ADD COLUMN `e2e_device_a`    varchar(36) NULL COMMENT '发起设备 devices.id',
-  ADD COLUMN `e2e_device_b`    varchar(36) NULL COMMENT '接受设备 devices.id',
-  ADD COLUMN `e2e_closed_at`   datetime    NULL,
-  ADD COLUMN `e2e_closed_by`   varchar(36) NULL COMMENT '关闭发起方 device_id',
-  ADD COLUMN `e2e_close_reason` varchar(20) NULL
-      COMMENT 'user / device_removed / admin / expired',
-  ADD COLUMN `e2e_pair_key`    varchar(80)
+  ADD COLUMN `e2e_state`    tinyint     NOT NULL DEFAULT 0
+      COMMENT '0=非私密 1=待接受 2=已激活（终止即删行，无 closed/rejected 状态）',
+  ADD COLUMN `user_a`       varchar(36) NULL COMMENT '参与者1（固定取较小 user_id）',
+  ADD COLUMN `user_b`       varchar(36) NULL COMMENT '参与者2（固定取较大 user_id）',
+  ADD COLUMN `e2e_device_a` varchar(36) NULL COMMENT '发起设备 devices.id',
+  ADD COLUMN `e2e_device_b` varchar(36) NULL COMMENT '接受设备 devices.id',
+  ADD COLUMN `e2e_pair_key` varchar(80)
       GENERATED ALWAYS AS (
         CASE WHEN `e2e_mode` = 1 AND `e2e_state` IN (1, 2)
              THEN CONCAT(LEAST(`user_a`, `user_b`), ':', GREATEST(`user_a`, `user_b`))
@@ -129,6 +134,9 @@ ALTER TABLE `conversations`
 
 -- 普通会话无需回填：e2e_mode=0, e2e_state=0
 ```
+
+**注意**：`idx_e2e_devices` / `idx_e2e_state` 都是普通索引，不包含任何"历史"语义；
+行被删除后索引项一并消失，不会留下痕迹。
 
 ### 4.2 迁移 ②：`device_keys`（设备级公钥）
 
@@ -147,39 +155,25 @@ CREATE TABLE `device_keys` (
   COMMENT='每台设备一把 X25519 identity 公钥（替代 user_keys 的单用户单钥）';
 ```
 
+> `device_keys` 只存**公钥**，不含任何会话关系，无法从它推断谁和谁开过私密会话。
+
 > `user_keys` **保留不删**（历史消息兼容用，见 §10）。
 
-### 4.3 迁移 ③（**可省略**）：关闭原因注释 + 设备索引
+### 4.3 为什么**没有**迁移 ③
 
-> ⚠️ 先说清楚：**这一步不建表、不存任何聊天内容、不产生任何"记录"**。
-> 它只做两件纯结构层面的小事，且都可以不做。
+原方案里曾有一条"给 `messages.destroy_reason` 增加 `e2e_closed` 取值"的迁移，**已删除**。
 
-```sql
--- ① 仅改注释：destroy_reason 本来就是 varchar(20)，加值不需要改结构，
---    改注释只是让后人知道存在 'e2e_closed' 这个取值（纯文档性质）
-ALTER TABLE `messages`
-  MODIFY COLUMN `destroy_reason` varchar(20) NULL
-    COMMENT 'fallback_expired/all_read/owner_dissolve/admin_dissolve/manual/e2e_closed';
+| 原因 | 说明 |
+|---|---|
+| 它会留下痕迹 | 哪怕行 24 小时后被物理删除，期间任何能读库的人都能从 `destroy_reason='e2e_closed'` 推断出"这里曾有一条私密消息" |
+| 关闭改成了物理删除 | 既然不存在"软删 24 小时"阶段，就不需要区分销毁原因 |
+| 普通销毁原因已够用 | 若将来确实需要走软删，复用现有的 `manual` 即可，**不要新增能指向私密会话的取值** |
 
--- ② 仅加索引：用于「设备被踢下线时，快速找出它绑定的私密会话」
---    数据量小时（万级以下）完全可以不加，走全表扫描也就几毫秒
-CREATE INDEX `idx_e2e_device_a` ON `conversations` (`e2e_device_a`);
-CREATE INDEX `idx_e2e_device_b` ON `conversations` (`e2e_device_b`);
-```
-
-**建议**：
-
-| 项 | 建议 | 理由 |
-|---|---|---|
-| ① 注释 | **可以合到迁移 ①** | 纯注释，无数据影响 |
-| ② 索引 | **数据量大于 10 万会话再加** | 当前库只有几百条会话，加了也是浪费写放大 |
-
-> 也就是说：**真正必需的迁移只有 ①（conversations 扩展）和 ②（device_keys 表）**。
-> 迁移 ③ 降级为"可选优化"，删掉它功能完全不受影响。
+**结论：本次只有 2 个迁移** —— `conversations` 扩展 + `device_keys` 建表。
 
 ### 4.4 幂等要求
 
-所有迁移使用 `information_schema` 判断（沿用现有迁移风格），可重复执行。
+两个迁移都使用 `information_schema` 判断（沿用现有迁移风格），可重复执行。
 
 ---
 
@@ -246,10 +240,10 @@ POST /api/v1/conversations/:id/e2e-accept
 POST /api/v1/conversations/:id/e2e-reject
 ```
 
-**成功 200**：`{ "code": 0, "message": "已拒绝", "data": { "e2e_state": 3 } }`
+**成功 200**：`{ "code": 0, "message": "已拒绝", "data": { "deleted": true } }`
 
 - 目标用户任一设备可拒绝；发起方不能拒绝自己的请求（应改用 close/撤回）
-- 置 `e2e_state=3`，`uk_e2e_pair` 自动释放 → **可立即重新发起**
+- **直接删除该会话行**（物理删除，不留 rejected 状态）：唯一约束随行删除自动释放 → **可立即重新发起**
 - 广播：向发起设备发 `e2e:rejected`；向拒绝方其他设备发 `e2e:request_gone`
 
 ### 5.4 关闭 / 撤回
@@ -267,7 +261,7 @@ Content-Type: application/json
 {
   "code": 0,
   "message": "私密聊天已结束",
-  "data": { "conversation_id": "uuid", "e2e_state": 4, "closed_at": "...", "deleted_messages": 42 }
+  "data": { "conversation_id": "uuid", "deleted": true, "deleted_messages": 42 }
 }
 ```
 
@@ -324,8 +318,7 @@ function isVisibleToDevice(conv: Conversation, userId: string, deviceId: string)
   if (conv.e2e_state === 2) {                                 // active：仅绑定设备
     return conv.e2e_device_a === deviceId || conv.e2e_device_b === deviceId;
   }
-  if (conv.e2e_state === 3) return conv.e2e_device_a === deviceId;   // 被拒：仅发起设备看得到
-  return false;                                                       // closed/expired：谁都看不到
+  return false;                                                       // 其余（不该出现）：不可见
 }
 ```
 
@@ -336,7 +329,7 @@ AND (
   c.e2e_mode = 0
   OR (c.e2e_mode = 1 AND c.e2e_state = 1 AND :userId IN (c.user_a, c.user_b))
   OR (c.e2e_mode = 1 AND c.e2e_state = 2 AND :deviceId IN (c.e2e_device_a, c.e2e_device_b))
-  OR (c.e2e_mode = 1 AND c.e2e_state = 3 AND c.e2e_device_a = :deviceId)
+  -- 没有 rejected/closed/expired 行：终止即删除，因此不需要额外分支
 )
 ```
 
@@ -365,7 +358,7 @@ AND (
   "id": "uuid",
   "type": "private",
   "e2e_mode": 1,
-  "e2e_state": 2,                    // 1/2/3
+  "e2e_state": 2,                    // 1=pending 2=active
   "e2e_expires_at": "2026-11-03T10:00:00Z",   // 仅 pending
   "is_bound_device": true,           // 当前设备是否为绑定设备
   "other_user": { "id": "...", "display_name": "..." },
@@ -376,145 +369,193 @@ AND (
 
 ---
 
-## 7. 关闭流程（方案 A：立即销毁 + 24h 缓冲）
+## 7. 关闭流程（关闭 = 物理删除）
 
-### 7.1 事务伪代码
+### 7.1 设计原则
+
+| 原则 | 说明 |
+|---|---|
+| **关闭即删** | 不设 `closed` 状态、不写 `destroy_reason`、不保留软删行 |
+| **删干净** | 消息（含密文）、回执、墓碑、成员、会话行、OSS 附件全部删除 |
+| **不留可推断的痕迹** | 删除后数据库里没有任何行能指向"这里曾经有过私密会话" |
+| **幂等** | 重复关闭返回成功（第二次时行已不存在，直接返回 `already_closed`） |
+| **先删对象再删行** | 附件 URL 存在消息行里，必须先把 OSS 对象删掉，再删行 |
+
+> 会话在**存续期间**必然有数据（消息密文、会话行）——这是投递所必需的；
+> 我们保证的是**关闭之后一行都不剩**。
+
+### 7.2 关闭事务伪代码
 
 ```ts
-async closeSecretChat(conversationId: string, userId: string, deviceId: string, reason = 'user') {
-  return this.dataSource.transaction(async (m) => {
+/**
+ * 关闭（或撤回）私密会话：物理删除，不留任何痕迹。
+ * @param trigger 'user' | 'device_removed' | 'admin'
+ */
+async closeSecretChat(
+  conversationId: string,
+  operatorUserId: string,
+  operatorDeviceId: string,
+  trigger: 'user' | 'device_removed' | 'admin' = 'user',
+) {
+  /** 事务外先用它收集需要通知的设备（提交后再发 WS，避免回滚后误通知） */
+  let notifyDevices: string[] = [];
+  let deletedMessages = 0;
+
+  await this.dataSource.transaction(async (m) => {
     const conv = await m.getRepository(Conversation)
       .createQueryBuilder('c')
-      .setLock('pessimistic_write')                       // 防并发（双方同时关闭）
+      .setLock('pessimistic_write')                    // 防双方同时关闭
       .where('c.id = :id', { id: conversationId })
       .getOne();
 
-    if (!conv) throw new NotFoundException('会话不存在');
+    if (!conv) return;                                 // 已关闭过：幂等，什么都不做
     if (conv.e2e_mode !== 1) throw new BadRequestException('不是私密会话');
-    if (conv.e2e_state === 4) return { already_closed: true };     // 幂等
 
-    // 权限：pending 仅发起设备可撤回；active 两台绑定设备都可关闭
-    const allowed = conv.e2e_state === 1
-      ? conv.e2e_device_a === deviceId
-      : conv.e2e_device_a === deviceId || conv.e2e_device_b === deviceId;
-    if (!allowed) throw new ForbiddenException('本设备无权操作该私密会话');
+    // 权限：pending 仅发起设备可撤回；active 两台绑定设备都可关闭；admin 不限
+    if (trigger !== 'admin') {
+      const allowed = conv.e2e_state === 1
+        ? conv.e2e_device_a === operatorDeviceId
+        : conv.e2e_device_a === operatorDeviceId || conv.e2e_device_b === operatorDeviceId;
+      if (!allowed) throw new ForbiddenException('本设备无权操作该私密会话');
+    }
 
-    const now = new Date();
-    await m.update(Conversation, conversationId, {
-      e2e_state: 4,
-      e2e_closed_at: now,
-      e2e_closed_by: deviceId,
-      e2e_close_reason: reason,
-      // e2e_pair_key 生成列自动变 NULL → 唯一约束释放 → 可立即重新发起
-    });
+    notifyDevices = [conv.e2e_device_a, conv.e2e_device_b].filter(Boolean) as string[];
 
-    // 消息：软删（复用焚毁链路，24h 后由 purge 物理删除）
-    const del = await m.createQueryBuilder()
-      .update(Message)
-      .set({ is_destroyed: true, destroyed_at: now, destroy_reason: 'e2e_closed' })
-      .where('conversation_id = :cid AND is_destroyed = 0', { cid: conversationId })
-      .execute();
+    // ① 附件：必须先删 OSS 对象（URL 存在消息行上，删行后就拿不到了）
+    const msgs = await m.createQueryBuilder()
+      .select(['m.id', 'm.file_url', 'm.file_original_url'])
+      .from(Message, 'm')
+      .where('m.conversation_id = :cid', { cid: conversationId })
+      .getRawMany();
+    for (const msg of msgs) {
+      await this.oss.deleteByUrl(msg.file_url);                // 内部已 try-catch
+      await this.oss.deleteByUrl(msg.file_original_url);
+    }
 
-    // 回执标记（不再需要计时）
-    await m.createQueryBuilder()
-      .update(MessageReceipt)
-      .set({ burn_at: now })
+    // ② 回执 / 墓碑
+    await m.createQueryBuilder().delete().from(MessageReceipt)
       .where('message_id IN (SELECT id FROM messages WHERE conversation_id = :cid)', { cid: conversationId })
       .execute();
+    await m.delete(MessageTombstone, { conversation_id: conversationId });
 
-    // 通知两台绑定设备（device room，不是 user room）
-    this.events.emitToDevices(
-      [conv.e2e_device_a, conv.e2e_device_b].filter(Boolean),
-      WS_EVENTS.E2E_CLOSED,
-      { conversation_id: conversationId, closed_by: deviceId, reason, closed_at: now.toISOString() },
-    );
+    // ③ 消息（密文随之物理消失）
+    const del = await m.delete(Message, { conversation_id: conversationId });
+    deletedMessages = del.affected ?? 0;
 
-    return { closed_at: now, deleted_messages: del.affected ?? 0 };
+    // ④ 会话级配置 / 成员
+    await m.createQueryBuilder().delete().from(BurnSetting)
+      .where("scope_type = 'conversation' AND scope_id = :cid", { cid: conversationId })
+      .execute();
+    await m.delete(ConversationMember, { conversation_id: conversationId });
+
+    // ⑤ 会话行本身（唯一约束随行删除自动释放）
+    await m.delete(Conversation, { id: conversationId });
   });
+
+  // ⑥ 提交后再广播（device room，不是 user room）
+  if (notifyDevices.length > 0) {
+    this.events.emitToDevices(notifyDevices, WS_EVENTS.E2E_CLOSED, {
+      conversation_id: conversationId,
+      trigger,
+    });
+  }
+
+  return { deleted_messages: deletedMessages };
 }
 ```
 
-### 7.2 物理删除（24 小时后）
+**要点说明**
 
-复用 `DestroyService.purge()` 链路（新增 `trigger='e2e_closed'`）：
+| 点 | 原因 |
+|---|---|
+| 先取 `notifyDevices`，提交后再广播 | 事务回滚时不能已经把"已结束"事件发出去 |
+| 附件先删 | 删行后 `file_url` 就丢了，OSS 对象会变成永久垃圾 |
+| 用 `m.delete(...)` 而不是 `update(... is_destroyed=1)` | 软删会留下带 `destroyed_at` 的行，等于留了痕迹 |
+| 不写 `audit_logs` | 审计表同样能反推"某天有人开过私密会话"，本方案**刻意不写** |
+| 应用日志也别打会话/用户 id | `logger.log('e2e closed conv=...')` 会留痕，只允许打"关闭成功"这种无标识日志 |
 
-```ts
-// burn.scheduler.ts purgeSweep 里已具备"扫描待删"能力，
-// 只需保证 e2e_closed 的消息在 24h 后满足 purge 条件（destroyed_at < now - 24h）
-```
-
-**附件删除**：`DestroyService.deleteAttachments()` 已删除 `file_url` / `file_original_url` 对应的 OSS 对象 —— 私密会话关闭后同样适用（见 `destroy.service.ts:302`）。
-
-### 7.3 绑定设备被移除时联动
+### 7.3 设备被移除时联动关闭
 
 ```ts
 // auth.service.removeDevice(userId, deviceId) 末尾追加
-async closeSecretChatsBoundTo(deviceId: string, reason = 'device_removed') {
-  const rows = await repo.createQueryBuilder('c')
+async closeSecretChatsBoundTo(deviceId: string, reason: 'device_removed' = 'device_removed') {
+  const rows = await this.dataSource.getRepository(Conversation)
+    .createQueryBuilder('c')
     .where('c.e2e_mode = 1 AND c.e2e_state IN (1,2)')
     .andWhere('(c.e2e_device_a = :d OR c.e2e_device_b = :d)', { d: deviceId })
     .getMany();
 
   for (const c of rows) {
-    await this.closeSecretChat(c.id, /* userId */ c.user_a, deviceId, reason);
+    await this.closeSecretChat(c.id, c.user_a, deviceId, reason);   // 同样是物理删除
   }
 }
 ```
 
 - 触发点：`POST /auth/devices/:deviceId/offline`、会话策略 `single`/`notify` 踢人、管理员强制下线
-- 通知：向对方设备发 `e2e:closed`（`reason='device_removed'`），前端提示"对方设备已下线，私密聊天已结束"
+- 通知：向对方绑定设备发 `e2e:closed`（`trigger='device_removed'`），前端提示"对方设备已下线，私密聊天已结束"
+- **注意**：设备被移除后，该设备上的私钥也就失效了（`device_keys` 行同时删除），即使客户端还留着本地缓存也无法再解密新消息
 
-### 7.4 关闭后服务端到底还留什么（**逐项明确**）
-
-私密会话"不留记录"要分**内容**和**元数据**两层看，两者处理方式不同：
-
-| 数据 | 关闭后 | 何时彻底消失 | 说明 |
-|---|---|---|---|
-| **消息正文（密文）** `messages.cipher_text` / `content` | 关闭时软删（`is_destroyed=1`） | **24 小时后物理删除** | 内容层：一定不留 |
-| **消息元数据**（谁发的、时间、类型） | 随消息行一起软删 | 24 小时后随行删除 | 内容层：不留 |
-| **附件**（`file_url` / `file_original_url` 指向的 OSS 对象） | 立即从 OSS 删除 | 即时 | `DestroyService.deleteAttachments()` |
-| **回执** `message_receipts` | 随消息级联删除 | 24 小时后 | — |
-| **墓碑** `message_tombstones` | 删除 | 即时 | 不留"这里曾有一条消息"的痕迹 |
-| **会话行** `conversations` | **保留**（仅元数据：谁和谁、开/关时间、关闭原因、绑定设备 id） | 取决于配置（见下） | 见下方三档 |
-| **审计日志** | 可选 | 取决于合规要求 | 谁在何时开了私密会话（不含内容） |
-
-#### 会话行的三档策略（需产品/合规拍板）
-
-| 档 | 行为 | 优点 | 缺点 | 建议 |
-|---|---|---|---|---|
-| **A. 保留元数据（默认）** | 会话行留下：`user_a/user_b`、`e2e_state=4`、`e2e_closed_at`、`e2e_close_reason`、`e2e_device_a/b`；消息与附件全清 | 可审计（"某天 A 和 B 开过一条私密会话，关闭原因=设备移除"）、客服排查、唯一约束自然释放 | 库里留一条"谁和谁开过私密会话"的记录 | ✅ 企业 IM 通常需要 |
-| **B. 保留 N 天后删除** | 同 A，但定时任务在 N 天后删除会话行与 `conversation_members` | 兼顾审计与最小化留存 | 多一个定时任务 | 合规要求"最小留存"时选 |
-| **C. 关闭即删除** | 会话行、members、消息、回执、墓碑全部立即物理删除 | 服务端零留存 | **无法审计、无法排查、无法回答"我明明开过"**；且删除后无法通知离线对方（只能等它拉列表时发现消失） | 除非合规明确要求，否则不建议 |
-
-**配置项**（建议）：
-
-```bash
-# 私密会话关闭后的会话行保留策略
-E2E_CLOSED_RETENTION=keep            # keep（默认，档 A）| 30d（档 B，N 天）| delete（档 C，立即删）
-```
-
-**注意**：无论选哪档，**内容（明文/密文/附件/附件地址）在 24 小时内一定全部消失**，"记录"只剩下"这两个人在某天开过一次私密会话"这一条元数据。
-
-> 补充一个容易误解的点：**E2E ≠ 服务端不暂存**。
-> 对方离线时，密文必须先在服务端排队，否则无法投递（Telegram 的 secret chat 同样如此——服务器在消息送达前也会暂存密文）。
-> 我们能控制的是"送达后/关闭后多久清理"，而不是"完全不经过服务端"。
-
-### 7.5 pending 过期
+### 7.4 pending 过期（同样是删行）
 
 ```ts
-// 新增 PresenceScheduler 同级定时任务（每小时）
+// 每 10 分钟扫一次
 @Cron('*/10 * * * *')
 async expireE2E() {
-  const r = await repo.createQueryBuilder()
-    .update(Conversation)
-    .set({ e2e_state: 5, e2e_close_reason: 'expired', e2e_closed_at: new Date() })
-    .where('e2e_mode = 1 AND e2e_state = 1 AND created_at < DATE_SUB(NOW(), INTERVAL 7 DAY)')
-    .execute();
-  // 向双方设备发 e2e:request_gone
+  const rows = await this.dataSource.getRepository(Conversation)
+    .createQueryBuilder('c')
+    .where('c.e2e_mode = 1 AND c.e2e_state = 1')
+    .andWhere('c.created_at < DATE_SUB(NOW(), INTERVAL 7 DAY)')
+    .getMany();
+
+  for (const c of rows) {
+    await this.closeSecretChat(c.id, c.user_a, c.e2e_device_a!, 'admin');   // 物理删除
+  }
+  if (rows.length > 0) this.logger.log(`Expired ${rows.length} e2e request(s)`);
 }
 ```
 
+> 不写 `expired` 状态、不写 `close_reason`：过期就是"这行不存在了"。
+
+### 7.5 关闭后服务端还剩什么（逐项核对）
+
+| 数据 | 关闭后 |
+|---|---|
+| `messages`（含 `cipher_text` / `content` / `file_url`） | ✅ 全部物理删除 |
+| `message_receipts` | ✅ 全部物理删除 |
+| `message_tombstones` | ✅ 全部物理删除 |
+| `conversation_members` | ✅ 全部物理删除 |
+| `conversations`（含 `user_a/user_b`、`e2e_device_a/b`） | ✅ **整行删除** |
+| `burn_settings`（会话级焚毁设置） | ✅ 删除 |
+| OSS 附件对象 | ✅ 立即删除 |
+| `audit_logs` | ✅ **刻意不写** |
+| `device_keys` | ⚠️ 保留（这是设备公钥，与具体会话无关，无法反推"和谁聊过"） |
+
+**结论：数据库里没有任何行/字段能指向"这两个人曾经有过一段私密会话"。**
+
+### 7.6 必须如实告知的"残余痕迹"（数据库之外）
+
+即使我们把表清干净，以下位置仍可能残留，属于**基础设施层面**，需要在运维策略上处理：
+
+| 位置 | 残留内容 | 保留期 | 缓解 |
+|---|---|---|---|
+| **MySQL binlog** | 删除前的 INSERT/UPDATE（含密文） | 默认 `expire_logs_days`/`binlog_expire_logs_seconds`（常见 7~30 天） | 缩短 binlog 保留期；开启加密 |
+| **数据库备份** | 备份文件里包含当期的会话与密文 | 取决于备份策略 | 备份加密；按合规要求定期销毁 |
+| **InnoDB 物理块 / undo log** | 已删行的页内残留 | 直到页被覆盖 | 对高敏感场景可评估 `innodb_undo` 与磁盘加密 |
+| **Nginx / 应用访问日志** | `POST /conversations/<uuid>/e2e-close` 之类的 URL | 日志保留期 | 关闭 access log 中的 query/param，或缩短保留 |
+| **客户端本地缓存** | 明文缓存（`bm_e2e_pt`）、本地会话快照 | 直到客户端清理 | 收到 `e2e:closed` 立即清空对应缓存 |
+| **对方设备** | 对方本地的历史消息（自己那份） | 直到对方清理 | 收到 `e2e:closed` 双方都清空本地缓存 |
+
+> 一句话：**服务端业务表可以做到零残留，但"物理世界"的痕迹需要配套的运维策略**（binlog、备份、日志）。
+> 这一条必须写进对客户/合规的说明里，不能承诺"绝对无痕"。
+
+### 7.7 一个容易误解的点：E2E ≠ 服务端不暂存
+
+对方离线时，密文必须先在服务端排队，否则无法投递 —— **Telegram 的 secret chat 同样如此**（服务器在消息送达前也会暂存密文）。
+
+我们能控制的是"关闭后多久清空 → 本方案是立即清空"，而不是"消息完全不经过服务端"。
+
 ---
+
 
 ## 8. WebSocket 事件（新增 4 个 + 1 个改造）
 
@@ -616,26 +657,28 @@ v2 可选方案：为设备单独注册 alias（`{userId}_{deviceIdHash}`），�
 | 12 | 关闭后立即重新发起 | ✅ 允许 |
 | 13 | 两条 pending 并发（同一对用户） | 唯一索引兜底，仅一条成功 |
 
-### 12.3 关闭
+### 12.3 关闭（物理删除）
 
 | # | 场景 | 期望 |
 |---|---|---|
 | 14 | A关闭 → B 在线 | 双方收到 `e2e:closed`，列表移除，本地缓存清空 |
 | 15 | A关闭 → B 离线 | B 下次登录列表无此会话，客户端对比后清理 |
 | 16 | 双方同时关闭 | 一次成功一次幂等（200） |
-| 17 | 绑定设备被踢 | 自动关闭，对方收到 `e2e:closed reason=device_removed` |
-| 18 | pending 7 天未处理 | 置 expired，双方设备收到 `e2e:request_gone` |
-| 19 | 关闭后 24h | 消息行与附件被物理删除；会话行保留（无内容） |
-| 20 | 关闭后再次发起 | 新会话、新密钥，与旧会话无关联 |
+| 17 | 绑定设备被踢 | 自动关闭，对方收到 `e2e:closed trigger=device_removed` |
+| 18 | pending 7 天未处理 | 定时任务**删除该行**，双方设备收事件后移除 |
+| 19 | 关闭后查库 | `conversations` / `messages` / `message_receipts` / `message_tombstones` / `conversation_members` 中**均查不到任何相关行** |
+| 20 | 关闭后查 `audit_logs` | 没有对应记录 |
+| 21 | 关闭后扫 `destroy_reason` | 不存在任何能指向私密会话的取值 |
+| 22 | 关闭后再次发起 | 新会话、新密钥，与旧会话无关联 |
 
 ### 12.4 安全
 
 | # | 场景 | 期望 |
 |---|---|---|
-| 21 | 私密会话用明文发送 | 400（强制加密） |
-| 22 | 伪造 `device_id` 调 accept | 用 JWT 的 deviceId，body 传参被忽略 |
-| 23 | 管理端查询私密会话 | 只有元数据，不返回 `cipher_text` |
-| 24 | 其他设备的 WS | 收不到该私密会话任何事件 |
+| 23 | 私密会话用明文发送 | 400（强制加密） |
+| 24 | 伪造 `device_id` 调 accept | 用 JWT 的 deviceId，body 传参被忽略 |
+| 25 | 管理端查询私密会话 | 只有元数据，不返回 `cipher_text` |
+| 26 | 其他设备的 WS | 收不到该私密会话任何事件 |
 
 ---
 
@@ -643,13 +686,13 @@ v2 可选方案：为设备单独注册 alias（`{userId}_{deviceIdHash}`），�
 
 | 阶段 | 内容 | 估时 |
 |---|---|---|
-| 后端 P1 | 3 个迁移 + 状态机 + 6 个接口（不含可见性改造） | 2.5 天 |
+| 后端 P1 | 2 个迁移 + 状态机 + 6 个接口（不含可见性改造） | 2.5 天 |
 | 后端 P2 | 10 处可见性改造 + WS device room 分流 + 推送跳过 | 2 天 |
-| 后端 P3 | 关闭/联动/过期 + 单测（≈25 例） | 2 天 |
+| 后端 P3 | 关闭(物理删除)/联动/过期 + 单测（≈26 例） | 2 天 |
 | 后端 P4 | 联调修复 + 管理端适配 | 1 天 |
 | **后端合计** | | **约 7.5 天** |
 | 前端 | 设备密钥、请求/接受/关闭 UI、列表分区、解密分支 | 5~7 天 |
-| 测试 | 24 条用例 × 多设备矩阵 | 3~4 天 |
+| 测试 | 26 条用例 × 多设备矩阵 | 3~4 天 |
 
 **建议排期**：后端先做 P1+P2（4.5 天）产出一个可联调的版本，前端并行开发；P3 在前端联调期间完成。
 
@@ -660,12 +703,12 @@ v2 可选方案：为设备单独注册 alias（`{userId}_{deviceIdHash}`），�
 | # | 问题 | 备选 | 建议 |
 |---|---|---|---|
 | 1 | pending 有效期 | 3 / 7 / 30 天 | **7 天** |
-| 2 | 关闭后消息保留缓冲 | 0 / 24h / 7d | **24h**（本次采用） |
-| 3 | 是否需要"管理端强制关闭" | 是/否 | **是**（设备丢失场景必备，需审计日志）|
+| 2 | 关闭后服务端留存 | 留元数据 / **零留存** | **零留存**（关闭即物理删除，见 §7） |
+| 3 | 是否需要"管理端强制关闭" | 是/否 | **是**（设备丢失场景必备；注意：该操作也不写审计）|
 | 4 | 私密会话是否也支持焚毁时长 | 是/否 | 否（v1 简化，整会话关闭即销毁）|
 | 5 | 同一对用户是否允许多条 active | 是/否 | **否**（已被唯一约束约束）|
 | 6 | 私密会话入口开关 | 环境变量 / 数据库开关 | **环境变量** `E2E_SECRET_CHAT_ENABLED` |
-| 7 | 关闭后会话元数据留存 | keep / 30d / delete | **keep**（可审计；见 §7.4，配置 E2E_CLOSED_RETENTION）|
+| 7 | binlog / 备份 / 访问日志的保留期 | 7 / 30 / 90 天 | 由运维定；**需在合规说明里写明"业务表零残留，物理介质按运维策略清理"**（见 §7.6）|
 
 ---
 
@@ -676,6 +719,11 @@ v2 可选方案：为设备单独注册 alias（`{userId}_{deviceIdHash}`），�
 | 密钥维度 | 用户（`user_keys`，覆盖） | **设备**（`device_keys`，互不覆盖） |
 | 会话可见性 | 用户级（所有设备） | **设备级**（仅绑定设备） |
 | 多设备 | 互相覆盖，只有一台能解 | 各设备独立会话，互不影响 |
-| 关闭语义 | 无 | **显式关闭 → 内容销毁 → 可重新发起** |
+| 关闭语义 | 无 | **关闭 = 物理删除**（会话行/消息/回执/成员/附件全删，可立即重新发起） |
+| 关闭后残留 | — | **业务表零残留**；binlog/备份/日志由运维策略处理（§7.6） |
 | 唯一性 | 无 | 一对用户同一时间仅一条 pending/active |
+| 结束状态 | — | 不设 closed/rejected/expired 状态，删行即结束 |
+| 审计 | — | **刻意不写**（避免反推"曾经有过私密会话"） |
 | 推送 | 用户级 | 私密会话不推（v1） |
+| 迁移数量 | — | **2 个**（conversations 扩展、device_keys 建表） |
+
