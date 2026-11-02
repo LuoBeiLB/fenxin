@@ -20,19 +20,13 @@ import { EventsGateway } from '../events/events.gateway';
 import { WS_EVENTS } from '../events/events.types';
 import { OssService } from '../upload/oss.service';
 import { SecretChatAcceptResult, SecretChatMutationResult, SecretChatRequestResult } from './dto/response';
+import { E2E_STATE, PENDING_TTL_DAYS } from './e2e.constants';
 
 /** 关闭触发方：用户主动 / 绑定设备被移除 / 管理员强制 / 过期清理 */
 export type SecretChatTrigger = 'user' | 'device_removed' | 'admin';
 
-/** 私有会话状态（与 conversations.e2e_state 对应） */
-export const E2E_STATE = {
-  NONE: 0,
-  PENDING: 1,
-  ACTIVE: 2,
-} as const;
-
-/** pending 有效期（天） */
-const PENDING_TTL_DAYS = 7;
+/** 状态与有效期统一从 e2e.constants 取，避免各模块各写一份 */
+export { E2E_STATE } from './e2e.constants';
 
 /**
  * 设备配对私密会话（Secret Chat，V6.2）。
@@ -125,7 +119,7 @@ export class E2eService {
   ): Promise<SecretChatAcceptResult> {
     if (!deviceId) throw new BadRequestException('缺少设备上下文，请重新登录');
 
-    const conv = await this.loadConversation(conversationId);
+    const conv = await this.requireConversation(conversationId);
     this.assertParticipant(conv, userId);
     if (conv.e2e_state !== E2E_STATE.PENDING) {
       throw new ConflictException({ code: 'E2E_STATE_INVALID', message: '该请求已被处理' });
@@ -182,7 +176,7 @@ export class E2eService {
     userId: string,
     deviceId: string,
   ): Promise<SecretChatMutationResult> {
-    const conv = await this.loadConversation(conversationId);
+    const conv = await this.requireConversation(conversationId);
     this.assertParticipant(conv, userId);
     if (conv.e2e_state !== E2E_STATE.PENDING) {
       throw new ConflictException({ code: 'E2E_STATE_INVALID', message: '该请求已被处理' });
@@ -314,6 +308,22 @@ export class E2eService {
   /** 读取会话（不存在返回 null，供幂等关闭使用） */
   private async loadConversation(id: string): Promise<Conversation | null> {
     return this.dataSource.getRepository(Conversation).findOne({ where: { id } });
+  }
+
+  /**
+   * 读取会话，不存在直接 404 E2E_SESSION_GONE。
+   * accept / reject 用这个：传不存在的 id 不能是一句「服务器内部错误」，
+   * 前端要能区分「这条请求已被处理/已过期」而直接把它从列表里移除。
+   */
+  private async requireConversation(id: string): Promise<Conversation> {
+    const conv = await this.loadConversation(id);
+    if (!conv) {
+      throw new NotFoundException({
+        code: 'E2E_SESSION_GONE',
+        message: '私密会话不存在（可能已被对方关闭、撤回或过期）',
+      });
+    }
+    return conv;
   }
 
   private assertParticipant(conv: Conversation, userId: string): void {

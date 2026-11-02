@@ -263,6 +263,14 @@ describe('E2eService · 发起私密聊天', () => {
 });
 
 describe('E2eService · 接受', () => {
+  it('会话不存在 → 404 E2E_SESSION_GONE（不能是 500）', async () => {
+    const { service } = makeService({ conversation: null });
+    await expect(service.acceptSecretChat('not-exist', USER_B, DEV_B)).rejects.toMatchObject({
+      status: 404,
+      response: expect.objectContaining({ code: 'E2E_SESSION_GONE' }),
+    });
+  });
+
   it('非成员 → 403', async () => {
     const { service } = makeService({ conversation: pendingConv() });
     await expect(service.acceptSecretChat(CONV, 'stranger', DEV_B)).rejects.toBeInstanceOf(
@@ -301,6 +309,14 @@ describe('E2eService · 接受', () => {
 });
 
 describe('E2eService · 拒绝', () => {
+  it('会话不存在 → 404 E2E_SESSION_GONE（不能是 500）', async () => {
+    const { service } = makeService({ conversation: null });
+    await expect(service.rejectSecretChat('not-exist', USER_B, DEV_B)).rejects.toMatchObject({
+      status: 404,
+      response: expect.objectContaining({ code: 'E2E_SESSION_GONE' }),
+    });
+  });
+
   it('发起方不能"拒绝"（应撤回）→ 400', async () => {
     const { service } = makeService({ conversation: pendingConv() });
     await expect(service.rejectSecretChat(CONV, USER_A, DEV_A)).rejects.toBeInstanceOf(

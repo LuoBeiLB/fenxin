@@ -3,10 +3,13 @@ import { ApiProperty } from '@nestjs/swagger';
 
 /**
  * X25519 公钥 base64 编码后的字符串。
- * 32 字节 → 标准 base64 44 字符（带 padding），URL-safe base64 43 字符（无 padding）。
- * 校验：43 或 44 字符，base64 字符集（A-Za-z0-9+/=-_）。
+ * 32 字节 → 标准 base64 44 字符（**结尾一个 =**），URL-safe/去填充 43 字符。
+ *
+ * 两种都接受（不同语言的标准库默认行为不同，例如 JS 的 btoa 带 '='、
+ * Go 的 RawURLEncoding 不带），服务端统一**去掉尾部 '=' 后按 43 字符存储**。
+ * 正则：43 个 base64 字符 + 可选的一个 '='。
  */
-const PUBKEY_BASE64_RE = /^[A-Za-z0-9+/_-]{43,44}$/;
+const PUBKEY_BASE64_RE = /^[A-Za-z0-9+/_-]{43}=?$/;
 
 /**
  * 上传本设备的 X25519 identity 公钥。

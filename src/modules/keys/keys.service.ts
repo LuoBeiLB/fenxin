@@ -11,6 +11,11 @@ import { Conversation } from '../../entities/conversation.entity';
 import { ConversationMember } from '../../entities/conversation-member.entity';
 import { DeviceKeyUploadResult, MyDeviceKeyView, PeerDeviceKeyView } from './dto/response';
 
+/** 去掉 base64 尾部填充：43 位无填充是服务端唯一存储形态 */
+export function normalizePubkey(pubkey: string): string {
+  return (pubkey || '').replace(/=+$/, '');
+}
+
 /**
  * 设备级加密密钥（V6.2 设备配对私密会话）。
  *
@@ -41,6 +46,12 @@ export class KeysService {
   ): Promise<DeviceKeyUploadResult> {
     if (!deviceId) throw new BadRequestException('缺少设备上下文，请重新登录');
 
+    // B3：统一去掉 base64 尾部的 '='（43 位无填充存储）。
+    // 不同语言的标准库行为不同（JS btoa 带 '='，RawURLEncoding 不带），
+    // 服务端只认一种形态，否则同一把公钥会因为 padding 差异被当成"密钥轮换"，
+    // 触发 TOFU 告警（"对方安全密钥已变更"）。
+    const pubkey = normalizePubkey(identityPubkey);
+
     const repo = this.dataSource.getRepository(DeviceKey);
     const existing = await repo.findOne({
       where: { user_id: userId, device_id: deviceId },
@@ -48,13 +59,13 @@ export class KeysService {
     });
 
     if (existing) {
-      if (existing.identity_pubkey === identityPubkey) return { updated: false };
-      await repo.update(existing.id, { identity_pubkey: identityPubkey });
+      if (normalizePubkey(existing.identity_pubkey) === pubkey) return { updated: false };
+      await repo.update(existing.id, { identity_pubkey: pubkey });
       this.logger.log(`device key rotated user=${userId} device=${deviceId}`);
       return { updated: true };
     }
 
-    await repo.save(repo.create({ user_id: userId, device_id: deviceId, identity_pubkey: identityPubkey }));
+    await repo.save(repo.create({ user_id: userId, device_id: deviceId, identity_pubkey: pubkey }));
     this.logger.log(`device key created user=${userId} device=${deviceId}`);
     return { updated: true };
   }

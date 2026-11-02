@@ -115,6 +115,31 @@ describe('KeysService（V6.2 设备级密钥）', () => {
         BadRequestException,
       );
     });
+
+    it('B3：带 = 填充的 44 字符与无填充 43 字符视为同一把钥匙（去填充后存储）', async () => {
+      const raw = 'p'.repeat(43);
+      const padded = raw + '=';
+
+      // 先上传带填充的 → 落库应是去填充的 43 位
+      const first = makeService({ deviceKey: null });
+      await first.service.uploadDeviceKey(USER, DEVICE, padded);
+      expect(first.created[0].identity_pubkey).toBe(raw);
+
+      // 库里已是 43 位，再传带填充的 → 幂等，不写库（不能误判成密钥轮换）
+      const second = makeService({
+        deviceKey: { id: 'k-1', user_id: USER, device_id: DEVICE, identity_pubkey: raw },
+      });
+      const r2 = await second.service.uploadDeviceKey(USER, DEVICE, padded);
+      expect(r2.updated).toBe(false);
+      expect(second.updated).toHaveLength(0);
+
+      // 反过来：库里是带填充的历史数据，传无填充的也判等
+      const third = makeService({
+        deviceKey: { id: 'k-2', user_id: USER, device_id: DEVICE, identity_pubkey: padded },
+      });
+      const r3 = await third.service.uploadDeviceKey(USER, DEVICE, raw);
+      expect(r3.updated).toBe(false);
+    });
   });
 
   describe('查询', () => {

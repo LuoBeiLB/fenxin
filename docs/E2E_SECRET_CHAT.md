@@ -297,7 +297,10 @@ Content-Type: application/json
 | 2 active | `e2e_device_a` 或 `e2e_device_b` | 结束会话 |
 | 3/4/5 | — | 幂等返回 200（`already_closed`），或 409 |
 
-**幂等**：重复调用返回同一结果，不报错。
+**幂等**：重复调用返回同一结果，不报错（会话已不存在时返回 `deleted: true` / 0 条消息）。
+
+> `e2e-accept` / `e2e-reject` 传不存在的 id 时返回 **404 `E2E_SESSION_GONE`**（不是 500），
+> 前端据此直接把该请求从列表移除。
 
 ### 5.5 上传本设备公钥
 
@@ -308,7 +311,9 @@ POST /api/v1/keys/device
 
 - `user_id` + `device_id` 均取自 JWT，**不接受 body 传参**
 - upsert（同一设备重复上传 = 更新；不同设备互不覆盖）
-- 首建或变更时向该用户的**共同会话用户**广播 `slot:key:changed`（见 §8）
+- **编码**：`identity_pubkey` 接受 43 字符（无填充）与 44 字符（结尾带一个 `=`）两种写法，
+  服务端统一去掉尾部 `=` 后按 43 字符存储 —— 两种写法视为同一把钥匙，不会误判成密钥轮换触发 TOFU 告警
+- 限流 5 次/分钟（自动化测试连续调用会 429，需留间隔）
 - 响应：`{ "updated": true|false }`
 
 ### 5.6 查询对方设备公钥（已按"可选优化"实现）
@@ -393,7 +398,7 @@ AND (
   "type": "private",
   "e2e_mode": 1,
   "e2e_state": 2,                    // 1=pending 2=active
-  "e2e_expires_at": "2026-11-03T10:00:00Z",   // 仅 pending
+  "e2e_expires_at": "2026-11-03T10:00:00Z",   // pending = created_at + 7 天；active/null 为 null
   "is_bound_device": true,           // 当前设备是否为绑定设备
   "other_user": { "id": "...", "display_name": "..." },
   "peer_device_id": "uuid",          // 对方绑定的设备（active 时才有）
@@ -683,8 +688,9 @@ v2 可选方案：为设备单独注册 alias（`{userId}_{deviceIdHash}`），�
 | 404 | `E2E_KEY_MISSING` | 目标设备未上传公钥 |
 | 409 | `E2E_PAIR_EXISTS` | 同对用户已有 pending/active（返回已有 conversation_id）|
 | 409 | `E2E_STATE_INVALID` | 状态不允许该操作（如对 active 调 accept）|
+| 404 | `E2E_SESSION_GONE` | accept/reject 时会话不存在（已被关闭/撤回/过期）—— 不是 500 |
 | 410 | `E2E_EXPIRED` | pending 已过期 |
-| 410 | `E2E_SESSION_GONE` | 会话已被对方关闭/设备移除 |
+| 410 | `E2E_SESSION_GONE` | 发消息时会话已被对方关闭/设备移除 |
 
 ---
 
@@ -834,9 +840,10 @@ v2 可选方案：为设备单独注册 alias（`{userId}_{deviceIdHash}`），�
 
 ```
 tsc --noEmit      : 0 error
-jest (--runInBand): 28 suites / 259 tests 全绿
-  · test/modules/secret-chat/e2e.service.spec.ts  16 条
-  · test/modules/keys/keys.service.spec.ts        13 条（重写为设备级）
+jest (--runInBand): 29 suites / 265 tests 全绿
+  · test/modules/secret-chat/e2e.service.spec.ts       18 条（含 404 E2E_SESSION_GONE）
+  · test/modules/secret-chat/conversation-list.spec.ts  3 条（e2e_expires_at / 绑定设备字段）
+  · test/modules/keys/keys.service.spec.ts             14 条（重写为设备级 + padding 归一化）
 ```
 
 ### 16.5 迁移实跑验证（本地 MySQL 5.7.26，库 `yy`）
@@ -857,3 +864,13 @@ jest (--runInBand): 28 suites / 259 tests 全绿
 > `tinyint DEFAULT 0`、`utf8mb4_unicode_ci`）两者都支持。上线前仍建议在测试机（8.x 容器）再跑一遍。
 >
 > `user_keys` 的 5 行数据已在 DROP 前备份到 `tmp-schema/user_keys-backup.json`（未提交，本地文件）。
+
+### 16.6 联调缺陷修复（2026-11-02，B1~B3）
+
+| # | 问题 | 根因 | 修复 |
+|---|---|---|---|
+| B1 | `e2e-accept` / `e2e-reject` 传不存在的 id 返回 **500** | `loadConversation` 返回 null 后直接 `assertParticipant(conv)` → TypeError | 新增 `requireConversation()`，走 **404 `E2E_SESSION_GONE`**；`close` 仍用可空版本保持幂等 |
+| B2 | pending 会话的 `e2e_expires_at` 返回 **null** | 列表只返回了 `is_bound_device` / `peer_device_id`，没算过期时间 | 抽出 `e2e.constants.ts`（`PENDING_TTL_DAYS=7` + `pendingExpiresAt()`），列表与单个会话都返回 `created_at + 7d` |
+| B3 | `POST /keys/device` 只接受 43 字符无填充，文档写 44 字符 | DTO 正则 `{43,44}` 不包含 `=`，而 32 字节 base64 是 43 字符 + 1 个 `=` | 正则改 `[A-Za-z0-9+/_-]{43}=?`；服务端 `normalizePubkey()` 去填充后按 43 位存储；文档改为「两种都接受」 |
+
+> 附带：`POST /keys/device` 限流 5 次/分钟，连续联调会 429，测试脚本需留间隔。

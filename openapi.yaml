@@ -5289,8 +5289,12 @@ paths:
         - 新接口按 (user_id, device_id) 存储，每台设备一把，互不覆盖；
         - device_id 一律取自 JWT，不接受 body 传参（防伪造覆盖他人公钥）。
 
+        【编码】43 字符（无填充）与 44 字符（结尾带一个 "="）**都接受** ——
+        不同语言标准库默认行为不同（JS btoa 带 "="，Go RawURLEncoding 不带）；
+        服务端统一去掉尾部 "=" 后按 43 字符存储，因此两种写法视为同一把钥匙（不会误判为密钥轮换）。
+
         【幂等】相同公钥重复上传返回 updated=false，不写库。
-        【限流】5 次/分钟。
+        【限流】5 次/分钟（自动化测试连续调用会触发 429，需留间隔）。
       requestBody:
         required: true
         content:
@@ -5514,6 +5518,11 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: 会话不存在或已被处理（E2E_SESSION_GONE）—— 前端应直接把该请求从列表移除，而不是提示"服务器内部错误"
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '410':
           description: 请求已过期（E2E_EXPIRED）
           content:
@@ -5557,6 +5566,11 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '403':
           description: 不是该会话成员
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: 会话不存在或已被处理（E2E_SESSION_GONE）
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -6185,6 +6199,34 @@ components:
           type: integer
           description: 成员数
           example: 12
+        e2e_mode:
+          type: integer
+          enum: [0, 1]
+          description: V6.2：0=普通会话（所有成员设备可见）1=设备配对私密会话（仅两台绑定设备可见）
+          example: 0
+        e2e_state:
+          type: integer
+          enum: [0, 1, 2]
+          description: V6.2：0=非私密 1=pending 待接受（双方所有设备可见，作为"请求"）2=active 已激活（仅绑定设备可见）
+          example: 0
+        e2e_expires_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: |-
+            V6.2：pending 私密会话的绝对过期时间（= created_at + 7 天），前端据此显示"剩余 N 天"与右上角角标。
+            active 会话与非私密会话为 null。
+          example: '2026-11-19T00:00:00.000Z'
+        is_bound_device:
+          type: boolean
+          description: V6.2：当前请求设备是否该私密会话的绑定设备（active 时才有意义）
+          example: false
+        peer_device_id:
+          type: string
+          nullable: true
+          description: V6.2：对方绑定的设备 ID（active 私密会话才有；非绑定设备拿到的是 null）
+          example: null
+
         unread_count:
           type: integer
           nullable: true

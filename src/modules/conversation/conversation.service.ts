@@ -7,6 +7,7 @@ import { Message } from '../../entities/message.entity';
 import { MessageReceipt } from '../../entities/message-receipt.entity';
 import { EventsGateway } from '../events/events.gateway';
 import { WS_EVENTS } from '../events/events.types';
+import { pendingExpiresAt } from '../e2e/e2e.constants';
 
 @Injectable()
 export class ConversationService {
@@ -117,6 +118,12 @@ export class ConversationService {
                 ? conv.e2e_device_b
                 : conv.e2e_device_a
               : null,
+          // B2：pending 请求要能在前端显示"剩余 N 天"与右上角角标，
+          // 必须给出绝对过期时间（= created_at + 7 天），不能返回 null
+          e2e_expires_at:
+            conv.e2e_mode === 1 && conv.e2e_state === 1
+              ? pendingExpiresAt(conv.created_at)
+              : null,
         };
         if (conv.type === 'private') {
           const members = await memberRepo.find({ where: { conversation_id: conv.id } });
@@ -149,6 +156,12 @@ export class ConversationService {
       const bound = !!deviceId && (conv.e2e_device_a === deviceId || conv.e2e_device_b === deviceId);
       if (!bound) throw new ForbiddenException('本设备无权访问该私密会话');
     }
-    return conv;
+
+    // 单个会话查询也要带 e2e_expires_at（与列表保持一致）
+    return {
+      ...conv,
+      e2e_expires_at:
+        conv.e2e_mode === 1 && conv.e2e_state === 1 ? pendingExpiresAt(conv.created_at) : null,
+    };
   }
 }
