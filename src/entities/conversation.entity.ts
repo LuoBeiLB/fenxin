@@ -6,6 +6,8 @@ export type ConversationType = 'private' | 'group' | 'channel';
 export type ChannelVisibility = 'public' | 'private';
 
 @Entity('conversations')
+// 私密会话列表过滤用（V6.2）：与迁移 1768200000000 的 idx_e2e_state 一致
+@Index('idx_e2e_state', ['e2e_mode', 'e2e_state'])
 export class Conversation {
   @PrimaryGeneratedColumn('uuid')
   id: string;
@@ -53,8 +55,10 @@ export class Conversation {
   /**
    * 0 = 普通会话（云端，所有成员设备可见）
    * 1 = 设备配对私密会话（仅两台绑定设备可见）
+   *
+   * 索引 `idx_e2e_state (e2e_mode, e2e_state)` 在类级别声明（见文件末尾 @Index），
+   * 与迁移 1768200000000 保持一致；不要在属性上单独声明，否则会与迁移里的复合索引不一致。
    */
-  @Index('idx_e2e_state')
   @Column({ type: 'tinyint', default: 0 })
   e2e_mode: number;
 

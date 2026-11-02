@@ -118,11 +118,38 @@ docker exec fenxin-backend node node_modules/typeorm/cli.js migration:run -d dis
 
 ### 3.4 `DB_SYNC` 必须为 false
 
-`synchronize` 会与迁移抢改表，**且实测会删除迁移创建的索引**。生产与开发环境都保持：
+`synchronize` 会与迁移抢改表，**且实测会删除迁移创建的索引与生成列**。生产与开发环境都保持：
 
 ```bash
 DB_SYNC=false
 ```
+
+#### 为什么 DB_SYNC=true 会在「有生成列」的库上直接启动失败
+
+2026-11-02 实际故障：`conversations.e2e_pair_key` 是数据库生成列（STORED GENERATED）。
+TypeORM 在 **synchronize 模式**下读表结构时，会为每个生成列查询自己的簿记表：
+
+```sql
+SELECT * FROM typeorm_metadata
+ WHERE type = 'GENERATED_COLUMN' AND name = 'e2e_pair_key' ...
+```
+
+而 `typeorm_metadata` 在本项目从来不存在（只用迁移，从没触发过 TypeORM 建表），
+且这次查询发生在 TypeORM **建表之前** → 鸡生蛋，启动直接失败：
+
+```
+QueryFailedError: Table 'yy.typeorm_metadata' doesn't exist
+[Nest] ERROR [TypeOrmModule] Unable to connect to the database. Retrying (1)...
+```
+
+**已由迁移 `1768200003000-AddTypeormMetadata` 补建该表**（并把现有生成列登记进去），
+因此现在误开 `DB_SYNC=true` 也不会再启动失败 —— 但**仍然不要开**：
+同步模式会把迁移建的 `uk_e2e_pair` / `idx_e2e_state` / `idx_e2e_devices` 与
+`e2e_pair_key` 生成列全部删掉（本项目已实测复现多次）。
+
+> 若已经误开过一次导致索引/生成列丢失：删掉对应迁移记录后重跑迁移即可自愈
+> （迁移都带 `hasColumn`/`hasIndex` 判断，缺什么补什么）：
+> `DELETE FROM typeorm_migrations WHERE name IN (...)` 然后 `migration:run`。
 
 ---
 

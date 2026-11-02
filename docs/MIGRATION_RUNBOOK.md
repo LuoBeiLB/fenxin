@@ -2,7 +2,7 @@
 
 > 适用：`fenxin-server` 部署 / 升级
 > 最后更新：2026-10-26
-> 结论先行：**这个项目的库从来没有跑过迁移，新版本上线必须跑一次 `migration:run`**（共 13 个，全部幂等）。
+> 结论先行：**这个项目的库从来没有跑过迁移，新版本上线必须跑一次 `migration:run`**（共 14 个，全部幂等）。
 
 ---
 
@@ -62,7 +62,7 @@ DB_SYNC=true（.env）→ 表都是 synchronize 自动建的
 > `messages.media_duration`、`messages.is_destroyed`、`conversation_members.muted`、
 > `conversations.ai_enabled`、`message_receipts.is_delivered`。
 
-**所以：全部 13 个迁移都会"从头"执行，但因为每个都带 `hasColumn`/`hasTable` 判断，
+**所以：全部 14 个迁移都会"从头"执行，但因为每个都带 `hasColumn`/`hasTable` 判断，
 已存在的对象会跳过，不会报 `Duplicate column name`。**
 
 ---
@@ -203,3 +203,42 @@ ALTER TABLE messages
 ```
 备份 → DB_SYNC=false → migration:run → 验证 FULLTEXT/表/字段 → 重启服务 → 冒烟搜索
 ```
+
+## 排障：启动报 `Table 'yy.typeorm_metadata' doesn't exist`
+
+**症状**：`npm run start:dev` 起不来，日志刷：
+
+```
+QueryFailedError: Table 'yy.typeorm_metadata' doesn't exist
+[Nest] ERROR [TypeOrmModule] Unable to connect to the database. Retrying (1)...
+```
+
+**原因**：开了 `DB_SYNC=true`，而库里有**生成列**（`conversations.e2e_pair_key`）。
+TypeORM 同步模式读表结构时会给每个生成列查 `typeorm_metadata`，这张表没建过 → 直接失败。
+
+**处理（按顺序）**：
+
+```bash
+# 1. 关掉同步（必须；开着会删掉迁移建的索引和生成列）
+#    .env 或容器环境变量里改成：
+DB_SYNC=false
+
+# 2. 补建 TypeORM 簿记表（迁移 1768200003000 已包含，跑一次即可）
+npm run migration:run
+
+# 3. 确认迁移全部执行
+npm run migration:show     # 应全为 [X]
+```
+
+**如果之前误开过 DB_SYNC=true**，索引/生成列可能已被删掉，用迁移自愈：
+
+```sql
+DELETE FROM typeorm_migrations
+ WHERE name IN ('AddSecretChatFields1768200000000',
+                'AddDeviceKeys1768200001000',
+                'DropUserKeys1768200002000',
+                'AddTypeormMetadata1768200003000');
+```
+
+然后重新 `npm run migration:run`（迁移幂等，缺什么补什么）。
+

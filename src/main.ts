@@ -14,6 +14,22 @@ async function bootstrap() {
   const uploadDir = path.resolve(process.cwd(), process.env.UPLOAD_DIR || './uploads');
   fs.mkdirSync(uploadDir, { recursive: true });
 
+  // DB_SYNC=true 是危险配置：TypeORM 会按实体重建表结构，
+  // 实测会删掉迁移创建的索引（含 FULLTEXT）与生成列，导致会话列表/search 慢查询甚至报错。
+  // 这里不直接退出（兼容首次建库的场景），但必须在启动日志里显眼地警告。
+  if ((process.env.DB_SYNC || 'false') === 'true') {
+    // eslint-disable-next-line no-console
+    console.error(
+      '\n' +
+        '======================================================================\n' +
+        '  ⚠️  DB_SYNC=true 已开启：TypeORM 将按实体同步表结构！\n' +
+        '  · 会删除迁移创建的索引（含 messages 全文索引）与生成列 e2e_pair_key\n' +
+        '  · 表结构请一律用迁移管理：DB_SYNC=false + migration:run\n' +
+        '  · 首次建库可以临时打开，建完立刻关掉\n' +
+        '======================================================================\n',
+    );
+  }
+
   // bufferLogs + useLogger：让所有 NestJS Logger（含各 service 内 new Logger('X')）都走 pino，
   // 输出结构化 JSON（生产）或带色 pretty 行（开发）
   const app = await NestFactory.create<NestExpressApplication>(AppModule, {

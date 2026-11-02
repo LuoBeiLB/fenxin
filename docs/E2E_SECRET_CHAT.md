@@ -2,7 +2,7 @@
 
 > 版本：v1.1（已实现）
 > 状态：**后端已实现**（2026-10-30），前端待对接
-> 实现：迁移 3 个 · 接口 7 个 · 单测 16 条（e2e）+ 13 条（keys）
+> 实现：迁移 4 个 · 接口 7 个 · 单测 16 条（e2e）+ 13 条（keys）
 > 关联文档：[E2E_ENCRYPTION.md](./E2E_ENCRYPTION.md) · [TOFU_FRONTEND.md](./TOFU_FRONTEND.md) · [websocket-events.md](./websocket-events.md)
 > 参考模型：Telegram Secret Chat
 
@@ -790,13 +790,14 @@ v2 可选方案：为设备单独注册 alias（`{userId}_{deviceIdHash}`），�
 
 ## 16. 实现记录（2026-10-30）
 
-### 16.1 迁移（3 个，全部幂等）
+### 16.1 迁移（4 个，全部幂等）
 
 | 文件 | 内容 |
 |---|---|
 | `1768200000000-AddSecretChatFields.ts` | conversations 加 6 列 + `e2e_pair_key` 生成列 + `uk_e2e_pair` 唯一索引 + 2 个普通索引 |
 | `1768200001000-AddDeviceKeys.ts` | 建 `device_keys` 表（`uk_device_keys_user_device` 唯一） |
 | `1768200002000-DropUserKeys.ts` | `DROP TABLE user_keys`（down() 只能重建空表，数据不可恢复） |
+| `1768200003000-AddTypeormMetadata.ts` | 补建 TypeORM 簿记表 `typeorm_metadata` 并登记 `e2e_pair_key` 生成列（修复 `DB_SYNC=true` 时启动报错，见 AGENTS.md §3.4） |
 
 ### 16.2 接口（7 个）
 
