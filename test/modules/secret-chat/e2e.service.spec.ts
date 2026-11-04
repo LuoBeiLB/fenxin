@@ -65,6 +65,9 @@ function makeService(opts: {
   relQb?: QbResult;
   existingPair?: any;
   transactionImpl?: (m: any) => Promise<any>;
+  /** V6.2.1：listMine / 409 / 僵尸清理用到的设备与用户数据 */
+  devices?: any[];
+  peers?: any[];
 } = {}) {
   const calls: string[] = [];
   const emitted: Array<{ type: string; event: string; targets: any; payload: any }> = [];
@@ -146,6 +149,7 @@ function makeService(opts: {
 
   const userRepo: any = {
     findOne: jest.fn(async () => ({ id: USER_B, display_name: 'Bob' })),
+    find: jest.fn(async () => opts.peers ?? []),
   };
 
   const deviceRepo: any = {
@@ -154,6 +158,10 @@ function makeService(opts: {
       deviceQbIdx += 1;
       return qb(next ?? { many: [] });
     }),
+    find: jest.fn(async () => opts.devices ?? []),
+    findOne: jest.fn(
+      async ({ where }: any) => (opts.devices ?? []).find((d: any) => d.id === where.id) ?? null,
+    ),
   };
 
   const manager: any = {
@@ -342,11 +350,21 @@ describe('E2eService · 关闭（物理删除）', () => {
     expect(dataSource.transaction).not.toHaveBeenCalled();
   });
 
-  it('非绑定设备 → 403', async () => {
+  it('V6.2.1：同一用户的「非绑定设备」也能结束自己名下的会话（解开换设备死锁）', async () => {
+    const { service, deleted } = makeService({
+      conversation: activeConv(),
+      msgQbs: [{ many: [] }],
+    });
+    const r = await service.closeSecretChat(CONV, USER_A, 'new-device-after-relogin', 'user');
+    expect(r.deleted).toBe(true);
+    expect(deleted.some((d) => d.entity === 'Conversation')).toBe(true);
+  });
+
+  it('非参与者的设备 → 403', async () => {
     const { service } = makeService({ conversation: activeConv() });
-    await expect(service.closeSecretChat(CONV, USER_A, 'stranger-device')).rejects.toBeInstanceOf(
-      ForbiddenException,
-    );
+    await expect(
+      service.closeSecretChat(CONV, 'stranger-user', 'stranger-device', 'user'),
+    ).rejects.toBeInstanceOf(ForbiddenException);
   });
 
   it('成功 → 删消息/回执/墓碑/成员/会话，并推 closed 给两台设备', async () => {
@@ -409,3 +427,194 @@ describe('E2eService · 设备下线联动 / 过期清理', () => {
     expect(dataSource.transaction).toHaveBeenCalledTimes(1);
   });
 });
+
+/* ============ V6.2.1：跨设备治理（B-1 / B-3 / B-7 / B-10） ============ */
+
+describe('E2eService · 跨设备列出（B-1 e2e-mine）', () => {
+  const devices = [
+    { id: DEV_A, device_name: '电脑A', is_online: false, last_active_at: new Date('2026-10-30T00:00:00Z') },
+    { id: DEV_B, device_name: '手机B', is_online: true, last_active_at: new Date('2026-11-04T00:00:00Z') },
+  ];
+  const peers = [
+    { id: USER_B, display_name: '张三' },
+    { id: USER_A, display_name: '我' },
+  ];
+
+  it('列出我名下 active 会话：带对方昵称、绑定设备名与在线态', async () => {
+    const { service } = makeService({
+      convQbs: [{ many: [activeConv()] }],
+      devices,
+      peers,
+    });
+    const list = await service.listMine(USER_A, { deviceId: DEV_A });
+    expect(list).toHaveLength(1);
+    expect(list[0]).toMatchObject({
+      conversation_id: CONV,
+      state: 'active',
+      peer_name: '张三',
+      bound_device_id: DEV_A,
+      bound_device_name: '电脑A',
+      bound_device_online: false,
+      is_bound_device: true,
+      peer_device_id: DEV_B,
+    });
+    expect(list[0].bound_device_last_seen_at).toEqual(devices[0].last_active_at);
+  });
+
+  it('bound_device=other：只返回绑在「其它设备」的会话', async () => {
+    const { service } = makeService({
+      // 两台会话：一条绑 DEV_A（当前），一条绑 DEV_X（旧设备）
+      convQbs: [
+        {
+          many: [
+            activeConv(),
+            activeConv({ id: 'conv-old', e2e_device_a: 'dev-old', e2e_device_b: DEV_B }),
+          ],
+        },
+      ],
+      devices: [...devices, { id: 'dev-old', device_name: 'Chrome', is_online: false, last_active_at: new Date() }],
+      peers,
+    });
+
+    const list = await service.listMine(USER_A, { deviceId: DEV_A, boundDevice: 'other' });
+    expect(list).toHaveLength(1);
+    expect(list[0].conversation_id).toBe('conv-old');
+    expect(list[0].bound_device_name).toBe('Chrome');
+    expect(list[0].is_bound_device).toBe(false);
+  });
+
+  it('bound_device=this：只返回绑在当前设备上的', async () => {
+    const { service } = makeService({
+      convQbs: [
+        {
+          many: [
+            activeConv(),
+            activeConv({ id: 'conv-old', e2e_device_a: 'dev-old', e2e_device_b: DEV_B }),
+          ],
+        },
+      ],
+      devices,
+      peers,
+    });
+    const list = await service.listMine(USER_A, { deviceId: DEV_A, boundDevice: 'this' });
+    expect(list.map((x) => x.conversation_id)).toEqual([CONV]);
+  });
+
+  it('pending 会话：带 expires_at，绑定设备为发起设备', async () => {
+    const { service } = makeService({ convQbs: [{ many: [pendingConv()] }], devices, peers });
+    const [item] = await service.listMine(USER_A, { deviceId: DEV_A });
+    expect(item.state).toBe('pending');
+    expect(item.expires_at).toBeTruthy();
+    expect(item.bound_device_id).toBe(DEV_A);
+  });
+
+  it('没有会话 → 返回空数组', async () => {
+    const { service } = makeService({ convQbs: [{ many: [] }] });
+    await expect(service.listMine(USER_A)).resolves.toEqual([]);
+  });
+});
+
+describe('E2eService · 批量结束（B-3 e2e-close-all）', () => {
+  it('结束全部：返回 closed 数量与 id 列表', async () => {
+    const { service } = makeService({
+      convQbs: [
+        { many: [activeConv(), pendingConv({ id: 'conv-2' })] },
+      ],
+      conversation: activeConv(),
+      msgQbs: [{ many: [] }, { many: [] }],
+    });
+    const r = await service.closeAll(USER_A, DEV_A, 'logout');
+    expect(r.closed).toBe(2);
+    expect(r.conversation_ids).toEqual([CONV, 'conv-2']);
+  });
+
+  it('onlyOtherDevices：只关绑在其它设备上的（不动当前设备的）', async () => {
+    const { service } = makeService({
+      convQbs: [
+        {
+          many: [
+            activeConv(),
+            activeConv({ id: 'conv-old', e2e_device_a: 'dev-old', e2e_device_b: DEV_B }),
+          ],
+        },
+      ],
+      conversation: activeConv({ id: 'conv-old', e2e_device_a: 'dev-old', e2e_device_b: DEV_B }),
+      devices: [{ id: 'dev-old', device_name: 'Chrome', is_online: false, last_active_at: new Date() }],
+      peers: [{ id: USER_B, display_name: '张三' }],
+      msgQbs: [{ many: [] }],
+    });
+    const r = await service.closeAll(USER_A, DEV_A, 'device_change', { onlyOtherDevices: true });
+    expect(r.conversation_ids).toEqual(['conv-old']);
+  });
+});
+
+describe('E2eService · 僵尸会话清理（B-10）', () => {
+  it('绑定设备记录已删除 → 自动结束（reason=device_gone）', async () => {
+    const { service, emitted } = makeService({
+      convQbs: [{ many: [activeConv()] }],
+      conversation: activeConv(),
+      devices: [], // 两台绑定设备都查不到
+      msgQbs: [{ many: [] }],
+    });
+    await service.closeGoneDeviceChats();
+    const ev = emitted.find((e) => e.event === 'e2e:closed');
+    expect(ev?.payload.trigger).toBe('device_gone');
+  });
+
+  it('绑定设备 8 天未上线 → 自动结束', async () => {
+    const old = new Date(Date.now() - 8 * 24 * 3600 * 1000);
+    const { service, dataSource } = makeService({
+      convQbs: [{ many: [activeConv()] }],
+      conversation: activeConv(),
+      devices: [
+        { id: DEV_A, device_name: '电脑A', is_online: false, last_active_at: old },
+        { id: DEV_B, device_name: '手机B', is_online: true, last_active_at: new Date() },
+      ],
+      msgQbs: [{ many: [] }],
+    });
+    await service.closeGoneDeviceChats();
+    expect(dataSource.transaction).toHaveBeenCalledTimes(1);
+  });
+
+  it('绑定设备最近活跃 → 不动', async () => {
+    const { service, dataSource } = makeService({
+      convQbs: [{ many: [activeConv()] }],
+      devices: [
+        { id: DEV_A, device_name: '电脑A', is_online: true, last_active_at: new Date() },
+        { id: DEV_B, device_name: '手机B', is_online: true, last_active_at: new Date() },
+      ],
+    });
+    await service.closeGoneDeviceChats();
+    expect(dataSource.transaction).not.toHaveBeenCalled();
+  });
+});
+
+describe('E2eService · 409 撞车时返回绑定设备信息（B-7）', () => {
+  it('已有 active 会话 → 409 带 bound_device_name / online / last_seen', async () => {
+    const lastSeen = new Date('2026-11-01T00:00:00Z');
+    const { service } = makeService({
+      relQb: { one: { id: 'cm' } },
+      existingPair: {
+        id: 'old-conv',
+        e2e_state: 2,
+        user_a: USER_A,
+        user_b: USER_B,
+        e2e_device_a: DEV_A,
+        e2e_device_b: DEV_B,
+      },
+      devices: [{ id: DEV_A, device_name: '电脑A', is_online: false, last_active_at: lastSeen }],
+    });
+
+    await expect(service.requestSecretChat(USER_A, 'dev-new', USER_B)).rejects.toMatchObject({
+      response: expect.objectContaining({
+        code: 'E2E_PAIR_EXISTS',
+        conversation_id: 'old-conv',
+        bound_device_id: DEV_A,
+        bound_device_name: '电脑A',
+        bound_device_online: false,
+        bound_device_last_seen_at: lastSeen,
+      }),
+    });
+  });
+});
+

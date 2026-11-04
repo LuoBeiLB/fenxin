@@ -269,7 +269,8 @@ export interface WsE2ERequestGonePayload {
 /** e2e:closed 的 payload —— 私密会话已结束（服务端已物理删除，客户端需清本地缓存） */
 export interface WsE2EClosedPayload {
   conversation_id: string;
-  trigger: 'user' | 'device_removed' | 'admin';
+  /** 结束原因（V6.2.1 新增 logout / device_change / device_gone） */
+  trigger: 'user' | 'device_removed' | 'admin' | 'logout' | 'device_change' | 'device_gone';
   at: string;
 }
 

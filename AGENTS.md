@@ -195,6 +195,7 @@ node node_modules/typescript/bin/tsc --noEmit
 | `docs/*_DESIGN.md` / 专题文档 | 设计变更 |
 | `docs/MIGRATION_RUNBOOK.md` | 迁移流程变更 |
 | `docs/DEVICE_UA.md` | 设备识别 / UA 解析规则变更 |
+| `docs/E2E_LIFECYCLE.md` | 加密会话生命周期（退出登录 / 换设备 / 僵尸清理）变更 |
 | `docs/DEPLOY_HANDOFF.md` | 发布流程变更 |
 
 ---

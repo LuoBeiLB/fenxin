@@ -84,7 +84,7 @@ describe('业务状态变化 → AuthCache.invalidate', () => {
       authCache,
       events,
       { deleteDeviceKeyByDeviceId: jest.fn() } as any,
-      { closeSecretChatsBoundTo: jest.fn() } as any,
+      { closeSecretChatsBoundTo: jest.fn(), listMine: jest.fn(async () => []) } as any,
     );
 
       // mock 后的 argon2 是 jest auto-mock，属性可重定义

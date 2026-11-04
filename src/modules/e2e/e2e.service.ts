@@ -16,14 +16,34 @@ import { MessageReceipt } from '../../entities/message-receipt.entity';
 import { MessageTombstone } from '../../entities/message-tombstone.entity';
 import { BurnSetting } from '../../entities/burn-setting.entity';
 import { Device } from '../../entities/device.entity';
+import { AppUser } from '../../entities/app-user.entity';
 import { EventsGateway } from '../events/events.gateway';
 import { WS_EVENTS } from '../events/events.types';
 import { OssService } from '../upload/oss.service';
-import { SecretChatAcceptResult, SecretChatMutationResult, SecretChatRequestResult } from './dto/response';
-import { E2E_STATE, PENDING_TTL_DAYS } from './e2e.constants';
+import {
+  SecretChatAcceptResult,
+  SecretChatMineView,
+  SecretChatMutationResult,
+  SecretChatRequestResult,
+} from './dto/response';
+import { E2E_STATE, PENDING_TTL_DAYS, pendingExpiresAt } from './e2e.constants';
 
-/** 关闭触发方：用户主动 / 绑定设备被移除 / 管理员强制 / 过期清理 */
-export type SecretChatTrigger = 'user' | 'device_removed' | 'admin';
+/**
+ * 关闭触发方（V6.2.1 扩展）：
+ *  - user           用户在某台设备上主动关闭
+ *  - device_removed 设备被下线 / 被踢（含用户主动下线别的设备）
+ *  - admin           管理员强制 / pending 过期清理
+ *  - logout          退出登录时批量结束（前端 F-2）
+ *  - device_change   换设备后在新设备上结束旧会话（前端 F-3）
+ *  - device_gone     僵尸会话清理：绑定设备 7 天未上线或记录已删除
+ */
+export type SecretChatTrigger =
+  | 'user'
+  | 'device_removed'
+  | 'admin'
+  | 'logout'
+  | 'device_change'
+  | 'device_gone';
 
 /** 状态与有效期统一从 e2e.constants 取，避免各模块各写一份 */
 export { E2E_STATE } from './e2e.constants';
@@ -63,6 +83,14 @@ export class E2eService {
 
     const existing = await this.findActiveOrPending(userId, targetUserId);
     if (existing) {
+      // B-7：把「已有会话绑在哪台设备」一并返回，前端才能提示
+      // 「你已在【电脑A】有一条与 B 的加密聊天（该设备已 3 天未上线）」
+      const iAmUserA = existing.user_a === userId;
+      const myBoundDeviceId = iAmUserA ? existing.e2e_device_a : existing.e2e_device_b;
+      const boundDevice = myBoundDeviceId
+        ? await this.dataSource.getRepository(Device).findOne({ where: { id: myBoundDeviceId } })
+        : null;
+
       throw new ConflictException({
         code: 'E2E_PAIR_EXISTS',
         message:
@@ -70,6 +98,13 @@ export class E2eService {
             ? '已有一条待对方接受的私密聊天'
             : '你和对方已有进行中的私密聊天',
         conversation_id: existing.id,
+        e2e_state: existing.e2e_state,
+        bound_user_id: userId,
+        bound_device_id: myBoundDeviceId ?? null,
+        bound_device_name: boundDevice?.device_name ?? null,
+        bound_device_online: boundDevice?.is_online ?? null,
+        bound_device_last_seen_at:
+          (boundDevice?.last_active_at ?? boundDevice?.online_at ?? null) as Date | null,
       });
     }
 
@@ -211,10 +246,11 @@ export class E2eService {
   /**
    * 关闭 / 撤回私密会话。
    *
-   * 权限：
-   *  - pending：仅发起设备可撤回；
-   *  - active：两台绑定设备都可关闭；
-   *  - admin：不限（管理员强制关闭 / 过期清理）。
+   * 权限（V6.2.1 放宽，用于解开"换设备后死锁"）：
+   *  - user / logout / device_change：**同一用户的任意设备**都能结束自己名下的会话
+   *    （关闭不泄露任何内容，而旧设备可能已经丢失，必须给用户自己留一条出口）；
+   *  - device_removed / device_gone：服务端内部按设备维度清理；
+   *  - admin：不限（管理员强制关闭 / pending 过期清理）。
    *
    * 幂等：会话已不存在时返回 deleted=true / 0 条消息，不报错。
    */
@@ -231,10 +267,17 @@ export class E2eService {
     if (conv.e2e_mode !== 1) throw new BadRequestException('不是私密会话');
 
     if (trigger !== 'admin') {
-      const isPending = conv.e2e_state === E2E_STATE.PENDING;
-      const allowed = isPending
-        ? conv.e2e_device_a === deviceId
-        : conv.e2e_device_a === deviceId || conv.e2e_device_b === deviceId;
+      const isParticipant = conv.user_a === userId || conv.user_b === userId;
+      const isBoundDevice = deviceId === conv.e2e_device_a || deviceId === conv.e2e_device_b;
+      const selfService = trigger === 'user' || trigger === 'logout' || trigger === 'device_change';
+      const serverCleanup = trigger === 'device_removed' || trigger === 'device_gone';
+
+      const allowed = selfService
+        ? isParticipant
+        : serverCleanup
+          ? isParticipant || isBoundDevice
+          : isBoundDevice;
+
       if (!allowed) {
         throw new ForbiddenException({ code: 'E2E_NOT_BOUND_DEVICE', message: '本设备无权操作该私密会话' });
       }
@@ -264,6 +307,201 @@ export class E2eService {
 
     this.logger.log(`secret chat closed conversation=${conv.id} messages=${deletedMessages}`);
     return { conversation_id: conv.id, deleted: true, deleted_messages: deletedMessages };
+  }
+
+  // ===================== 跨设备治理（V6.2.1） =====================
+
+  /** 僵尸会话判定天数：绑定设备连续离线超过该天数即自动结束（env E2E_DEVICE_GONE_DAYS，默认 7） */
+  private deviceGoneDays(): number {
+    const n = parseInt(process.env.E2E_DEVICE_GONE_DAYS || '7', 10);
+    return Number.isFinite(n) && n > 0 ? n : 7;
+  }
+
+  /**
+   * B-1：列出「我名下」的全部进行中私密会话（不依赖当前设备是否绑定）。
+   *
+   * 用途：
+   *  - 退出登录前提示「将结束 N 个加密聊天」（前端 F-1）
+   *  - 新设备登录后提示「有未结束的加密聊天」（前端 F-3）
+   *  - 锁图标面板「其他设备的加密聊天(N)」（前端 F-4）
+   *
+   * @param opts.deviceId    当前设备（用于计算 is_bound_device）
+   * @param opts.boundDevice all=全部 this=绑在本设备 other=绑在其它设备（含已丢失设备）
+   */
+  async listMine(
+    userId: string,
+    opts: { deviceId?: string; boundDevice?: 'all' | 'this' | 'other' } = {},
+  ): Promise<SecretChatMineView[]> {
+    const boundDevice = opts.boundDevice ?? 'all';
+
+    const rows = await this.dataSource
+      .getRepository(Conversation)
+      .createQueryBuilder('c')
+      .where('c.e2e_mode = 1 AND c.e2e_state IN (1, 2)')
+      .andWhere('(c.user_a = :uid OR c.user_b = :uid)', { uid: userId })
+      .orderBy('c.created_at', 'DESC')
+      .limit(200)
+      .getMany();
+    if (rows.length === 0) return [];
+
+    // 对方昵称
+    const peerIds = [
+      ...new Set(rows.map((c) => (c.user_a === userId ? c.user_b : c.user_a)).filter(Boolean)),
+    ] as string[];
+    const peers = peerIds.length
+      ? await this.dataSource
+          .getRepository(AppUser)
+          .find({ where: { id: In(peerIds) }, select: ['id', 'display_name'] })
+      : [];
+    const peerMap = new Map(peers.map((u) => [u.id, u.display_name]));
+
+    // 绑定设备信息（名称 / 在线 / 最后活跃）
+    const deviceIds = [
+      ...new Set(rows.flatMap((c) => [c.e2e_device_a, c.e2e_device_b]).filter(Boolean)),
+    ] as string[];
+    const devices = deviceIds.length
+      ? await this.dataSource.getRepository(Device).find({ where: { id: In(deviceIds) } })
+      : [];
+    const devMap = new Map(devices.map((d) => [d.id, d]));
+
+    const asOf = new Date().toISOString();
+    const list: SecretChatMineView[] = rows.map((c) => {
+      const iAmUserA = c.user_a === userId;
+      const peerUserId = iAmUserA ? c.user_b : c.user_a;
+      // 我为 a 时绑定设备是 a；为 b 时是 b（pending 阶段 b 尚未绑定 → null）
+      const myDeviceId = iAmUserA ? c.e2e_device_a : c.e2e_device_b;
+      const peerDeviceId = iAmUserA ? c.e2e_device_b : c.e2e_device_a;
+      const myDevice = myDeviceId ? devMap.get(myDeviceId) : undefined;
+
+      return {
+        conversation_id: c.id,
+        state: c.e2e_state === E2E_STATE.PENDING ? 'pending' : 'active',
+        peer_user_id: peerUserId ?? null,
+        peer_name: peerUserId ? (peerMap.get(peerUserId) ?? null) : null,
+        /** 我在这条会话上绑定的设备（null = 我是被邀请方且尚未接受 / 已失去绑定） */
+        bound_device_id: myDeviceId ?? null,
+        bound_device_name: myDevice?.device_name ?? null,
+        bound_device_online: myDevice?.is_online ?? null,
+        bound_device_last_seen_at: (myDevice?.last_active_at ?? myDevice?.online_at ?? null) as
+          | Date
+          | null,
+        /** 绑定的这台是不是当前请求设备（false 且 bound_device_id 非空 = 绑在别的设备上） */
+        is_bound_device: !!opts.deviceId && myDeviceId === opts.deviceId,
+        peer_device_id: peerDeviceId ?? null,
+        created_at: c.created_at,
+        expires_at:
+          c.e2e_state === E2E_STATE.PENDING
+            ? pendingExpiresAt(c.created_at).toISOString()
+            : null,
+        as_of: asOf,
+      };
+    });
+
+    return list.filter((item) => {
+      if (boundDevice === 'all') return true;
+      const boundElsewhere = !!item.bound_device_id && !item.is_bound_device;
+      return boundDevice === 'other' ? boundElsewhere : item.is_bound_device;
+    });
+  }
+
+  /**
+   * B-3：一次结束我名下全部进行中私密会话（退出登录 / 换设备时用）。
+   *
+   * @param reason                关闭原因（logout / device_change / user）
+   * @param opts.onlyOtherDevices true = 只结束绑在**其它设备**上的（不动当前设备正在用的）
+   */
+  async closeAll(
+    userId: string,
+    deviceId: string,
+    reason: SecretChatTrigger = 'user',
+    opts: { onlyOtherDevices?: boolean } = {},
+  ): Promise<{ closed: number; conversation_ids: string[]; deleted_messages: number }> {
+    const mine = await this.listMine(userId, {
+      deviceId,
+      boundDevice: opts.onlyOtherDevices ? 'other' : 'all',
+    });
+
+    const conversationIds: string[] = [];
+    let deletedMessages = 0;
+
+    for (const item of mine) {
+      try {
+        const r = await this.closeSecretChat(item.conversation_id, userId, deviceId, reason);
+        conversationIds.push(item.conversation_id);
+        deletedMessages += r.deleted_messages;
+      } catch (err: any) {
+        // 单条失败不阻塞批量（可能已被对方同时关闭）
+        this.logger.warn(
+          `close-all skipped conversation=${item.conversation_id} err=${err?.message || err}`,
+        );
+      }
+    }
+
+    if (conversationIds.length > 0) {
+      this.logger.log(
+        `secret chat close-all user=${userId} count=${conversationIds.length} reason=${reason}`,
+      );
+    }
+    return {
+      closed: conversationIds.length,
+      conversation_ids: conversationIds,
+      deleted_messages: deletedMessages,
+    };
+  }
+
+  /**
+   * B-10（=B-8）：僵尸会话清理 —— 绑定设备长时间未上线、或设备记录已被删除时自动结束。
+   *
+   * 判定（任一命中即结束，reason=device_gone）：
+   *  1. 绑定设备在 devices 表里**已不存在**（下线 / 被踢 / 账号删除）；
+   *  2. 绑定设备最后活跃时间超过 E2E_DEVICE_GONE_DAYS（默认 7 天）。
+   *
+   * 每小时跑一次；每次最多处理 200 条，避免长事务。
+   */
+  @Cron('0 * * * *')
+  async closeGoneDeviceChats(): Promise<void> {
+    const days = this.deviceGoneDays();
+    const cutoff = new Date(Date.now() - days * 24 * 3600 * 1000);
+
+    const rows = await this.dataSource
+      .getRepository(Conversation)
+      .createQueryBuilder('c')
+      .where('c.e2e_mode = 1 AND c.e2e_state IN (1, 2)')
+      .andWhere('c.created_at < :cutoff', { cutoff })
+      .orderBy('c.created_at', 'ASC')
+      .limit(200)
+      .getMany();
+    if (rows.length === 0) return;
+
+    const deviceIds = [
+      ...new Set(rows.flatMap((c) => [c.e2e_device_a, c.e2e_device_b]).filter(Boolean)),
+    ] as string[];
+    const devices = deviceIds.length
+      ? await this.dataSource.getRepository(Device).find({ where: { id: In(deviceIds) } })
+      : [];
+    const devMap = new Map(devices.map((d) => [d.id, d]));
+
+    let closed = 0;
+    for (const c of rows) {
+      // pending 看发起设备；active 看任一台绑定设备
+      const bound = [c.e2e_device_a, c.e2e_device_b].filter(Boolean) as string[];
+      const gone = bound.some((id) => {
+        const d = devMap.get(id);
+        if (!d) return true; // 设备记录已删除
+        const lastSeen = d.last_active_at ?? d.online_at ?? d.created_at;
+        return new Date(lastSeen).getTime() < cutoff.getTime();
+      });
+      if (!gone) continue;
+
+      try {
+        await this.closeSecretChat(c.id, c.user_a ?? '', c.e2e_device_a ?? '', 'device_gone');
+        closed += 1;
+      } catch (err: any) {
+        this.logger.warn(`device_gone close failed conversation=${c.id} err=${err?.message || err}`);
+      }
+    }
+
+    if (closed > 0) this.logger.log(`closed ${closed} secret chat(s) by device_gone (>${days}d)`);
   }
 
   /** 设备被移除 / 踢下线时，关闭该设备绑定的所有私密会话（调用方：AuthService.removeDevice） */

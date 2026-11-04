@@ -160,6 +160,12 @@ export class AuthService {
       ...tokens,
       device,
       force_change_pwd: user.force_change_pwd,
+      // B-5（V6.2.1）：新设备登录时一次性带回「绑在其它设备上的加密会话」，
+      // 前端据此弹「检测到 N 个未结束的加密聊天」，省一次请求。
+      // 失败不影响登录（加密会话治理不能阻塞主链路）。
+      e2e_on_other_devices: await this.e2eService
+        .listMine(user.id, { deviceId: device.id, boundDevice: 'other' })
+        .catch(() => []),
     };
   }
 
@@ -290,6 +296,30 @@ export class AuthService {
     // WS 通知该用户全部设备（被下线设备若还连着可立即跳转登录页）
     this.events.emitToUsers(WS_EVENTS.DEVICE_REMOVED, [userId], { device_id: deviceId });
     await this.audit.log({ userId, action: 'remove_device', targetId: deviceId });
+  }
+
+  /**
+   * 退出登录（V6.2.1，B-4）。
+   *
+   * 与 `removeDevice` 的区别只是语义与返回值：
+   *  - 服务端**兜底**结束该设备绑定的全部加密会话（即使前端退出前没调 e2e-close-all）；
+   *  - 返回被结束的会话数，前端可提示「已结束 N 个加密聊天」；
+   *  - 幂等：设备已不存在时同样成功（`closed_secret_chats` 为 0）。
+   *
+   * 注意：这里删的是「本设备记录」，不是"删号"；其他设备不受影响。
+   */
+  async logout(userId: string, deviceId: string): Promise<{ closed_secret_chats: number }> {
+    let closed = 0;
+    if (deviceId) {
+      try {
+        closed = await this.e2eService.closeSecretChatsBoundTo(deviceId, 'logout');
+      } catch (err: any) {
+        console.warn(`[auth] logout close secret chats failed: ${err?.message || err}`);
+      }
+      await this.removeDevice(userId, deviceId);
+    }
+    await this.audit.log({ userId, action: 'logout', targetId: deviceId });
+    return { closed_secret_chats: closed };
   }
 
   /**

@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Post, Put, Req } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, Param, Post, Put, Req } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { Request } from 'express';
@@ -72,6 +72,22 @@ export class AuthController {
   async offlineDevice(@CurrentUser() user: AuthPayload, @Param('deviceId') deviceId: string) {
     await this.authService.removeDevice(user.userId, deviceId);
     return null;
+  }
+
+  /**
+   * 退出登录（V6.2.1）。
+   *
+   * 服务端兜底：删除本设备记录（token 立即失效），并**自动结束该设备绑定的加密会话**
+   * （向对方推 `e2e:closed`）—— 即使前端在退出前没走 `e2e-close-all`，也不会留下孤儿会话。
+   *
+   * 幂等：设备记录已不存在时同样返回成功。
+   */
+  @ApiBearerAuth()
+  @Post('logout')
+  @HttpCode(200)
+  @ResponseMessage('已退出登录')
+  async logout(@CurrentUser() user: AuthPayload): Promise<{ closed_secret_chats: number }> {
+    return this.authService.logout(user.userId, user.deviceId);
   }
 
   /**

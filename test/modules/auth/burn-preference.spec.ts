@@ -89,7 +89,7 @@ describe('AuthService 默认焚毁时长偏好（default_burn_ttl_seconds）', (
       { invalidate: jest.fn() } as unknown as AuthCacheService,
       { emitToUsers: jest.fn(), emitToDevices: jest.fn() } as unknown as EventsGateway,
       { deleteDeviceKeyByDeviceId: jest.fn() } as any,
-      { closeSecretChatsBoundTo: jest.fn() } as any,
+      { closeSecretChatsBoundTo: jest.fn(), listMine: jest.fn(async () => []) } as any,
     );
   });
 

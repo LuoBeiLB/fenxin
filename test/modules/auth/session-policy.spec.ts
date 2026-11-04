@@ -83,7 +83,7 @@ function buildService(opts: { others?: any[] } = {}) {
     authCache as any,
     events as any,
     { deleteDeviceKeyByDeviceId: jest.fn() } as any,
-    { closeSecretChatsBoundTo: jest.fn() } as any,
+    { closeSecretChatsBoundTo: jest.fn(), listMine: jest.fn(async () => []) } as any,
   );
 
   return { service, userRepo, deviceRepo, audit, authCache, events };

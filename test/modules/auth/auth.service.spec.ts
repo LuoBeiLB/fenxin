@@ -88,7 +88,7 @@ describe('AuthService topic（用户主题色）', () => {
       authCache as unknown as AuthCacheService,
       events as unknown as EventsGateway,
       { deleteDeviceKeyByDeviceId: jest.fn() } as any,
-      { closeSecretChatsBoundTo: jest.fn() } as any,
+      { closeSecretChatsBoundTo: jest.fn(), listMine: jest.fn(async () => []) } as any,
     );
   });
 

@@ -276,6 +276,25 @@ paths:
                         type: boolean
                         description: 为 true 时前端应强制跳转修改密码
                         example: false
+                      e2e_on_other_devices:
+                        type: array
+                        description: |-
+                          V6.2.1（B-5）：绑在**其它设备**上的未结束私密会话。
+                          非空时前端应弹「检测到 N 个未结束的加密聊天（绑定设备：电脑A）」并引导结束，
+                          否则用户换设备后无法与对方重新建立加密会话。
+                          结构同 GET /conversations/e2e-mine。
+                        items:
+                          type: object
+                          properties:
+                            conversation_id: { type: string, format: uuid }
+                            state: { type: string, enum: [pending, active] }
+                            peer_name: { type: string, nullable: true }
+                            bound_device_id: { type: string, nullable: true }
+                            bound_device_name: { type: string, nullable: true }
+                            bound_device_online: { type: boolean, nullable: true }
+                            bound_device_last_seen_at: { type: string, format: date-time, nullable: true }
+                            created_at: { type: string, format: date-time }
+                        example: []
         '400':
           description: 参数校验失败（如手机号格式不正确、密码为空、device_type 非法）
           content:
@@ -523,6 +542,43 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+
+  /auth/logout:
+    post:
+      tags: [认证]
+      summary: 退出登录（服务端兜底结束本设备绑定的加密会话）
+      description: |-
+        【用途】退出当前设备：删除本设备的设备记录（token 立即失效），
+        并**自动结束该设备绑定的所有私密会话**（向对方推 e2e:closed，reason=logout）。
+
+        【为什么服务端要做】前端可能崩溃 / 被杀进程 / 直接关标签页，
+        只靠前端在退出前逐个结束会话并不可靠；服务端兜底才能避免"孤儿会话"。
+
+        【幂等】设备记录已不存在时同样返回成功（closed_secret_chats=0）。
+        【注意】只影响当前设备，其他设备登录态不受影响。
+      responses:
+        '200':
+          description: 已退出登录
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: 已退出登录 }
+                  data:
+                    type: object
+                    properties:
+                      closed_secret_chats:
+                        type: integer
+                        example: 2
+                        description: 本次退出顺带结束的加密会话数量
+        '401':
+          description: 未认证 / 设备已下线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
 
   /auth/devices:
     get:
@@ -5469,6 +5525,120 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /conversations/e2e-mine:
+    get:
+      tags: [私密会话]
+      summary: 跨设备列出我名下全部进行中私密会话（V6.2.1，B-1）
+      description: |-
+        【用途】不依赖当前设备是否绑定，返回「我名下」所有 pending / active 私密会话。
+        用于：退出登录前提示「将结束 N 个加密聊天」、新设备登录提示「有未结束的加密聊天」、
+        锁图标面板的「其他设备的加密聊天(N)」。
+
+        【与 GET /conversations 的区别】
+        - GET /conversations 按**设备**过滤：绑在别的设备上的会话你在列表里看不到；
+        - 本接口按**用户**返回：能看到「绑在【电脑A】上的那条」，并附带该设备的在线态。
+
+        【返回值要点】
+        - bound_device_id / bound_device_name：我在这条会话上绑定的设备；
+        - bound_device_online / bound_device_last_seen_at：用于显示「旧设备已 3 天未上线」；
+        - is_bound_device：是不是当前请求的这台设备；
+        - expires_at：pending 才有（created_at + 7 天）；
+        - as_of：服务端时间，前端算「几天前」时以它为准，避免依赖本机时钟。
+      parameters:
+        - name: bound_device
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [all, this, other]
+            default: all
+          description: all=全部 / this=只列绑在本设备的 / other=只列绑在其它设备（含已丢失设备）的
+      responses:
+        '200':
+          description: 成功，data 为 SecretChatMineView 数组
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: ok }
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        conversation_id: { type: string, format: uuid }
+                        state: { type: string, enum: [pending, active] }
+                        peer_user_id: { type: string, nullable: true }
+                        peer_name: { type: string, nullable: true, example: 张三 }
+                        bound_device_id: { type: string, nullable: true }
+                        bound_device_name: { type: string, nullable: true, example: 电脑A }
+                        bound_device_online: { type: boolean, nullable: true }
+                        bound_device_last_seen_at: { type: string, format: date-time, nullable: true }
+                        is_bound_device: { type: boolean }
+                        peer_device_id: { type: string, nullable: true }
+                        created_at: { type: string, format: date-time }
+                        expires_at: { type: string, format: date-time, nullable: true }
+                        as_of: { type: string, format: date-time }
+        '401':
+          description: 未认证
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /conversations/e2e-close-all:
+    post:
+      tags: [私密会话]
+      summary: 一次结束我名下全部进行中私密会话（V6.2.1，B-3）
+      description: |-
+        【用途】退出登录前 / 换设备后清理旧会话，等价于逐个调用 POST /conversations/{id}/e2e-close，
+        但只有一次往返；单条失败不阻塞其余（失败项不会出现在 conversation_ids 里）。
+
+        【权限】同一用户的任意设备都可以结束自己名下的会话（V6.2.1 放宽，解开「换设备后死锁」）。
+
+        【副作用】服务端物理删除会话与全部消息，向对方推 e2e:closed（触发原因见 reason）。
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  enum: [user, logout, device_change]
+                  default: user
+                  description: user=主动结束 / logout=退出登录 / device_change=换设备清理
+                only_other_devices:
+                  type: boolean
+                  default: false
+                  description: true=只结束绑在其它设备上的会话（当前设备正在用的不动）
+      responses:
+        '200':
+          description: 批量结束完成
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer, example: 0 }
+                  message: { type: string, example: 私密会话已批量结束 }
+                  data:
+                    type: object
+                    properties:
+                      closed: { type: integer, example: 2 }
+                      conversation_ids:
+                        type: array
+                        items: { type: string, format: uuid }
+                      deleted_messages: { type: integer, example: 42 }
+        '401':
+          description: 未认证
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+
   /conversations/e2e-request:
     post:
       tags: [私密会话]
@@ -5519,7 +5689,11 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '409':
-          description: 已有 pending 或 active 会话（E2E_PAIR_EXISTS）
+          description: |-
+            已有 pending 或 active 会话（E2E_PAIR_EXISTS）。响应额外带：
+            conversation_id（已有会话 ID）、e2e_state、bound_user_id、
+            bound_device_id / bound_device_name / bound_device_online / bound_device_last_seen_at
+            —— 前端据此提示「你已在【电脑A】有一条与该用户的加密聊天（3 天未上线）」。
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
