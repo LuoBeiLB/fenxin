@@ -16,6 +16,7 @@ import { AuthCacheService } from '../../common/cache/auth-cache.service';
 import { EventsGateway } from '../events/events.gateway';
 import { KeysService } from '../keys/keys.service';
 import { E2eService } from '../e2e/e2e.service';
+import { parseUserAgent } from '../../common/ua/ua-parser';
 import { WS_EVENTS } from '../events/events.types';
 
 const MAX_LOGIN_FAILS = 5;
@@ -78,10 +79,20 @@ export class AuthService {
       });
     }
 
+    // V6.2：UA 由服务端解析（客户端自报的 device_name / device_type 不可信）
+    const ua = parseUserAgent(meta.userAgent);
+
     if (device) {
       // 同一设备重复登录：刷新设备信息与在线状态，不新建
-      device.device_name = deviceInfo.deviceName;
-      device.device_type = deviceInfo.deviceType;
+      // 昵称仍以客户端为准（用户可能自己改过），但空值用解析结果兜底
+      device.device_name = deviceInfo.deviceName || device.device_name;
+      device.device_type = deviceInfo.deviceType || ua.device_type || device.device_type;
+      // UA 每次登录都刷新（浏览器升级后会变），便于管理端看到最新浏览器
+      device.user_agent = (meta.userAgent ?? '').slice(0, 512) || device.user_agent;
+      device.browser = ua.browser ?? device.browser;
+      device.browser_version = ua.browser_version ?? device.browser_version;
+      device.os = ua.os ?? device.os;
+      device.os_version = ua.os_version ?? device.os_version;
       device.is_online = true;
       device.online_at = device.online_at ?? new Date();
       device.offline_at = null;
@@ -91,8 +102,14 @@ export class AuthService {
       device = await deviceRepo.save(
         deviceRepo.create({
           user_id: user.id,
-          device_name: deviceInfo.deviceName,
-          device_type: deviceInfo.deviceType,
+          // 客户端没传名字时用 UA 解析结果兜底（"Chrome · Windows"）
+          device_name: deviceInfo.deviceName || ua.browser || 'Unknown device',
+          device_type: deviceInfo.deviceType || ua.device_type || 'unknown',
+          user_agent: (meta.userAgent ?? '').slice(0, 512) || null,
+          browser: ua.browser,
+          browser_version: ua.browser_version,
+          os: ua.os,
+          os_version: ua.os_version,
           device_id: deviceInfo.deviceId ?? crypto.randomUUID(),
           is_online: true,
           online_at: new Date(),
@@ -228,10 +245,28 @@ export class AuthService {
     return sanitizeUserWithPrefs(updated);
   }
 
+  /**
+   * 我的登录设备列表（V6.2）。
+   * 除原始字段外附带 `ua_display`（如 "Chrome 129 · Windows 10/11"），
+   * 前端无需自己拼浏览器名；解析不出来的老设备回退到 device_name。
+   */
   async getDevices(userId: string) {
-    return this.dataSource.getRepository(Device).find({
+    const rows = await this.dataSource.getRepository(Device).find({
       where: { user_id: userId },
       order: { created_at: 'DESC' },
+    });
+
+    return rows.map((d) => {
+      const parts: string[] = [];
+      if (d.browser) {
+        const major = d.browser_version ? d.browser_version.split('.')[0] : null;
+        parts.push(major ? `${d.browser} ${major}` : d.browser);
+      }
+      if (d.os) parts.push(d.os_version ? `${d.os} ${d.os_version}` : d.os);
+      return {
+        ...d,
+        ua_display: parts.length > 0 ? parts.join(' · ') : null,
+      };
     });
   }
 

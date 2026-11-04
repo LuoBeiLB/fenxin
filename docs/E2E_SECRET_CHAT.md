@@ -2,7 +2,7 @@
 
 > 版本：v1.1（已实现）
 > 状态：**后端已实现**（2026-10-30），前端待对接
-> 实现：迁移 4 个 · 接口 7 个 · 单测 16 条（e2e）+ 13 条（keys）
+> 实现：迁移 5 个 · 接口 7 个 · 单测 16 条（e2e）+ 13 条（keys）
 > 关联文档：[E2E_ENCRYPTION.md](./E2E_ENCRYPTION.md) · [TOFU_FRONTEND.md](./TOFU_FRONTEND.md) · [websocket-events.md](./websocket-events.md)
 > 参考模型：Telegram Secret Chat
 

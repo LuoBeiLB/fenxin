@@ -194,6 +194,7 @@ node node_modules/typescript/bin/tsc --noEmit
 | `docs/websocket-events.md` | 任何 WS 事件变更 |
 | `docs/*_DESIGN.md` / 专题文档 | 设计变更 |
 | `docs/MIGRATION_RUNBOOK.md` | 迁移流程变更 |
+| `docs/DEVICE_UA.md` | 设备识别 / UA 解析规则变更 |
 | `docs/DEPLOY_HANDOFF.md` | 发布流程变更 |
 
 ---

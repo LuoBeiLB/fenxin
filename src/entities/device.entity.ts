@@ -18,6 +18,29 @@ export class Device {
   @Column({ length: 20 })
   device_type: string;
 
+  /** 登录时的原始 User-Agent（服务端记录，排查问题用；超长截断到 512） */
+  @Column({ length: 512, nullable: true })
+  user_agent: string | null;
+
+  /**
+   * 服务端从 UA 解析出来的浏览器（V6.2）。
+   * 与 device_name 的区别：device_name 是客户端自报的"昵称"，这里是客观识别结果。
+   */
+  @Column({ length: 40, nullable: true })
+  browser: string | null;
+
+  /** 浏览器版本（Chrome 101+ 的 UA 冻结导致只有大版本可靠） */
+  @Column({ length: 20, nullable: true })
+  browser_version: string | null;
+
+  /** 操作系统：Windows / macOS / iOS / iPadOS / Android / HarmonyOS / Linux / ChromeOS */
+  @Column({ length: 40, nullable: true })
+  os: string | null;
+
+  /** 系统版本 */
+  @Column({ length: 20, nullable: true })
+  os_version: string | null;
+
   @Column({ length: 100 })
   device_id: string;
 

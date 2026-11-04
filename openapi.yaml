@@ -198,6 +198,11 @@ paths:
         - 账号被停用（status=disabled）时登录返回 401「账号已被停用」。
         - 每次登录都会新建一条设备记录（device_id 为服务端生成的设备指纹 UUID），token payload 中携带该设备记录主键；后续「下线设备」即删除该记录使 token 立即失效。
         - 响应中 force_change_pwd=true 时（新开通或被重置密码的账号），前端必须强制跳转修改密码（POST /auth/change-password）。
+        - 【V6.2 设备识别】**服务端会自己解析请求头 User-Agent**，落库 browser / browser_version / os / os_version：
+          客户端自报的 device_name / device_type 只作为「设备昵称」使用，不作为识别依据
+          （现网数据里同一浏览器出现过 "Web" 与 "web" 两种写法）。
+          浏览器类型可识别：Chrome / Safari / Edge / Firefox / Opera / Samsung Internet /
+          WeChat / WeCom / QQBrowser / QQ / UC / Huawei Browser / Mi Browser / Android WebView。
       security: []
       requestBody:
         required: true
@@ -516,6 +521,8 @@ paths:
 
         【业务规则与注意事项】
         - 返回的 Device.id 是设备记录主键，用于「下线设备」接口的路径参数；device_id 字段才是设备指纹 UUID，二者不要混淆。
+        - 【V6.2】每条设备附带 ua_display（如 "Chrome 129 · Windows 10/11"），由服务端 UA 解析生成；
+          解析字段（browser / os / …）为 null 时（本次上线前的存量设备）前端应回退显示 device_name。
       responses:
         '200':
           description: 成功，data 为 Device 数组（按 created_at 倒序）
@@ -5928,6 +5935,44 @@ components:
           enum: [mobile, desktop, tablet, web]
           description: 设备类型：mobile 手机 / desktop 桌面端 / tablet 平板 / web 网页端
           example: mobile
+        user_agent:
+          type: string
+          nullable: true
+          description: 登录时的原始 User-Agent（服务端记录，截断 512 字符；存量设备为 null）
+          example: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36
+        browser:
+          type: string
+          nullable: true
+          description: |-
+            V6.2：服务端从 UA 解析出的浏览器（不是客户端自报的 device_name）：
+            Chrome / Safari / Edge / Firefox / Opera / Samsung Internet /
+            WeChat / WeCom / QQBrowser / QQ / UC / Huawei Browser / Mi Browser / Android WebView
+          example: Chrome
+        browser_version:
+          type: string
+          nullable: true
+          description: 浏览器版本。Chrome 101+ 做了 UA 冻结，只能拿到大版本（如 129.0.0.0）
+          example: 129.0.0.0
+        os:
+          type: string
+          nullable: true
+          description: 操作系统：Windows / macOS / iOS / iPadOS / Android / HarmonyOS / Linux / ChromeOS
+          example: Windows
+        os_version:
+          type: string
+          nullable: true
+          description: |-
+            系统版本。Windows 10 与 11 的 UA 都是 NT 10.0，无法区分，统一返回 10/11；
+            iPadOS 桌面模式（伪装成 Macintosh）也能正确识别为 iPadOS。
+          example: 10/11
+        ua_display:
+          type: string
+          nullable: true
+          description: |-
+            仅 GET /auth/devices 返回的便捷字段：「浏览器 大版本 · 系统 版本」，
+            如 "Chrome 129 · Windows 10/11"；解析不出来时为 null，前端回退显示 device_name。
+          example: Chrome 129 · Windows 10/11
+
         device_id:
           type: string
           format: uuid
