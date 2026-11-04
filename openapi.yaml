@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: 焚信 BurnMsg API
-  version: 2.8.0
+  version: 2.9.0
   description: |-
     焚信（BurnMsg）是一款企业内部加密即时通讯（IM）应用，支持云聊天与秘密聊天、阅后即焚消息。本文件为其后端（NestJS + TypeORM + MySQL）的标准 OpenAPI 3.0.3 接口文档。
 
@@ -102,6 +102,15 @@ info:
     - Message 新字段：burn_ttl_seconds（点开才焚 TTL）、file_original_url（原图地址）、media_duration（音视频时长）、mentions（@提及用户 ID 数组）、is_encrypted / cipher_nonce / cipher_text / sender_ephemeral_pubkey（E2E 端到端加密四件套）；焚毁视图运行时字段：is_blurred、burn_at、remain_seconds、media_burn_pending、consume_deadline。
     - MessageReceipt 新字段：revealed_at、burn_at（点开才焚计时）；Conversation 新字段：visibility、ai_enabled、dissolved_at、dissolved_by（频道可见性 / AI 预留 / 软解散标记）。
     - POST /messages 请求体新增：media_duration_seconds、file_original_url、burn_ttl_seconds、mentions 及 E2E 加密三字段；POST /upload 响应新增 thumb_url（图片缩略图，v5.9.0）。
+
+    【V6.2 变更摘要】
+    - 新增「设备配对私密会话（Secret Chat）」：一条私密会话归属于一对设备，谁接受谁绑定；
+      active 后仅两台绑定设备可见，关闭即物理删除（服务端零残留）。
+    - 密钥改为**设备级**：`POST /keys/device` / `GET /keys/device/{conversationId}`；
+      用户级 `POST /keys`、`GET /keys/{userId}`、`POST /keys/query` 已下线（user_keys 表已删除）。
+    - 登录时服务端解析 User-Agent，devices 新增 browser / browser_version / os / os_version，
+      `GET /auth/devices` 返回 ua_display（如 “Chrome 129 · Windows 10/11”）。
+    - 消息类接口对私密会话按设备鉴权：非绑定设备一律 403（错误码 E2E_NOT_BOUND_DEVICE）。
 servers:
   - url: http://localhost:9091/api/v1
     description: 开发环境（部署时请替换为实际域名/IP；端口默认 9091，全局前缀 /api/v1）
@@ -117,9 +126,9 @@ tags:
   - name: 通讯录
     description: 企业通讯录：全员分页列表与快速搜索（仅 active 用户，不含本人），用于选人建会话/拉群。
   - name: 会话
-    description: 会话管理：创建/获取私聊会话、我的会话列表、会话详情。
+    description: 会话管理：创建/获取私聊会话、我的会话列表、会话详情。V6.2 起列表按设备过滤：私密会话 active 后仅两台绑定设备可见。
   - name: 消息
-    description: 消息管理：发送（含阅后即焚）、历史消息游标分页、编辑、撤回、已读标记与消息回执。
+    description: 消息管理：发送（含阅后即焚 / E2E 加密）、历史消息游标分页、编辑、撤回、已读标记与消息回执。V6.2 起私密会话按设备鉴权，非绑定设备返回 403。
   - name: 群组
     description: 群组/频道管理：建群、群资料、群成员增删与角色设置（群主 owner / 管理员 admin / 成员 member）。
   - name: 系统公告
@@ -152,6 +161,11 @@ tags:
     description: 仅 admin：在线用户/设备概览、在线设备列表、强制下线设备。
   - name: 管理端-系统设置
     description: 仅 admin：数据保留策略（只读，由环境变量控制）。
+  - name: 私密会话
+    description: |
+      设备配对私密会话（Secret Chat，V6.2）。
+      一条私密会话归属于一对设备：发起 → 对方任一设备接受 → 仅两台绑定设备可见 → 关闭即物理删除（服务端零残留）。
+      同一对用户同时只允许一条进行中的会话；拒绝/关闭后可立即重新发起。
 
 paths:
   /health:
@@ -2443,6 +2457,11 @@ paths:
           一次聚合查询得出，前端应以此为准（换设备/重装不再丢失未读数）。
         - 已解散的群/频道不返回。
         - 未加入任何会话时返回空数组。
+
+        【V6.2 私密会话可见性】返回值按**设备**过滤：
+        - 普通会话（e2e_mode=0）：所有成员设备可见；
+        - 私密会话 pending（e2e_state=1）：双方所有设备可见（作为"待接受请求"），带 e2e_expires_at = created_at + 7 天；
+        - 私密会话 active（e2e_state=2）：**仅两台绑定设备**可见，其余设备列表里根本没有这条会话。
       responses:
         '200':
           description: 成功，data 为 Conversation 数组
@@ -2475,6 +2494,8 @@ paths:
         【业务规则与注意事项】
         - 仅会话成员可访问，非成员返回 403（Access denied to this conversation）。
         - 会话不存在返回 404（校验顺序：先校验成员身份，再查会话本体）。
+
+        【V6.2 私密会话】active 私密会话仅绑定设备可访问，其他设备返回 403。
       parameters:
         - name: id
           in: path
@@ -3361,6 +3382,11 @@ paths:
         - 焚毁（V6.0）：传 burn_ttl_seconds（秒数，1~2592000）。服务端落库 destroy_at = 发送时刻 + max(BURN_FALLBACK_TTL_HOURS, burn_ttl_seconds)，首次点开时还会延长到 ≥ 本人 burn_at。焚毁消息对全员（含发送方）先显示马赛克占位，调 POST /messages/{id}/reveal 才下发内容并开始各自倒计时；音视频消息可同时传 media_duration_seconds 保证播完才焚。
         - 旧客户端兼容：只传 destroy_at（ISO8601）也可，后端会反算成 burn_ttl_seconds；两者都传时以 burn_ttl_seconds 为准。
         - E2E 端到端加密：同时传 sender_ephemeral_pubkey / cipher_nonce / cipher_text 三字段（接收方用 GET /keys/{userId} 拿发送方身份公钥做 ECDH 解密）；加密消息 content 仅为占位提示。
+
+        【V6.2 私密会话】发送前服务端会校验「当前设备是否该私密会话的绑定设备」（device_id 取自 JWT）：
+        - 私密会话（e2e_mode=1）**必须**带 cipher_text / cipher_nonce / sender_ephemeral_pubkey，缺失返回 400 E2E_ENCRYPTION_REQUIRED；
+        - 非绑定设备发送返回 403 E2E_NOT_BOUND_DEVICE；会话未激活返回 403 E2E_STATE_INVALID；
+        - 私密会话的 message:new 只推给两台绑定设备，且**不触发离线推送**（避免泄露给其他设备）。
       requestBody:
         required: true
         content:
@@ -3501,6 +3527,8 @@ paths:
         - keyword trim 后 2~64 字符（ngram 最小切 2 字，单字返回 400）；BOOLEAN MODE 操作符（+ - > < ( ) ~ * " @）会被自动清洗。
         - 过滤：加密消息（服务端无明文）、已焚毁（is_destroyed / destroy_at 到期）、点开才焚（burn_ttl_seconds 非空，防搜索泄露受保护内容）、已撤回消息均不返回。
         - after / before 支持 ISO8601 字符串或毫秒时间戳，格式无效返回 400。
+
+        【V6.2 私密会话】全局搜索**排除所有私密会话**（服务端无明文，且不应向其他设备暴露"存在加密消息"这一元数据）。
       parameters:
         - name: keyword
           in: query
@@ -3632,6 +3660,9 @@ paths:
         - 已销毁（is_destroyed=true）及已到销毁时间（destroy_at <= 当前时间）的消息不返回，即使定时销毁任务尚未执行（过滤兜底）。
         - 点开才焚（burn_ttl_seconds 非空）的消息按当前用户回执状态返回：未点开 → 马赛克占位（is_blurred=true，content/file_url/加密字段全部置 null）；已点开未到期 → 完整内容 + burn_at + remain_seconds（前端据此跑本地倒计时）；已到期 → 整条不返回（对该用户而言已焚毁）。
         - mentions 字段保证为数组（存量 null 归一化为 []）；加密消息 content 为占位提示，明文需客户端解密。
+
+        【V6.2 私密会话】active 私密会话仅两台绑定设备可拉取历史；其他设备返回 403 E2E_NOT_BOUND_DEVICE。
+        私密会话里的消息 cipher_text 只有绑定设备能解密，服务端不下发明文。
       parameters:
         - name: conversationId
           in: path
@@ -3689,6 +3720,8 @@ paths:
         - 点开才焚消息（burn_ttl_seconds 非空）不参与搜索，防止搜索泄露马赛克内容。
         - 已销毁（is_destroyed）及已到销毁时间（destroy_at <= 当前时间）的消息不返回（与历史消息列表过滤一致）。
         - limit 默认 50，服务端二次兜底上限 200；before 支持 ISO8601 字符串或毫秒时间戳（UUID 不行，格式错误返回 400）。
+
+        【V6.2 私密会话】会话内搜索同样要求调用设备为绑定设备，否则 403 E2E_NOT_BOUND_DEVICE。
       parameters:
         - name: conversationId
           in: path
@@ -3998,6 +4031,8 @@ paths:
         - 重复点开不重置计时；自己那份倒计时已到期 / 兜底到期后一律按已焚毁 404 处理（消息已焚毁）。
         - v5.8.9 播完才焚（仅音视频焚毁消息，含 type=file 的视频扩展名）：倒计时为「消费窗口」= max(burn_ttl_seconds, 媒体时长 + 缓冲 30s)，窗口内可反复播放；body 可带 media_duration_seconds（前端播放器 metadata 时长，仅存库值缺失时兜底）；返回 media_burn_pending=true 提示前端播放完成/放弃时调 POST /messages/{id}/consume 提前焚毁，consume_deadline 为窗口截止时刻。文本/图片焚毁消息两字段为 false / 不返回。
         - 首次点开即标记已读并广播已读回执（发送方实时看到「对方已点开」）。
+
+        【V6.2 私密会话】点开焚毁消息也会校验设备绑定关系：非绑定设备返回 403 E2E_NOT_BOUND_DEVICE。
       parameters:
         - name: id
           in: path
@@ -4066,6 +4101,8 @@ paths:
         - 幂等：重复调用 / 自己窗口已到期 / 消息已被调度器物理删除，均返回 already=true 成功。
         - 物理删除仍由调度器统一执行（所有接收方都到期才删行删文件，群聊「各看各的」语义不变，未看成员不受影响）。
         - 广播 message:consumed 事件：对端与本人其他在线设备实时切「已焚毁」态。
+
+        【V6.2 私密会话】消费（播完才焚）同样要求调用设备为绑定设备。
       parameters:
         - name: id
           in: path
@@ -4223,6 +4260,8 @@ paths:
         - 本接口本身不删除任何数据；不确认也不会报错，但会在 `ACK_FALLBACK_DAYS`（默认 7 天）
           后被服务端强制真删除。
         - 单次最多返回 500 条（按 destroyed_at 升序）。
+
+        【V6.2 私密会话】待销毁列表按设备隔离：非绑定设备返回 403 E2E_NOT_BOUND_DEVICE。
       parameters:
         - name: conversationId
           in: path
@@ -4286,6 +4325,8 @@ paths:
           群聊 = 确认人数 ≥ `PURGE_ACK_THRESHOLD`（默认 1）；该值为 0 时要求所有非发送方（n-1）都确认。
         - 响应里的 `purged_ids` 是本次真正被物理删除的消息；`acked` 是本次写入的确认条数。
         - 即使不调用，服务端也会在 `ACK_FALLBACK_DAYS`（默认 7 天）后强制真删除。
+
+        【V6.2 私密会话】确认删除同样校验设备绑定关系。
       parameters:
         - name: conversationId
           in: path
